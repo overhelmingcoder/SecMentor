@@ -32,3 +32,9 @@ dist/
 # --- Logs ---
 *.log
 logs/
+
+# --- Runtime data & databases ---
+.puku/
+*.db
+*.db-wal
+*.db-shm
