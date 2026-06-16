@@ -1,0 +1,1755 @@
+"""Smoke + structural tests for Phase 3 (with Phase 8 additions).
+
+These tests do NOT call the live OpenRouter API. They verify that:
+- The package layout is still valid (Phase 2 regression check).
+- The config module loads from .env.
+- The openrouter module is importable and exposes the expected surface.
+- The error path of `chat()` is exercised by feeding it a bad base URL
+  pointing at localhost, so we exercise the real requests code path
+  without spending an API credit.
+- The teaching-mode sidebar swap block in the Streamlit view fires on a
+  real user click and does not spuriously fire on a fresh session, and
+  the **web UI default is the CTF/lab mentor persona** ("SecMentor").
+
+Run with:  python -m unittest tests.test_smoke -v
+"""
+
+import importlib
+import os
+import re
+import sys
+import unittest
+from unittest.mock import patch
+
+from app import config, openrouter, prompts
+from app.openrouter import OpenRouterError, chat
+from web.chat_helpers import _active_system_prompt
+
+# Absolute path to the Streamlit view script. Used by the sys.path
+# bootstrap tests below so they can exec the bootstrap block in an
+# isolated namespace without spinning up a real Streamlit session.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO = os.path.dirname(_HERE)
+_STREAMLIT_VIEW = os.path.join(_REPO, "web", "streamlit_app.py")
+
+
+def _read_streamlit_view() -> str:
+    """Read the Streamlit view source as text.
+
+    Streamlit's renderer can't be unit-tested (it requires a browser), but
+    the file itself is a Python module and we can read it like any other
+    file. Structural tests below pin its contract so a bad edit to the
+    two-pass pattern or the model selector surfaces in CI, not in a
+    browser screenshot.
+    """
+    with open(_STREAMLIT_VIEW, "r", encoding="utf-8") as fh:
+        return fh.read()
+
+
+class SmokeTests(unittest.TestCase):
+    """Basic structural checks (Phase 2 regression)."""
+
+    def test_app_modules_import(self):
+        self.assertIsNotNone(config)
+        self.assertIsNotNone(openrouter)
+        self.assertIsNotNone(prompts)
+
+    def test_default_prompt_is_string(self):
+        self.assertIsInstance(prompts.DEFAULT_SYSTEM_PROMPT, str)
+        self.assertGreater(len(prompts.DEFAULT_SYSTEM_PROMPT), 0)
+
+
+class PromptTests(unittest.TestCase):
+    """Verify the Phase 5 engineered cybersecurity system prompt.
+
+    These checks pin the prompt's scope and guardrails. If anyone ever
+    edits `app/prompts.py` and accidentally drops a pillar or weakens the
+    refusal clause, the test suite tells us immediately.
+    """
+
+    PROMPT = prompts.DEFAULT_SYSTEM_PROMPT.lower()
+
+    def test_prompt_is_substantial(self):
+        """A real prompt should be a few hundred characters, not a stub."""
+        self.assertGreater(len(prompts.DEFAULT_SYSTEM_PROMPT), 400)
+
+    def test_prompt_covers_defensive_pillar(self):
+        self.assertIn("defensive", self.PROMPT)
+        self.assertIn("incident response", self.PROMPT)
+
+    def test_prompt_covers_devsecops_pillar(self):
+        self.assertIn("devsecops", self.PROMPT)
+        self.assertIn("supply-chain", self.PROMPT)
+
+    def test_prompt_covers_ai_security_pillar(self):
+        self.assertIn("prompt injection", self.PROMPT)
+        self.assertIn("owasp", self.PROMPT)
+
+    def test_prompt_covers_offensive_education_pillar(self):
+        self.assertIn("offensive", self.PROMPT)
+        self.assertIn("attack", self.PROMPT)
+
+    def test_prompt_has_explicit_refusal_clause(self):
+        """The refusal to produce weaponized output must be present."""
+        self.assertIn("you do not generate", self.PROMPT)
+        self.assertIn("exploit", self.PROMPT)
+        self.assertIn("malware", self.PROMPT)
+
+    def test_prompt_points_users_to_legal_labs(self):
+        """Educational redirect to authorized lab platforms must exist."""
+        self.assertIn("lab", self.PROMPT)
+
+
+class OffensiveMentorPromptTests(unittest.TestCase):
+    """Pin the Phase 8 CTF / lab mentor prompt's scope and refusal clauses.
+
+    The mentor prompt is a *deliberate* expansion of the defensive prompt:
+    it authorizes working exploit snippets, payload one-liners, msfvenom
+    recipes, and malware-family analysis, BUT only when the user is
+    working in a lab they own (HTB, THM, PortSwigger, DVWA, WebGoat,
+    picoCTF, or their own VMs).
+
+    The tests in this class pin the boundary so a future edit cannot
+    silently weaken the refusal clauses (real-target payloads, WAF/EDR
+    bypasses, brand-new malware strains) or silently drop the
+    authorization framing that lets a student actually use the mentor
+    mode for its intended purpose.
+    """
+
+    PROMPT = prompts.OFFENSIVE_MENTOR_SYSTEM_PROMPT
+    PROMPT_LOWER = PROMPT.lower()
+
+    def test_mentor_prompt_is_substantial(self):
+        """A real prompt should be several KB, not a stub."""
+        self.assertGreater(len(self.PROMPT), 1500)
+
+    def test_mentor_prompt_is_distinct_from_defensive(self):
+        """The two profiles must be different prompts, not duplicates."""
+        self.assertNotEqual(
+            prompts.OFFENSIVE_MENTOR_SYSTEM_PROMPT,
+            prompts.CYBERSECURITY_SYSTEM_PROMPT,
+            "mentor prompt must not be a copy of the defensive prompt",
+        )
+
+    def test_mentor_prompt_names_itself(self):
+        """The persona must be self-identifying so the model cannot
+        accidentally impersonate the safer 'SecTutor' voice."""
+        self.assertIn("SecMentor", self.PROMPT)
+
+    def test_mentor_prompt_keeps_defensive_pillar(self):
+        self.assertIn("defensive", self.PROMPT_LOWER)
+        self.assertIn("threat modeling", self.PROMPT_LOWER)
+
+    def test_mentor_prompt_keeps_devsecops_pillar(self):
+        self.assertIn("devsecops", self.PROMPT_LOWER)
+        self.assertIn("supply chain", self.PROMPT_LOWER)
+
+    def test_mentor_prompt_keeps_ai_security_pillar(self):
+        self.assertIn("prompt injection", self.PROMPT_LOWER)
+        self.assertIn("owasp", self.PROMPT_LOWER)
+
+    def test_mentor_prompt_covers_offensive_in_lab_scope(self):
+        """The mentor prompt must explicitly mention the lab scope and
+        the core offensive-security sub-topics a CTF learner needs."""
+        for needle in (
+            "hackthebox",
+            "tryhackme",
+            "portswigger",
+            "dvwa",
+            "webgoat",
+            "sql injection",
+            "xss",
+            "privilege escalation",
+            "reverse shell",
+            "msfvenom",
+        ):
+            self.assertIn(
+                needle, self.PROMPT_LOWER,
+                f"mentor prompt is missing expected term {needle!r}",
+            )
+
+    def test_mentor_prompt_authorizes_working_snippets_in_lab(self):
+        """The mentor prompt must explicitly authorize working snippets
+        in the lab context — otherwise it collapses back into the
+        defensive-only behavior the user is trying to escape."""
+        self.assertIn("runnable", self.PROMPT_LOWER)
+        # 'for your lab' framing is the policy that distinguishes mentor
+        # mode from 'no working code ever' mode.
+        self.assertIn("for your lab", self.PROMPT_LOWER)
+        # Reference examples for the labeling convention the model is
+        # expected to follow in every code block.
+        self.assertIn("10.10.10.3", self.PROMPT)  # HackTheBox sample
+        self.assertIn("10.10.210.71", self.PROMPT)  # TryHackMe sample
+
+    def test_mentor_prompt_requires_defensive_countermeasure(self):
+        """Every offensive answer in mentor mode must include the
+        defensive countermeasure alongside the technique."""
+        self.assertIn("defensive", self.PROMPT_LOWER)
+        self.assertIn("countermeasure", self.PROMPT_LOWER)
+        # A handful of named countermeasures that should appear as
+        # worked examples the model is meant to mirror.
+        for needle in (
+            "parameterized queries",
+            "output encoding",
+            "egress filtering",
+            "least privilege",
+        ):
+            self.assertIn(
+                needle, self.PROMPT_LOWER,
+                f"mentor prompt should cite {needle!r} as a worked "
+                f"defensive countermeasure",
+            )
+
+    def test_mentor_prompt_refuses_real_target_payloads(self):
+        """The headline boundary: no payloads against a specific named
+        real system the user does not own."""
+        # The phrase 'real production' is the boundary the prompt uses
+        # internally; the model is told to redirect real targets to
+        # the lab equivalent.
+        self.assertIn("real production", self.PROMPT_LOWER)
+        self.assertIn("decline", self.PROMPT_LOWER)
+        # 'written authorization' is the legal framing for sanctioned
+        # pentests, as opposed to 'I found a real server on Shodan'.
+        self.assertIn("written authorization", self.PROMPT_LOWER)
+
+    def test_mentor_prompt_refuses_named_vendor_bypasses(self):
+        """The WAF/EDR/MFA bypass refusal must be present, otherwise
+        mentor mode silently becomes a vendor-bypass assistant."""
+        for needle in ("waf", "edr", "mfa"):
+            self.assertIn(needle, self.PROMPT_LOWER)
+
+    def test_mentor_prompt_refuses_brand_new_malware(self):
+        """The model may analyze malware families but must not author
+        a brand-new strain on demand."""
+        self.assertIn("brand-new", self.PROMPT_LOWER)
+        self.assertIn("malware", self.PROMPT_LOWER)
+        # Specifically: the prompt should say it won't write a fresh
+        # ransomware / C2 / dropper, while still allowing analysis.
+        self.assertIn("ransomware", self.PROMPT_LOWER)
+        self.assertIn("c2", self.PROMPT_LOWER)
+        self.assertIn("dropper", self.PROMPT_LOWER)
+
+    def test_mentor_prompt_refuses_harm_to_physical_systems(self):
+        """Critical-infrastructure carve-out must be present."""
+        self.assertIn("critical infrastructure", self.PROMPT_LOWER)
+        self.assertIn("medical", self.PROMPT_LOWER)
+
+    def test_mentor_prompt_redirects_distress_to_authorities(self):
+        """If the user is in distress about a real incident, the prompt
+        must direct them to CISA / CERT and stop speculating."""
+        self.assertIn("cisa", self.PROMPT_LOWER)
+        self.assertIn("cert", self.PROMPT_LOWER)
+
+
+class WebHelpersActivePromptTests(unittest.TestCase):
+    """Pin the helper that selects which system prompt is active.
+
+    The web view stores `teaching_mode` in session_state. The helper
+    `_active_system_prompt` returns the right constant for the mode so
+    the view layer does not have to know the two prompt names directly.
+    """
+
+    def test_defensive_mode_returns_defensive_prompt(self):
+        from web.chat_helpers import _active_system_prompt
+        from app.prompts import CYBERSECURITY_SYSTEM_PROMPT
+
+        self.assertIs(
+            _active_system_prompt({"teaching_mode": "defensive"}),
+            CYBERSECURITY_SYSTEM_PROMPT,
+        )
+
+    def test_mentor_mode_returns_mentor_prompt(self):
+        from web.chat_helpers import _active_system_prompt
+        from app.prompts import OFFENSIVE_MENTOR_SYSTEM_PROMPT
+
+        self.assertIs(
+            _active_system_prompt({"teaching_mode": "mentor"}),
+            OFFENSIVE_MENTOR_SYSTEM_PROMPT,
+        )
+
+    def test_unknown_mode_falls_back_to_defensive(self):
+        """An unknown mode must default to the safer prompt, never to
+        the wider mentor scope — fail-closed on ambiguity."""
+        from web.chat_helpers import _active_system_prompt
+        from app.prompts import CYBERSECURITY_SYSTEM_PROMPT
+
+        self.assertIs(
+            _active_system_prompt({"teaching_mode": "experimental"}),
+            CYBERSECURITY_SYSTEM_PROMPT,
+        )
+        self.assertIs(
+            _active_system_prompt({}),  # missing key
+            CYBERSECURITY_SYSTEM_PROMPT,
+        )
+
+    def test_non_dict_state_falls_back_to_defensive(self):
+        """Defensive: a malformed state must not crash the helper."""
+        from web.chat_helpers import _active_system_prompt
+        from app.prompts import CYBERSECURITY_SYSTEM_PROMPT
+
+        self.assertIs(
+            _active_system_prompt(None),
+            CYBERSECURITY_SYSTEM_PROMPT,
+        )
+
+
+class ConfigTests(unittest.TestCase):
+    """Verify .env was loaded and the required values are present."""
+
+    def test_api_key_is_loaded(self):
+        # We do NOT assert the actual value (security) — only that it loaded.
+        self.assertTrue(config.OPENROUTER_API_KEY)
+        self.assertTrue(config.OPENROUTER_API_KEY.startswith("sk-or-v1-"))
+
+    def test_model_is_loaded(self):
+        self.assertTrue(config.OPENROUTER_MODEL)
+        # A model name always contains a slash (provider/model).
+        self.assertIn("/", config.OPENROUTER_MODEL)
+
+    def test_base_url_is_loaded(self):
+        self.assertTrue(config.OPENROUTER_BASE_URL.startswith("https://"))
+        self.assertTrue(config.OPENROUTER_BASE_URL.endswith("/chat/completions"))
+
+    def test_numeric_defaults_are_sane(self):
+        self.assertGreater(config.DEFAULT_TEMPERATURE, 0.0)
+        self.assertLessEqual(config.DEFAULT_TEMPERATURE, 2.0)
+        self.assertGreater(config.DEFAULT_MAX_TOKENS, 0)
+        self.assertGreater(config.HTTP_TIMEOUT_SECONDS, 0)
+
+
+class OpenRouterClientTests(unittest.TestCase):
+    """Verify the openrouter.client surface and error paths."""
+
+    def test_empty_messages_raises(self):
+        with self.assertRaises(OpenRouterError):
+            chat([])
+
+    def test_network_failure_is_wrapped(self):
+        """Pointing at a closed port must raise OpenRouterError, not crash."""
+        # 127.0.0.1:1 is reserved and never listens -> connection refused.
+        with patch.object(openrouter, "OPENROUTER_BASE_URL", "http://127.0.0.1:1"):
+            with self.assertRaises(OpenRouterError):
+                chat([{"role": "user", "content": "hello"}])
+
+
+class ChatbotHistoryTests(unittest.TestCase):
+    """Verify the Phase 4 history accumulator in the CLI chatbot.
+
+    These tests are offline — they never call OpenRouter. They exercise the
+    pure-Python message-builder logic so we can confirm the conversation
+    memory is wired up correctly before the user sees it in the terminal.
+    """
+
+    def test_build_messages_includes_prior_turn(self):
+        """A follow-up turn must carry the prior user/assistant exchange."""
+        from cli.chatbot import _build_messages
+
+        history = [
+            {"role": "system", "content": "You are a helper."},
+            {"role": "user", "content": "What is XSS?"},
+            {"role": "assistant", "content": "Cross-site scripting."},
+        ]
+        messages = _build_messages(history, "Can you give an example?")
+
+        # New payload should be exactly: history + new user turn.
+        self.assertEqual(len(messages), 4)
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(messages[1]["role"], "user")
+        self.assertEqual(messages[1]["content"], "What is XSS?")
+        self.assertEqual(messages[2]["role"], "assistant")
+        self.assertEqual(messages[2]["content"], "Cross-site scripting.")
+        self.assertEqual(messages[3]["role"], "user")
+        self.assertEqual(messages[3]["content"], "Can you give an example?")
+
+    def test_build_messages_keeps_system_prompt_first(self):
+        """No matter what the caller passes, the system message must lead."""
+        from cli.chatbot import _build_messages
+
+        # Even if a caller hands us garbage history, the system prompt is
+        # whatever they put first — we trust the caller to maintain it.
+        # This test pins the contract: history[0] is always the system role.
+        history = [
+            {"role": "system", "content": "You are a helper."},
+            {"role": "user", "content": "Hi"},
+        ]
+        messages = _build_messages(history, "Hello again")
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(messages[-1]["role"], "user")
+        self.assertEqual(messages[-1]["content"], "Hello again")
+
+
+class ChatHelpersTests(unittest.TestCase):
+    """Verify the Phase 6 pure helpers used by the Streamlit UI.
+
+    The Streamlit file itself is not unit-tested (Streamlit is a view
+    layer; its tests are "open the browser, click around"). But the
+    helpers that shape state — building messages, truncating history,
+    serializing a transcript — are pure functions and worth pinning
+    down so a bad edit to the UI logic surfaces here, not in a
+    browser screenshot.
+    """
+
+    def test_build_messages_appends_user_turn(self):
+        from web.chat_helpers import _build_messages
+
+        history = [
+            {"role": "system", "content": "You are SecTutor."},
+            {"role": "user", "content": "Earlier question"},
+            {"role": "assistant", "content": "Earlier answer"},
+        ]
+        messages = _build_messages(history, "Follow-up question")
+        self.assertEqual(len(messages), 4)
+        self.assertEqual(messages[-1], {"role": "user", "content": "Follow-up question"})
+        # The original list must not be mutated.
+        self.assertEqual(len(history), 3)
+
+    def test_build_messages_rejects_empty_history(self):
+        from web.chat_helpers import _build_messages
+
+        with self.assertRaises(ValueError):
+            _build_messages([], "hi")
+
+    def test_build_messages_rejects_blank_user_input(self):
+        from web.chat_helpers import _build_messages
+
+        with self.assertRaises(ValueError):
+            _build_messages(
+                [{"role": "system", "content": "sys"}], "   \n  "
+            )
+
+    def test_truncate_history_keeps_system_prompt(self):
+        from web.chat_helpers import _truncate_history
+
+        history: list = [
+            {"role": "system", "content": "You are SecTutor."},
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "u2"},
+            {"role": "assistant", "content": "a2"},
+        ]
+        truncated = _truncate_history(history, max_messages=2)
+        # System prompt preserved + last 2 turns only.
+        self.assertEqual(truncated[0]["role"], "system")
+        self.assertEqual(len(truncated), 3)
+        self.assertEqual([m["content"] for m in truncated[1:]], ["u2", "a2"])
+
+    def test_truncate_history_no_op_when_under_cap(self):
+        from web.chat_helpers import _truncate_history
+
+        history = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "u1"},
+        ]
+        out = _truncate_history(history, max_messages=10)
+        self.assertEqual(out, history)
+
+    def test_truncate_history_rejects_zero(self):
+        from web.chat_helpers import _truncate_history
+
+        with self.assertRaises(ValueError):
+            _truncate_history(
+                [{"role": "system", "content": "s"}], max_messages=0
+            )
+
+    def test_serialize_for_download_includes_roles(self):
+        from web.chat_helpers import _serialize_for_download
+
+        history = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ]
+        out = _serialize_for_download(history, model="gemma/test:free")
+        self.assertIn("Model: gemma/test:free", out)
+        self.assertIn("--- USER ---", out)
+        self.assertIn("hi", out)
+        self.assertIn("--- ASSISTANT ---", out)
+        self.assertIn("hello", out)
+
+    def test_serialize_for_download_works_without_model(self):
+        from web.chat_helpers import _serialize_for_download
+
+        out = _serialize_for_download([{"role": "user", "content": "x"}])
+        self.assertNotIn("Model:", out)
+        self.assertIn("--- USER ---", out)
+
+    def test_count_chars_sums_all_content(self):
+        from web.chat_helpers import _count_chars
+
+        history = [
+            {"role": "system", "content": "abcd"},     # 4
+            {"role": "user", "content": "hello"},     # 5
+            {"role": "assistant", "content": "world!"},  # 6
+        ]
+        self.assertEqual(_count_chars(history), 15)
+
+    def test_bubble_alignment_user_right_others_left(self):
+        from web.chat_helpers import _bubble_alignment
+
+        self.assertEqual(_bubble_alignment("user"), "right")
+        self.assertEqual(_bubble_alignment("assistant"), "left")
+        self.assertEqual(_bubble_alignment("system"), "left")
+        self.assertEqual(_bubble_alignment("tool"), "left")
+
+
+class StreamlitViewImportSurfaceTests(unittest.TestCase):
+    """Pin the view's import surface against `web/chat_helpers.py`.
+
+    The view is a top-level Streamlit script. It can only see helpers it
+    explicitly imports from `web.chat_helpers`. If someone adds a new
+    helper to `chat_helpers.py` and calls it from the view, the unit
+    tests for that helper still pass (they import the helper directly).
+    The `NameError` only fires when the browser loads the running app.
+
+    This test parses the view source and the helper source, builds the
+    set of names the view actually references, and asserts every
+    referenced name from `chat_helpers.py` is in the view's import
+    block. Bug family: the same family that produced the
+    `NameError: name '_bubble_alignment' is not defined` and
+    `NameError: name '_build_messages' is not defined` incidents.
+    """
+
+    @staticmethod
+    def _defined_helpers_in_chat_helpers() -> set[str]:
+        """Return the set of `_<name>` function names defined in
+        `web/chat_helpers.py` (top-level def statements only)."""
+        path = os.path.join(_REPO, "web", "chat_helpers.py")
+        with open(path, "r", encoding="utf-8") as fh:
+            src = fh.read()
+        return set(re.findall(r"^def (_[a-z][a-z0-9_]*)\(", src, re.MULTILINE))
+
+    @staticmethod
+    def _view_imports_from_chat_helpers(view_src: str) -> set[str]:
+        """Return the set of names listed in the view's
+        `from web.chat_helpers import (...)` block. Tolerant of
+        multi-line layouts, trailing commas, and blank lines. Returns
+        an empty set if the import block is missing or uses a form
+        other than the parenthesised one (e.g. one-name-per-line)."""
+        match = re.search(
+            r"from\s+web\.chat_helpers\s+import\s+\((.*?)\)",
+            view_src,
+            re.DOTALL,
+        )
+        if not match:
+            return set()
+        block = match.group(1)
+        return {n.strip() for n in block.split(",") if n.strip()}
+
+    @staticmethod
+    def _view_references_to_chat_helpers(view_src: str) -> set[str]:
+        """Return the set of `_<name>(` references in the view body.
+
+        This is an over-approximation: it catches every call-shaped
+        identifier that starts with an underscore. False positives are
+        fine (an `_<name>(` inside a docstring or a comment is
+        harmless); the goal is to surface *misses*, not to be exact.
+        """
+        # Strip docstrings so an `_<name>(...)` mentioned in a comment
+        # block or module docstring doesn't trip the check. We use a
+        # simple heuristic: a triple-quoted string anywhere in the
+        # file is treated as documentation and skipped.
+        scrubbed = re.sub(r'"""[\s\S]*?"""', "", view_src)
+        scrubbed = re.sub(r"'''[\s\S]*?'''", "", scrubbed)
+        return set(re.findall(r"\b(_[a-z][a-z0-9_]*)\s*\(", scrubbed))
+
+    def test_view_imports_every_chat_helper_it_references(self):
+        """The view's import block must cover every helper it calls.
+
+        Pulls the list of helpers from `web/chat_helpers.py`,
+        intersects with the view's actual call sites, and asserts the
+        view's `from web.chat_helpers import (...)` block includes the
+        full intersection. Failing here means the running app would
+        hit `NameError` on first render.
+        """
+        defined = self._defined_helpers_in_chat_helpers()
+        view_src = _read_streamlit_view()
+        imported = self._view_imports_from_chat_helpers(view_src)
+        referenced = self._view_references_to_chat_helpers(view_src)
+
+        # What the view calls that lives in chat_helpers.
+        called_from_helpers = referenced & defined
+        # What is called but NOT imported. This is the failure case.
+        missing = called_from_helpers - imported
+
+        self.assertEqual(
+            missing,
+            set(),
+            (
+                "web/streamlit_app.py references chat_helpers names "
+                "that are not in its import block. The running app "
+                "will hit NameError on first render. "
+                f"Missing: {sorted(missing)}. "
+                f"Referenced from chat_helpers: {sorted(called_from_helpers)}. "
+                f"Currently imported: {sorted(imported & defined)}."
+            ),
+        )
+
+
+class TeachingModeSwapTests(unittest.TestCase):
+    """Pin the sidebar's teaching-mode swap detection.
+
+    Bug: when the user clicks the radio from "Defensive" to "CTF / Lab
+    mentor", the widget with `key="teaching_mode"` writes the new value
+    to `st.session_state["teaching_mode"]` *before* the script body runs
+    on the rerun-after-click. The original view read `_previous_mode`
+    from the same `st.session_state["teaching_mode"]` key, so it always
+    saw the new value, the comparison `_chosen_mode != _previous_mode`
+    was always false, and the swap block was silently skipped. The
+    radio toggled visually but the system prompt never changed.
+
+    Fix: track the *previous* mode in a separate
+    `teaching_mode_previous` key that is only updated *after* the swap
+    fires. On the rerun-after-click, `teaching_mode` (live, written by
+    the widget) ≠ `teaching_mode_previous` (still the old value) and
+    the swap runs.
+
+    These tests pin (a) the helper correctly swaps the system prompt
+    when teaching_mode changes (already covered elsewhere, but pinned
+    here as a precondition), and (b) the view's swap-detection logic
+    is structured to actually fire. The behavioral assertion uses a
+    simulated session_state dict (the same shape the view uses); the
+    structural assertion reads the view source.
+    """
+
+    @staticmethod
+    def _simulate_swap(state: dict, chosen_mode: str) -> bool:
+        """Replicate the view's swap-detection + swap block.
+
+        Returns True if the swap would fire for `chosen_mode`. Mirrors
+        the logic in `web/streamlit_app.py` exactly so a regression in
+        the view code does not silently make this test pass.
+        """
+        previous_mode = state.get(
+            "teaching_mode_previous",
+            state.get("teaching_mode", "defensive"),
+        )
+        if chosen_mode != previous_mode:
+            state["messages"][0] = {
+                "role": "system",
+                # The view uses the helper; we call it the same way.
+                "content": _active_system_prompt({"teaching_mode": chosen_mode}),
+            }
+            state["response_cache"] = {}
+            state["teaching_mode_previous"] = chosen_mode
+            return True
+        return False
+
+    def test_swap_fires_when_user_clicks_mentor(self):
+        """The first click from defensive → mentor must reseed the
+        system message with the mentor prompt."""
+        defensive_prompt = prompts.CYBERSECURITY_SYSTEM_PROMPT
+        mentor_prompt = prompts.OFFENSIVE_MENTOR_SYSTEM_PROMPT
+        state = {
+            "teaching_mode": "mentor",  # what the widget just wrote
+            "teaching_mode_previous": "defensive",  # what was there before
+            "messages": [
+                {"role": "system", "content": defensive_prompt},
+                {"role": "user", "content": "hi"},
+            ],
+        }
+        fired = self._simulate_swap(state, chosen_mode="mentor")
+        self.assertTrue(
+            fired,
+            "Swap must fire on defensive → mentor click (pre-fix it "
+            "was silently skipped because both the widget and the "
+            "_previous_mode read targeted st.session_state['teaching_mode']).",
+        )
+        self.assertIs(
+            state["messages"][0]["content"],
+            mentor_prompt,
+            "After swap, the system message must be the mentor prompt.",
+        )
+        self.assertEqual(
+            state["teaching_mode_previous"],
+            "mentor",
+            "After swap, teaching_mode_previous must be updated so the "
+            "next comparison is stable.",
+        )
+
+    def test_swap_does_not_fire_on_initial_render(self):
+        """A fresh session must not spuriously swap.
+
+        `_init_state` seeds `teaching_mode_previous` equal to the live
+        `teaching_mode`. If that seed is missing, the helper's fallback
+        (`st.session_state.get('teaching_mode', 'defensive')`) still
+        produces a stable comparison, so the swap must not fire.
+        """
+        defensive_prompt = prompts.CYBERSECURITY_SYSTEM_PROMPT
+        # Case A: seed present, comparison stable.
+        state_seeded = {
+            "teaching_mode": "defensive",
+            "teaching_mode_previous": "defensive",
+            "messages": [{"role": "system", "content": defensive_prompt}],
+        }
+        self.assertFalse(
+            self._simulate_swap(state_seeded, chosen_mode="defensive"),
+            "No swap on a no-op click.",
+        )
+        # Case B: seed missing (first run after upgrade), comparison
+        # falls back to the live key, still stable.
+        state_unseeded = {
+            "teaching_mode": "defensive",
+            "messages": [{"role": "system", "content": defensive_prompt}],
+        }
+        self.assertFalse(
+            self._simulate_swap(state_unseeded, chosen_mode="defensive"),
+            "No spurious swap when teaching_mode_previous is missing "
+            "and the live key already matches.",
+        )
+
+    def test_swap_fires_back_to_defensive(self):
+        """Mentor → defensive must also reseed."""
+        defensive_prompt = prompts.CYBERSECURITY_SYSTEM_PROMPT
+        mentor_prompt = prompts.OFFENSIVE_MENTOR_SYSTEM_PROMPT
+        state = {
+            "teaching_mode": "defensive",  # widget just wrote
+            "teaching_mode_previous": "mentor",  # was mentor
+            "messages": [
+                {"role": "system", "content": mentor_prompt},
+                {"role": "user", "content": "give me the SQLi payload"},
+            ],
+        }
+        fired = self._simulate_swap(state, chosen_mode="defensive")
+        self.assertTrue(fired, "Swap must fire on mentor → defensive click.")
+        self.assertIs(
+            state["messages"][0]["content"],
+            defensive_prompt,
+            "After swap back, the system message must be the defensive prompt.",
+        )
+
+    def test_view_uses_separate_previous_key(self):
+        """Static check: the view source must track the previous
+        mode in a separate key, not in the live `teaching_mode` key
+        that the radio widget overwrites.
+
+        Bug family: re-introducing `_previous_mode = st.session_state
+        .get('teaching_mode', 'defensive')` would re-break the toggle
+        and the user would see the radio flip without any system
+        prompt change.
+        """
+        view_src = _read_streamlit_view()
+        lines = view_src.splitlines()
+
+        # The previous-mode read must reference the separate key.
+        self.assertIn(
+            "teaching_mode_previous",
+            view_src,
+            "The view must use a separate `teaching_mode_previous` key "
+            "for the swap comparison, because the radio's `key='teaching_mode'` "
+            "writes the new value into st.session_state['teaching_mode'] "
+            "before the script body runs on the rerun-after-click.",
+        )
+
+        # Find the line where `_previous_mode = st.session_state.get(`
+        # starts. The call is multi-line in the actual source (the
+        # helper has a fallback default), so we look at the next ~6
+        # lines to see if `teaching_mode_previous` appears in the call.
+        previous_start = next(
+            (i for i, line in enumerate(lines, start=1)
+             if re.search(r"_previous_mode\s*=\s*st\.session_state\.get\(", line)),
+            0,
+        )
+        self.assertGreater(
+            previous_start, 0,
+            "Could not find `_previous_mode = st.session_state.get(` "
+            "in the view. The swap-detection logic must read the "
+            "previous mode from session_state, not hard-code it.",
+        )
+        # Look at a window of 8 lines after `previous_start` (covers
+        # the multi-line fallback in the actual source).
+        window_end = min(previous_start + 8, len(lines))
+        window = "\n".join(lines[previous_start - 1:window_end])
+        self.assertIn(
+            "teaching_mode_previous", window,
+            "The `_previous_mode = st.session_state.get(...)` call must "
+            "read the separate `teaching_mode_previous` key, not the "
+            "live `teaching_mode` key (which the radio widget overwrites "
+            "before the script body runs).",
+        )
+
+        # The previous-mode read must happen BEFORE the teaching-mode
+        # ``st.radio`` call. The view may have other unrelated radios
+        # (e.g. a layout-mode toggle) that would match a bare
+        # ``st.radio(`` substring, so we anchor on the
+        # ``key="teaching_mode"`` argument within a 12-line window after
+        # the call (the actual call is multi-line in the source).
+        radio_line = 0
+        for i, line in enumerate(lines, start=1):
+            if "st.radio(" not in line:
+                continue
+            window_end = min(i + 12, len(lines))
+            window = "\n".join(lines[i - 1:window_end])
+            if 'key="teaching_mode"' in window:
+                radio_line = i
+                break
+        self.assertGreater(radio_line, 0,
+                           "Could not find the teaching-mode st.radio( "
+                           "(key=\"teaching_mode\") in the view.")
+        self.assertLess(
+            previous_start, radio_line,
+            "The previous-mode read must happen BEFORE the teaching-mode "
+            f"st.radio( call. Read at line {previous_start}, radio at line {radio_line}.",
+        )
+
+        # The swap block must update teaching_mode_previous after firing.
+        # We assert the assignment appears inside the `if _chosen_mode !=
+        # _previous_mode:` block, after the messages reseed.
+        swap_block = re.search(
+            r"if\s+_chosen_mode\s*!=\s*_previous_mode\s*:(.*?)(?=\n\s*st\.divider\(\)|\n\s*st\.markdown\(|\Z)",
+            view_src,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(
+            swap_block,
+            "Could not find the `if _chosen_mode != _previous_mode:` "
+            "swap block in the view.",
+        )
+        self.assertIn(
+            "teaching_mode_previous",
+            swap_block.group(1),
+            "The swap block must update teaching_mode_previous after "
+            "firing, otherwise the comparison is unstable.",
+        )
+
+    def test_view_seeds_mentor_as_default(self):
+        """The web UI must default the teaching mode to the wider
+        CTF/lab mentor persona (SecMentor), not the defensive one.
+
+        Rationale: SecMentor is the product surface we built in
+        Phase 8; learners landing on the page should get the lab-
+        scoped teaching persona from the first turn. The defensive
+        prompt stays one click away in the sidebar and is the
+        default for the CLI (`app.prompts.DEFAULT_SYSTEM_PROMPT`).
+
+        This is a structural test on the view source so the default
+        can only change by also updating this pin (intentional
+        breakage of the regression test = intentional doc change).
+        """
+        view_src = _read_streamlit_view()
+        # 1) The fresh-session seed must be "mentor".
+        self.assertRegex(
+            view_src,
+            r'_DEFAULT_TEACHING_MODE\s*:\s*str\s*=\s*"mentor"',
+            "The fresh-session seed in `_init_state` must be the "
+            "mentor mode (the wider CTF/lab scope).",
+        )
+        # 2) The sidebar radio options must list "mentor" first so
+        # the visible default is the mentor persona (the radio's
+        # index= fallback also lands on index 0).
+        self.assertRegex(
+            view_src,
+            r'_TEACHING_OPTIONS\s*:\s*list\[str\]\s*=\s*\[\s*"mentor"\s*,\s*"defensive"\s*\]',
+            'The sidebar radio must list ["mentor", "defensive"] so '
+            "the visible default is the mentor persona.",
+        )
+        # 3) The `_previous_mode` fallback (used when both the
+        # separate-key seed and the live key are missing on a
+        # brand-new session) must agree with the seed default.
+        self.assertRegex(
+            view_src,
+            r'st\.session_state\.get\(\s*"teaching_mode"\s*,\s*"mentor"\s*\)',
+            "The `_previous_mode` fallback default must be "
+            '"mentor" so a fresh session is self-consistent with '
+            "the seed in `_init_state`.",
+        )
+
+    def test_view_swaps_to_mentor_prompt_on_first_render(self):
+        """End-to-end (structural) check: on a fresh session the
+        system message must be the mentor prompt, not the defensive
+        one, and the swap block must NOT fire (because there is
+        nothing to swap — the seed already matches the visible
+        radio).
+        """
+        mentor_prompt = prompts.OFFENSIVE_MENTOR_SYSTEM_PROMPT
+        defensive_prompt = prompts.CYBERSECURITY_SYSTEM_PROMPT
+        state = {
+            # _init_state seeds these on a fresh session.
+            "teaching_mode": "mentor",
+            "teaching_mode_previous": "mentor",
+            "messages": [
+                {"role": "system", "content": mentor_prompt},
+            ],
+        }
+        # No swap on initial render (previous == chosen == "mentor").
+        self.assertFalse(
+            self._simulate_swap(state, chosen_mode="mentor"),
+            "On a fresh session with the new default, no swap "
+            "must fire — the seed already matches the radio.",
+        )
+        # And the system message is the mentor prompt, not defensive.
+        self.assertIs(
+            state["messages"][0]["content"],
+            mentor_prompt,
+            "Fresh-session default system message must be the "
+            "OFFENSIVE_MENTOR_SYSTEM_PROMPT constant.",
+        )
+        # Sanity: the two prompts really are different objects —
+        # otherwise the test would pass trivially.
+        self.assertIsNot(
+            mentor_prompt,
+            defensive_prompt,
+            "Sanity: the two prompt constants must be distinct objects.",
+        )
+
+
+class FriendlyErrorTests(unittest.TestCase):
+    """Pin the rate-limit / generic-error mapping for the chat UI.
+
+    The view used to dump the raw upstream JSON to the user. We now
+    classify the error and show a short, actionable message. These
+    tests guard the classification so a wording change in the engine
+    ("HTTP 429" -> "status 429" for example) does not silently
+    regress the UI to the raw-JSON banner.
+    """
+
+    def test_is_rate_limit_true_for_http_429_substring(self):
+        from web.chat_helpers import _is_rate_limit_error
+
+        class FakeExc(BaseException):
+            pass
+
+        self.assertTrue(
+            _is_rate_limit_error(
+                RuntimeError("OpenRouter returned HTTP 429: {...}")
+            )
+        )
+
+    def test_is_rate_limit_false_for_500(self):
+        from web.chat_helpers import _is_rate_limit_error
+
+        self.assertFalse(
+            _is_rate_limit_error(
+                RuntimeError("OpenRouter returned HTTP 500: boom")
+            )
+        )
+
+    def test_friendly_error_mentions_model_for_429(self):
+        from web.chat_helpers import _friendly_error_message
+
+        exc = RuntimeError(
+            "OpenRouter returned HTTP 429: {retry_after_seconds: 29}"
+        )
+        headline, body = _friendly_error_message(exc, "meta-llama/llama-3.3-70b:free")
+        self.assertIn("meta-llama/llama-3.3-70b:free", headline)
+        self.assertIn("rate-limited", headline.lower())
+        self.assertIn("sidebar", body.lower())
+
+    def test_friendly_error_generic_for_unknown(self):
+        from web.chat_helpers import _friendly_error_message
+
+        exc = RuntimeError("OpenRouter returned HTTP 500: boom")
+        headline, body = _friendly_error_message(exc, "some-model")
+        self.assertIn("some-model", headline)
+        self.assertIn(".env", body)
+
+
+class FreeModelChoicesTests(unittest.TestCase):
+    """Verify the curated free-model list shipped in the web view.
+
+    The list is what the user sees in the sidebar dropdown. If anyone
+    deletes all entries, adds a paid model id by mistake, or breaks the
+    schema the view relies on, the UI breaks in a confusing way. These
+    tests catch that at CI time.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        # Importing the view module spins up Streamlit's
+        # DeltaGeneratorSingleton. Doing it once per class (instead of
+        # once per test) keeps subsequent test methods from tripping
+        # the "instance already exists" guard on a hot re-import.
+        super().setUpClass()
+        from web import streamlit_app as _view
+        cls._view = _view
+
+    def test_curated_list_imports_and_is_non_empty(self):
+        FREE_MODEL_CHOICES = self._view.FREE_MODEL_CHOICES
+
+        self.assertIsInstance(FREE_MODEL_CHOICES, list)
+        self.assertGreater(len(FREE_MODEL_CHOICES), 0)
+
+    def test_every_entry_has_required_keys(self):
+        FREE_MODEL_CHOICES = self._view.FREE_MODEL_CHOICES
+
+        required = {"id", "label", "role", "blurb"}
+        for entry in FREE_MODEL_CHOICES:
+            self.assertTrue(
+                required.issubset(entry.keys()),
+                f"entry {entry!r} is missing keys: {required - set(entry.keys())}",
+            )
+            for k in required:
+                self.assertIsInstance(entry[k], str)
+                self.assertGreater(
+                    entry[k].strip(), "",
+                    f"entry {entry!r} has empty {k!r}",
+                )
+
+    def test_default_index_constant_is_in_range(self):
+        DEFAULT_SELECTED_MODEL_INDEX = self._view.DEFAULT_SELECTED_MODEL_INDEX
+        FREE_MODEL_CHOICES = self._view.FREE_MODEL_CHOICES
+
+        self.assertGreaterEqual(DEFAULT_SELECTED_MODEL_INDEX, 0)
+        self.assertLess(DEFAULT_SELECTED_MODEL_INDEX, len(FREE_MODEL_CHOICES))
+
+    def test_ids_are_unique(self):
+        FREE_MODEL_CHOICES = self._view.FREE_MODEL_CHOICES
+
+        ids = [m["id"] for m in FREE_MODEL_CHOICES]
+        self.assertEqual(
+            len(ids), len(set(ids)),
+            f"duplicate model ids in curated list: {ids}",
+        )
+
+
+class TwoPassPatternTests(unittest.TestCase):
+    """Pin the two-pass ``_ask`` pattern used to render the Thinking… bubble.
+
+    Streamlit is single-pass per script run. To show the user bubble
+    *before* the model finishes thinking, ``_ask`` writes the user turn
+    to session_state and reruns (pass 1), then on the rerun runs the
+    model and writes the assistant turn (pass 2). Pass 2 is the only
+    place the placeholder, the toast, and the status-line marker are
+    rendered.
+
+    The first cut of this pattern worked for the example-prompt button
+    (which set ``pending_prompt`` and the rerun found it), but it broke
+    silently for the main ``st.chat_input`` path: chat_input returns ""
+    on the rerun, ``pending_prompt`` is None, so pass 2 was never
+    driven — the user just saw nothing.
+
+    The fix is a top-level driver that calls ``_ask(None)`` when
+    ``pending_request`` is set, *before* the input widgets run. These
+    tests pin that contract so a future refactor doesn't silently
+    regress the chat_input path.
+    """
+
+    def test_ask_signature_accepts_none(self):
+        """``_ask(None)`` must be a valid call: it signals pass 2."""
+        import ast
+
+        tree = ast.parse(_read_streamlit_view())
+        func_defs = [
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_ask"
+        ]
+        self.assertEqual(len(func_defs), 1, "_ask must be defined exactly once")
+        arg = func_defs[0].args.args[0]
+        self.assertIsInstance(arg.annotation, ast.BinOp)
+        # BinOp with ast.BitOr (|) is the ast shape of `str | None`.
+        self.assertIsInstance(arg.annotation.op, ast.BitOr)
+
+    def test_pass2_driver_block_exists(self):
+        """The top-level driver that fires pass 2 must be present."""
+        src = _read_streamlit_view()
+        # The block lives AFTER the function definition. We anchor on
+        # the comment we added so a refactor that deletes the block
+        # lights up the test rather than silently breaking the UI.
+        self.assertIn(
+            "Two-pass continuation",
+            src,
+            "missing the 'Two-pass continuation' driver block — pass 2 "
+            "won't fire after a chat_input submission",
+        )
+        # And it must actually call _ask(None) under a guard on
+        # pending_request.
+        self.assertRegex(
+            src,
+            r'if\s+st\.session_state\.get\(\s*["\']pending_request["\']\s*\)\s*:\s*\n\s*_ask\(None\)',
+            "pass-2 driver block is malformed; expected "
+            "if st.session_state.get('pending_request'):\\n    _ask(None)",
+        )
+
+    def test_pass2_driver_appears_after_ask_definition(self):
+        """The driver must come AFTER ``def _ask``, not before.
+
+        We saw this mistake in an earlier turn: putting the driver
+        block before the function definition causes NameError at run
+        time because ``_ask`` is not yet bound. This test reads the
+        source and asserts the byte offset of the driver is greater
+        than the byte offset of the ``def _ask`` line.
+        """
+        src = _read_streamlit_view()
+        def_offset = src.find("def _ask(")
+        driver_offset = src.find("Two-pass continuation")
+        self.assertGreater(def_offset, 0, "def _ask(...) not found in source")
+        self.assertGreater(driver_offset, 0, "driver block not found in source")
+        self.assertGreater(
+            driver_offset, def_offset,
+            "pass-2 driver block must come AFTER the _ask definition "
+            "(otherwise the call to _ask(None) raises NameError)",
+        )
+
+    def test_pass2_success_path_calls_rerun(self):
+        """After the reply is appended, pass 2 must rerun the script.
+
+        Without the rerun, the assistant turn is appended to
+        session_state but the history-render loop at the top of the
+        script never re-paints — the user sees no reply until they
+        trigger some other rerun (e.g. by sending a second message).
+        Pin this so the bug cannot regress silently.
+        """
+        src = _read_streamlit_view()
+        # Locate the success path. The reply is appended in this block.
+        # The rerun must be inside the same indentation block as the
+        # append so it actually fires on the happy path.
+        # We anchor on a unique phrase from the success path.
+        anchor = '"role": "assistant", "content": reply'
+        idx = src.find(anchor)
+        self.assertGreater(idx, 0, "success path append not found in source")
+        # Look at the next ~200 chars after the append — the rerun
+        # must be there.
+        window = src[idx : idx + 300]
+        self.assertIn(
+            "st.rerun()", window,
+            "pass-2 success path must call st.rerun() after appending "
+            "the assistant turn, otherwise the user never sees the reply",
+        )
+
+    def test_cache_hit_path_calls_rerun(self):
+        """The cache-hit branch must also rerun so the cached reply
+        actually renders in the history loop."""
+        src = _read_streamlit_view()
+        anchor = "response_cache"
+        idx = src.find(anchor)
+        # Find every occurrence and inspect the one inside the cache-hit
+        # block (the one that appends a `cached` value).
+        cache_idx = src.find("append(\n            {\"role\": \"assistant\", \"content\": cached}", idx)
+        self.assertGreater(cache_idx, 0, "cache-hit append not found in source")
+        window = src[cache_idx : cache_idx + 400]
+        self.assertIn(
+            "st.rerun()", window,
+            "cache-hit branch must call st.rerun() after appending "
+            "the cached reply, otherwise repeat questions are invisible",
+        )
+
+    def test_error_path_uses_friendly_helper(self):
+        """The error block must call the friendly-error helper instead
+        of dumping the raw exception into ``st.error``."""
+        src = _read_streamlit_view()
+        self.assertIn(
+            "_render_friendly_error(",
+            src,
+            "error handler must call _render_friendly_error; the old "
+            "raw st.error(f'... {exc}') path leaks upstream JSON to "
+            "the user",
+        )
+
+
+class StreamlitSysPathBootstrapTests(unittest.TestCase):
+    """Pin the ``sys.path`` bootstrap that lets ``streamlit run
+    web/streamlit_app.py`` resolve ``from app.config import ...``.
+
+    Streamlit's ``modified_sys_path`` only prepends the SCRIPT's
+    directory (``web/``) to ``sys.path[0]``. The project root is NOT
+    added. So unless the bootstrap is present, the app crashes on
+    import with ``ModuleNotFoundError: No module named 'app'`` as soon
+    as the worker process is launched from a cwd that is not the
+    project root. These tests pin the contract so a future refactor
+    can't silently drop the bootstrap.
+    """
+
+    def test_streamlit_app_uses_absolute_imports(self):
+        """``web/streamlit_app.py`` must not use relative imports.
+        Relative imports only work for modules inside the same package;
+        ``streamlit_app`` is a top-level script, so a relative import
+        like ``from . import app`` would raise ``ImportError`` even
+        before the ``sys.path`` question matters.
+        """
+        src = _read_streamlit_view()
+        # The only legal pattern is `from __future__ import ...`
+        for line in src.splitlines():
+            stripped = line.lstrip()
+            if not stripped.startswith("from "):
+                continue
+            self.assertFalse(
+                stripped.startswith("from ."),
+                f"streamlit_app.py uses a relative import: {line!r}. "
+                "Top-level Streamlit scripts must use absolute imports.",
+            )
+
+    def test_bootstrap_appears_before_streamlit_import(self):
+        """The ``sys.path`` bootstrap must run BEFORE
+        ``import streamlit as st`` and BEFORE any ``from app...``
+        import, otherwise the ImportError has already been raised.
+        """
+        src = _read_streamlit_view()
+        bootstrap_match = re.search(
+            r"^# --- sys\.path bootstrap ---.*?^import streamlit",
+            src,
+            re.MULTILINE | re.DOTALL,
+        )
+        self.assertIsNotNone(
+            bootstrap_match,
+            "expected a `sys.path bootstrap` comment block that ends "
+            "right before `import streamlit`; if you renamed the "
+            "comment, update this test too.",
+        )
+        # And the bootstrap must actually mutate sys.path
+        self.assertIn(
+            "sys.path.insert(0,",
+            bootstrap_match.group(0),
+            "bootstrap block must call sys.path.insert(0, ...) so the "
+            "project root is found before any app.* import.",
+        )
+
+    def test_bootstrap_makes_app_importable_from_web_only_path(self):
+        """Simulate Streamlit's ``modified_sys.path`` semantics: only
+        the SCRIPT's directory is on ``sys.path[0]``. After running
+        the bootstrap block, ``import app.config`` must succeed.
+        """
+        project_root = os.path.dirname(os.path.dirname(_STREAMLIT_VIEW))
+        web_dir = os.path.dirname(_STREAMLIT_VIEW)
+
+        # Start with a path that mirrors what a long-running worker
+        # process might have: web/ on sys.path[0], project root absent.
+        clean_path = [web_dir] + [
+            p for p in sys.path
+            if p not in ("", project_root, web_dir)
+        ]
+
+        # Execute just the bootstrap block (lines 1..35 approx) of
+        # streamlit_app.py in an isolated namespace, then verify
+        # app.config is importable.
+        with open(_STREAMLIT_VIEW, "r", encoding="utf-8") as fh:
+            src = fh.read()
+
+        # Cut off at `import streamlit as st` so we don't actually
+        # spin up a Streamlit session in the test process.
+        cut = src.index("import streamlit as st")
+        bootstrap_src = src[:cut]
+
+        namespace: dict = {"__name__": "__not_streamlit__", "__file__": _STREAMLIT_VIEW}
+        exec(bootstrap_src, namespace)
+
+        # The bootstrap must have inserted the project root
+        self.assertIn(
+            project_root, sys.path,
+            f"bootstrap failed to add project root {project_root!r} "
+            f"to sys.path; sys.path is now: {sys.path[:5]!r}",
+        )
+
+        # And with that on sys.path, app.config must import cleanly
+        # (importlib fresh-imports it so the test does not depend on
+        # whether app.config is already loaded in this test process).
+        importlib.invalidate_caches()
+        try:
+            importlib.import_module("app.config")
+        except ModuleNotFoundError as exc:
+            self.fail(
+                f"even with the bootstrap, app.config failed to import: "
+                f"{exc}. sys.path[0:3] = {sys.path[:3]!r}"
+            )
+
+
+class OpenRouterErrorHierarchyTests(unittest.TestCase):
+    """Pin the typed error hierarchy used by the router.
+
+    The router branches on ``isinstance`` to decide whether to retry,
+    rotate, or disable a slot. If anyone renames a subclass or drops
+    the ``status`` attribute, the routing logic falls back to string
+    parsing — which is exactly what we want to prevent.
+    """
+
+    def test_base_error_carries_status_provider_model_body(self):
+        from app.openrouter import OpenRouterError
+
+        exc = OpenRouterError(
+            "boom",
+            status=429,
+            provider="openrouter",
+            model="google/gemma-4-31b-it:free",
+            body='{"error":"rate limit"}',
+        )
+        self.assertEqual(exc.status, 429)
+        self.assertEqual(exc.provider, "openrouter")
+        self.assertEqual(exc.model, "google/gemma-4-31b-it:free")
+        self.assertEqual(exc.body, '{"error":"rate limit"}')
+        # str(exc) must still work (used everywhere in the UI/CLI logs).
+        self.assertIn("boom", str(exc))
+        # Base class is still a RuntimeError (backwards compat).
+        self.assertIsInstance(exc, RuntimeError)
+
+    def test_default_attributes_are_none(self):
+        from app.openrouter import OpenRouterError
+
+        exc = OpenRouterError("simple message")
+        self.assertIsNone(exc.status)
+        self.assertIsNone(exc.provider)
+        self.assertIsNone(exc.model)
+        self.assertIsNone(exc.body)
+
+    def test_four_typed_subclasses_exist_and_inherit_base(self):
+        from app.openrouter import (
+            OpenRouterAuthError,
+            OpenRouterClientError,
+            OpenRouterError,
+            OpenRouterRateLimitError,
+            OpenRouterServerError,
+        )
+
+        for cls in (
+            OpenRouterAuthError,
+            OpenRouterRateLimitError,
+            OpenRouterServerError,
+            OpenRouterClientError,
+        ):
+            with self.subTest(cls=cls):
+                self.assertTrue(issubclass(cls, OpenRouterError))
+                # Each subclass must accept the same kwargs as the base.
+                instance = cls(
+                    f"{cls.__name__} msg",
+                    status=500,
+                    provider="x",
+                    model="y",
+                    body="z",
+                )
+                self.assertEqual(instance.status, 500)
+                self.assertIn(cls.__name__, str(instance))
+
+    def test_view_uses_router_specific_exceptions_in_imports(self):
+        """The view must import the router-specific exception types it
+        catches in its `try/except` blocks. If a refactor drops one of
+        these from the import block, the wiring silently breaks.
+        """
+        view_src = _read_streamlit_view()
+        for symbol in (
+            "AllSlotsExhaustedError",
+            "ModelRouter",
+            "NoFreeModelConfiguredError",
+            "RouterError",
+            "build_from_config",
+        ):
+            with self.subTest(symbol=symbol):
+                self.assertIn(
+                    "from app.router import",
+                    view_src,
+                    "view must import app.router",
+                )
+                self.assertIn(
+                    symbol, view_src,
+                    f"view must reference {symbol!r} (used in the router wiring)",
+                )
+
+
+class ModelRouterTests(unittest.TestCase):
+    """Pin the routing behaviour of ``app.router.ModelRouter``.
+
+    The router is the safety net that hides the per-account daily
+    free-tier cap behind automatic rotation. These tests use
+    ``unittest.mock`` to fake the network, so no real HTTP calls are
+    made and no API credits are spent.
+    """
+
+    def _build(self, keys, models, **kwargs):
+        """Build a router from short hand-crafted inputs.
+
+        Keeps the call sites below readable.
+        """
+        from app.router import build_from_config
+
+        return build_from_config(keys, models, **kwargs)
+
+    def test_construction_rejects_non_free_model_id(self):
+        """The router must reject any model id that doesn't end in
+        ``:free`` — silent fallback to a paid model is a hard
+        industry-standard anti-pattern we explicitly do not want.
+        """
+        from app.router import NoFreeModelConfiguredError
+
+        with self.assertRaises(NoFreeModelConfiguredError) as ctx:
+            self._build(["k1"], ["openai/gpt-4o"])  # not :free
+        self.assertIn(":free", str(ctx.exception))
+
+    def test_construction_rejects_empty_pool(self):
+        from app.router import NoFreeModelConfiguredError
+
+        with self.assertRaises(NoFreeModelConfiguredError):
+            self._build([], [])
+
+    def test_slot_label_redacts_key(self):
+        """Slot labels must never include the raw API key.
+
+        The labels are surfaced in the CLI banner and the Streamlit
+        sidebar caption, both of which can appear in screenshots and
+        log captures. A leak here is a credentials disclosure.
+        """
+        router = self._build(
+            ["sk-or-v1-AAAAAAAABBBBBBBB"],
+            ["m:free"],
+        )
+        label = router.slot_labels()[0]
+        self.assertIn("m:free", label)
+        self.assertIn("****", label)
+        # The raw key must not appear anywhere in the label.
+        self.assertNotIn("sk-or-v1-AAAAAAAABBBBBBBB", label)
+
+    def test_healthy_slot_count_decreases_on_401(self):
+        """A 401 must permanently disable the slot. The disabled slot
+        should not be re-enabled on the next call — that is the whole
+        point of the health state.
+        """
+        from app.openrouter import OpenRouterAuthError
+        from app.router import AllSlotsExhaustedError
+
+        router = self._build(["k1", "k2"], ["m:free"], sleep=lambda _s: None)
+        self.assertEqual(router.healthy_slot_count(), 2)
+
+        # Both slots return 401 -> all disabled -> exhaustion.
+        auth_exc = OpenRouterAuthError("unauthorized", status=401)
+        with patch(
+            "app.openrouter.chat",
+            side_effect=auth_exc,
+        ):
+            with self.assertRaises(AllSlotsExhaustedError):
+                router.chat([{"role": "user", "content": "hi"}])
+
+        # All slots are now disabled; subsequent calls also exhaust
+        # immediately without even reaching the network.
+        self.assertEqual(router.healthy_slot_count(), 0)
+        with self.assertRaises(AllSlotsExhaustedError):
+            router.chat([{"role": "user", "content": "hi"}])
+
+    def test_429_retries_then_rotates(self):
+        """A 429 must be retried once on the same slot, and only then
+        rotate to the next slot. If we rotated on the first 429 we
+        would burn through the whole pool in a single user message.
+        """
+        from app.openrouter import OpenRouterRateLimitError
+        from app.router import AllSlotsExhaustedError
+
+        rate_limited = OpenRouterRateLimitError("rate limit", status=429)
+        router = self._build(["k1", "k2"], ["m:free"], sleep=lambda _s: None)
+
+        call_count = {"n": 0}
+
+        def side_effect(*_a, **_k):
+            call_count["n"] += 1
+            raise rate_limited
+
+        with patch("app.openrouter.chat", side_effect=side_effect):
+            with self.assertRaises(AllSlotsExhaustedError):
+                router.chat([{"role": "user", "content": "hi"}])
+
+        # k1: first call + 1 retry = 2 calls, k2: first call + 1 retry = 2 calls
+        # = 4 total. Anything else means we are over- or under-rotating.
+        self.assertEqual(
+            call_count["n"], 4,
+            f"expected 4 total calls (2 slots × 2 attempts each), "
+            f"got {call_count['n']}",
+        )
+
+    def test_success_advances_cursor(self):
+        """After a successful call, the cursor must advance so the
+        next call lands on a different slot position. Otherwise we
+        keep hammering the same slot and never spread load.
+        """
+        router = self._build(
+            ["k1", "k2"],
+            ["m1:free", "m2:free"],
+        )
+        # 4 slots: k1/m1, k1/m2, k2/m1, k2/m2
+        self.assertEqual(router.healthy_slot_count(), 4)
+
+        # Stub the network so the real router.chat() runs to
+        # completion. The stub records the (key, model) pair, which
+        # is unique per slot, so we can identify the slot position
+        # unambiguously. (Using just the model id is ambiguous:
+        # k1/m1 and k2/m1 both look like model m1.)
+        seen_pairs: list[tuple[str, str]] = []
+
+        def fake_openrouter_chat(
+            _messages, *, model, api_key=None, **_kwargs
+):
+            seen_pairs.append((api_key, model))
+            return "ok"
+
+        with patch("app.openrouter.chat", side_effect=fake_openrouter_chat):
+            for _ in range(5):
+                router.chat([{"role": "user", "content": "hi"}])
+
+        # Translate each (key, model) pair to its slot index in
+        # the router's pool, so the assertion talks about positions
+        # (which the cursor advance code cares about) rather than
+        # the raw pair.
+        seen_positions: list[int] = []
+        for key, model in seen_pairs:
+            for i, slot in enumerate(router._slots):
+                if slot.api_key == key and slot.model_id == model:
+                    seen_positions.append(i)
+                    break
+
+        # 5 calls, 4 slot positions, cursor advances by 1 each
+        # time -> positions 0, 1, 2, 3, 0. The 5th call must wrap
+        # back to slot 0.
+        self.assertEqual(len(seen_positions), 5, f"saw: {seen_positions}")
+        self.assertEqual(
+            seen_positions,
+            [0, 1, 2, 3, 0],
+            f"cursor did not advance + wrap as expected: {seen_positions}",
+        )
+
+    def test_all_slots_exhausted_error_lists_tried_slots(self):
+        """The exhaustion error must expose which slots were tried
+        (with redacted keys) so the CLI / web UI can show the user
+        which slots were tried.
+        """
+        from app.openrouter import OpenRouterAuthError
+        from app.router import AllSlotsExhaustedError
+
+        router = self._build(
+            ["sk-or-v1-XXXXXXXXXXXXXXXX"],
+            ["m1:free", "m2:free"],
+        )
+        auth_exc = OpenRouterAuthError("nope", status=401)
+        with patch("app.openrouter.chat", side_effect=auth_exc):
+            with self.assertRaises(AllSlotsExhaustedError) as ctx:
+                router.chat([{"role": "user", "content": "hi"}])
+
+        exc = ctx.exception
+        # Structural access: tried_slots must be a list of redacted
+        # labels, one per slot that was tried.
+        self.assertEqual(len(exc.tried_slots), 2, f"got: {exc.tried_slots}")
+        joined = " ".join(exc.tried_slots)
+        self.assertIn("m1:free", joined)
+        self.assertIn("m2:free", joined)
+        self.assertIn("****", joined)
+        # The raw key must not appear in either the labels or the
+        # human-readable message.
+        self.assertNotIn("sk-or-v1-XXXXXXXXXXXXXXXX", joined)
+        self.assertNotIn("sk-or-v1-XXXXXXXXXXXXXXXX", str(exc))
+
+
+class BuildUserTurnTextTests(unittest.TestCase):
+    """Pin ``web.chat_helpers.build_user_turn_text`` so the file-upload
+    UX cannot regress.
+
+    The helper collapses uploaded files (which the OpenRouter chat-
+    completions endpoint cannot read) into a plain-text block. Tests
+    use a duck-typed fake that matches the
+    ``_UploadedFileLike`` Protocol (``name``, ``type``, ``size``,
+    ``read()``) so the Streamlit runtime is not required.
+    """
+
+    def setUp(self):
+        # Mirror the project-root-cd pattern used elsewhere in this file
+        # so a `python -m unittest tests.test_smoke` invocation from
+        # anywhere still resolves `from web.chat_helpers import ...`.
+        self._orig_cwd = os.getcwd()
+        self._orig_path = list(sys.path)
+        project_root = os.path.dirname(os.path.dirname(_STREAMLIT_VIEW))
+        os.chdir(project_root)
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
+        # Force a fresh import in case the helper changed during the
+        # test session (a previous test could have cached an older
+        # module).
+        for mod in list(sys.modules):
+            if mod == "web.chat_helpers" or mod.startswith("web.chat_helpers."):
+                del sys.modules[mod]
+
+    def tearDown(self):
+        os.chdir(self._orig_cwd)
+        sys.path[:] = self._orig_path
+
+    @staticmethod
+    def _fake_upload(name, mime, data):
+        class _FakeUpload:
+            def __init__(self, name, mime, data):
+                self.name = name
+                self.type = mime
+                self.size = len(data)
+                self._data = data
+
+            def read(self, n=-1):
+                if n is None or n < 0:
+                    return self._data
+                return self._data[:n]
+
+            def seek(self, *_args, **_kwargs):
+                return 0
+
+        return _FakeUpload(name, mime, data)
+
+    def test_text_only_passes_through_unchanged(self):
+        """When there are no files, the user text is returned as-is
+        (no trailing newlines, no header)."""
+        from web.chat_helpers import build_user_turn_text
+
+        out = build_user_turn_text("hello world", [])
+        self.assertEqual(out, "hello world")
+
+    def test_none_text_with_no_files_returns_empty_string(self):
+        """The view passes ``getattr(user_chat, "text", None)`` which
+        can legitimately be ``None`` (user attached files only). The
+        helper must coerce that to an empty string instead of raising
+        a ``TypeError`` on the ``+`` / join."""
+        from web.chat_helpers import build_user_turn_text
+
+        self.assertEqual(build_user_turn_text(None, []), "")
+        self.assertEqual(build_user_turn_text("", []), "")
+
+    def test_single_text_file_is_inlined_below_user_message(self):
+        """A textual attachment should appear after a blank line,
+        with a header that names the file and inlines the body."""
+        from web.chat_helpers import build_user_turn_text
+
+        fake = self._fake_upload(
+            "evidence.log", "text/plain", b"2024-01-01 ALERT bad.exe\n"
+        )
+        out = build_user_turn_text("explain this log", [fake])
+        self.assertTrue(
+            out.startswith("explain this log\n\n"),
+            f"expected text first then blank line; got: {out!r}",
+        )
+        self.assertIn("[Attached file: evidence.log", out)
+        self.assertIn("2024-01-01 ALERT bad.exe", out)
+
+    def test_binary_file_is_summarized_not_inlined(self):
+        """A binary attachment (PNG) must NOT have its raw bytes
+        inlined — the LLM would see garbage and the prompt would
+        balloon. Instead the header must contain a 'binary, not
+        inlined' marker."""
+        from web.chat_helpers import build_user_turn_text
+
+        png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 200
+        fake = self._fake_upload("screenshot.png", "image/png", png_bytes)
+        out = build_user_turn_text(None, [fake])
+
+        self.assertIn("[Attached file: screenshot.png (image/png", out)
+        self.assertIn("binary", out.lower())
+        # Raw PNG magic bytes must NOT appear in the prompt
+        self.assertNotIn(b"\x89PNG\r\n\x1a\n".decode("latin-1"), out)
+
+    def test_multiple_files_are_listed_in_order(self):
+        """When the user attaches 3 files, the prompt must list
+        them in the order they were attached and prefix with a
+        header that mentions the count."""
+        from web.chat_helpers import build_user_turn_text
+
+        files = [
+            self._fake_upload("a.py", "text/x-python", b"print(1)"),
+            self._fake_upload("b.log", "text/plain", b"line1\n"),
+            self._fake_upload("c.png", "image/png", b"\x89PNG\r\n\x1a\n"),
+        ]
+        out = build_user_turn_text("triaging", files)
+
+        self.assertIn("3 files", out)
+        # Order must be preserved (a appears before b before c).
+        idx_a = out.index("a.py")
+        idx_b = out.index("b.log")
+        idx_c = out.index("c.png")
+        self.assertLess(idx_a, idx_b)
+        self.assertLess(idx_b, idx_c)
+
+    def test_files_only_no_text_still_produces_a_prompt(self):
+        """If the user attaches files without typing anything, the
+        helper must still produce a non-empty prompt (the view's
+        `if prompt_text.strip():` guard would otherwise silently
+        drop the turn)."""
+        from web.chat_helpers import build_user_turn_text
+
+        fake = self._fake_upload(
+            "trace.json", "application/json", b'{"event":"x"}'
+        )
+        out = build_user_turn_text(None, [fake])
+        self.assertTrue(out.strip(), "files-only prompt was empty")
+        self.assertIn("trace.json", out)
+
+    def test_oversized_text_file_is_truncated_with_marker(self):
+        """A text file larger than the inline cap must be cut off
+        with a 'truncated' marker so the LLM does not see megabytes
+        of unrelated content."""
+        from web.chat_helpers import build_user_turn_text, _MAX_INLINE_BYTES
+
+        big = b"A" * (_MAX_INLINE_BYTES * 3)  # 3x the cap
+        fake = self._fake_upload("huge.log", "text/plain", big)
+        out = build_user_turn_text("review", [fake])
+
+        # The header must include the original size so the model
+        # knows how much was clipped.
+        self.assertIn(str(len(big)), out)
+        # And the body must NOT contain the full payload.
+        self.assertLess(len(out), len(big) + 200)
+        self.assertIn("truncat", out.lower())
+
+
+class StreamlitChatInputFileUploadTests(unittest.TestCase):
+    """Pin that ``st.chat_input`` is wired for file uploads.
+
+    These are source-level checks (not behavioral) because the
+    Streamlit widget cannot be invoked from a test process. The
+    goal is to fail loudly if someone reverts the chat input to a
+    plain text field.
+    """
+
+    def test_chat_input_uses_accept_file_multiple(self):
+        """The chat input must enable multi-file attachments. If this
+        regresses the user loses the 📎 button."""
+        src = _read_streamlit_view()
+        # Look for the chat_input call and verify the keyword is
+        # present. A naive substring check is fine because the
+        # widget is only called once in the view.
+        self.assertIn(
+            "accept_file=\"multiple\"",
+            src,
+            "st.chat_input must be called with accept_file=\"multiple\"; "
+            "otherwise the user cannot attach files.",
+        )
+
+    def test_chat_input_declares_an_accepted_file_type_whitelist(self):
+        """``file_type=`` must be set so Streamlit's browser-side
+        file picker filters to extensions the helper can actually
+        classify. An empty ``file_type=`` would let the user pick
+        anything and the helper's binary-summarization path would
+        swallow real content silently."""
+        src = _read_streamlit_view()
+        # Match `file_type=<something>` on the same logical line.
+        match = re.search(r"file_type\s*=\s*([A-Za-z_][A-Za-z0-9_]*)", src)
+        self.assertIsNotNone(
+            match,
+            "st.chat_input must be called with file_type=<list-or-name>; "
+            "an unrestricted picker will let users attach anything.",
+        )
+        # The variable must be non-empty at module level.
+        var_name = match.group(1)
+        with open(_STREAMLIT_VIEW, "r", encoding="utf-8") as fh:
+            full_src = fh.read()
+        decl_re = re.compile(
+            rf"^{re.escape(var_name)}\s*(?::\s*[^=]+)?=\s*\[([^\]]*)\]",
+            re.MULTILINE,
+        )
+        decl = decl_re.search(full_src)
+        self.assertIsNotNone(
+            decl,
+            f"could not find a list assignment for {var_name!r}",
+        )
+        items = [s.strip().strip('"\'') for s in decl.group(1).split(",") if s.strip()]
+        self.assertGreater(
+            len(items), 4,
+            f"{var_name} whitelist is too small ({len(items)} entries); "
+            "users won't be able to attach the common file types.",
+        )
+
+    def test_view_routes_uploaded_files_through_helper(self):
+        """The view must call ``build_user_turn_text`` with both
+        ``text`` and ``files`` pulled off the chat return value,
+        otherwise the uploaded files are silently dropped before
+        reaching the LLM."""
+        src = _read_streamlit_view()
+        self.assertIn("build_user_turn_text(", src)
+        # Both .text and .files must be extracted (so a refactor
+        # that drops either one fails this test).
+        self.assertIn(".text", src)
+        self.assertIn(".files", src)
+        # And the helper's output must gate the _ask() call so an
+        # empty prompt is not sent.
+        self.assertIn(
+            "prompt_text and prompt_text.strip()",
+            src,
+            "view must guard against empty prompts (files-only with "
+            "no recognised content would otherwise call _ask('')).",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

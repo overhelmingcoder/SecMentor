@@ -1,9 +1,12 @@
-# AI Security Chatbot (Stage 1)
+# 🛡 SecMentor
 
-A minimal, beginner-friendly chatbot that answers cybersecurity questions using a free LLM via [OpenRouter](https://openrouter.ai).
+> **AI-Powered Cybersecurity Learning & Analysis Platform**
+> Learn · Analyze · Defend · Research
 
-This is a **learning project** built in 7 phases plus a Session-4 post-hoc pass and a Session-7 multimodal pass:
+A Streamlit chatbot that answers cybersecurity questions using free LLMs routed through [OpenRouter](https://openrouter.ai). Built as a personal learning project across 7 phases plus a Session-4 post-hoc pass and a Session-7 multimodal pass:
 plain request/response → memory → prompt engineering → web UI → refactor → multi-model selector, two-pass pattern, friendly-error classifier → file & image upload (multimodal).
+
+The web UI ships in **CTF / Lab mentor** mode by default (a lab-scoped teaching persona that can produce runnable exploit snippets *for your own lab*), with a one-click switch to the conservative **Defensive (4-pillar)** prompt. The CLI keeps the defensive default so headless / scripted use stays in the tighter scope. Both modes share the same hard refusals — see the [Safety](#safety) section below.
 
 Layout note: the `phase3_cli/` and `phase6_web/` folder names from earlier phases were renamed to `cli/` and `web/` in Phase 7 once the teaching scaffold was no longer useful. The engines behind them are unchanged.
 
@@ -23,8 +26,8 @@ See `docs/technical_write_up.md` for the technical reference and
 ### 2. Clone and configure
 
 ```bash
-git clone <your-repo-url> ai-security-chatbot
-cd ai-security-chatbot
+git clone <your-repo-url> secmentor
+cd secmentor
 copy .env.example .env        # Windows
 # or:  cp .env.example .env   # macOS / Linux
 ```
@@ -32,10 +35,10 @@ copy .env.example .env        # Windows
 Open `.env` in any text editor and fill in:
 
 ```dotenv
-OPENROUTER_API_KEY=sk-or-v1-PASTE-YOUR-KEY-HERE
-OPENROUTER_MODEL=google/gemma-4-31b-it:free
+OPENROUTER_API_KEY=sk-or-v1-REPLACE_ME
+OPENROUTER_MODEL=provider/model-name:free
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1/chat/completions
-OPENROUTER_APP_NAME=AI Security Chatbot (Stage 1)
+OPENROUTER_APP_NAME=SecMentor
 ```
 
 > **Free-model heads-up.** The `:free` tier is rate-limited per provider
@@ -100,13 +103,18 @@ Expected: `Ran 133 tests in …` → `OK`.
 ## Project layout
 
 ```
-app/             # Core library: config, OpenRouter client, router, prompts, file_processor (multimodal)
-cli/             # Terminal interface (defensive prompt by default)
-web/             # Streamlit web interface + pure UI-logic helpers
-tests/           # Automated checks (unittest, 133 tests: 28 file + 105 smoke)
-docs/            # Technical and personal study logs
-verify_changes.py  # Pre-flight check (catches stale-worker import errors)
-improvements.md  # Change-log + tuning guide for offensive / defensive behavior
+app/              # Core library: config, OpenRouter client, router, prompts, file_processor (multimodal)
+cli/              # Terminal interface (defensive prompt by default)
+web/              # Streamlit web interface + pure UI-logic helpers
+tests/            # Automated checks (unittest, 133 tests: 28 file + 105 smoke)
+docs/             # Technical and personal study logs
+.streamlit/
+  config.toml     # Theme pin: light base, dark text, enterprise-blue accent
+verify_changes.py # Pre-flight check (catches stale-worker import errors)
+run.py            # One-command runner: venv + deps + .env bootstrap + streamlit
+improvements.md   # Change-log + tuning guide for offensive / defensive behavior
+probe_nemotron.py # One-off script used during multimodal bring-up (kept for reference)
+probe_post_fix.py # One-off script used after the white-on-white fix (kept for reference)
 ```
 
 Key files:
@@ -117,18 +125,19 @@ Key files:
 - `app/prompts.py` — The two system prompts: `CYBERSECURITY_SYSTEM_PROMPT` (defensive, four pillars) and `OFFENSIVE_MENTOR_SYSTEM_PROMPT` ("SecMentor", lab-scope). The web UI can swap between them from the sidebar.
 - `app/file_processor.py` — Multimodal file pipeline: `process_upload(uploaded_file)` returns `ProcessedFile(text, image_b64, mime)`. Handles PDF (text extract via pymupdf, lazy-imported), PNG/JPG/GIF/WebP images (base64, 4 MB cap), raises 8 typed `FileProcessingError` kinds. No Streamlit dependency.
 - `cli/chatbot.py` — REPL-style terminal chat. Always uses the defensive prompt.
-- `web/streamlit_app.py` — The Streamlit view. `sys.path` bootstrap, sidebar (model selector + teaching-mode radio + file uploader), `_init_state`, two-pass `_ask` driver (`pending_request` in `session_state`), `_render_friendly_error`.
+- `web/streamlit_app.py` — The Streamlit view. `sys.path` bootstrap, sidebar (model selector + **teaching mode** radio + **Layout mode** radio + file uploader), `_init_state`, two-pass `_ask` driver (`pending_request` in `session_state`), `_render_friendly_error`. Theme is pinned via `.streamlit/config.toml`; the design-token CSS in this file adds light-mode guards so OS / browser dark-mode UA stylesheets cannot override text colour.
 - `web/chat_helpers.py` — Pure UI-logic helpers: `_active_system_prompt(state)` (the teaching-mode → prompt bridge, fail-closed), `_is_rate_limit_error`, `_friendly_error_message`, `_build_messages`, `_truncate_history`, `_serialize_for_download`, `_count_chars`, `_bubble_alignment`, **and the multimodal bridge**: `_is_image_mime`, `_is_pdf_mime`, `build_user_turn_content` (returns `str | list[dict]` — text-only OR OpenAI vision content array), `select_model_for_request` (auto-upgrades to a vision-capable model when the turn contains an image), and `_DEFAULT_FREE_VISION_MODEL = "nvidia/nemotron-nano-12b-v2-vl:free"`. No Streamlit calls in any of these.
-- `tests/test_smoke.py` — 105 tests across 18 classes. Covers the engine, the helpers, the view contracts, the two-pass pattern, the model selector, the friendly-error path, the multi-key router, the prompt boundary, and the `sys.path` bootstrap.
+- `tests/test_smoke.py` — 105 tests across 18 classes. Covers the engine, the helpers, the view contracts, the two-pass pattern, the model selector, the friendly-error path, the multi-key router, the prompt boundary, the `sys.path` bootstrap, and the new `key="teaching_mode"` radio windowed-search guard.
 - `tests/test_files.py` — 28 tests across 14 classes. Covers `app/file_processor.py` (PDF text extraction, image bytes, MIME detection, size cap, error taxonomy) and the multimodal bridge in `web/chat_helpers.py` (vision auto-upgrade, stub-block path, fallback model, base64 encoding).
 - `verify_changes.py` — Pre-flight script: `READY` / `STALE_WORKER: kill PIDs …` / `IMPORT_BROKEN`. Uses `Get-CimInstance` and `Get-NetTCPConnection` to find stale workers before they bite.
-- `improvements.md` — The change-log. Section A documents the offensive behavior (the SecMentor prompt, the swap, how to tune it). Section B documents the requirement-issue solutions (5 keys, multi-model, friendly errors, two-pass, pre-flight). Section C lists future improvement suggestions.
+- `run.py` — One-command runner. Locates a Python 3.11+ interpreter, creates `.venv/`, installs `requirements.txt`, copies `.env.example → .env` if missing, runs `verify_changes.py`, then launches `streamlit run web/streamlit_app.py` in the foreground (or detached with `--detach`).
+- `improvements.md` — The change-log. Section A documents the offensive behavior (the SecMentor prompt, the swap, how to tune it). Section B documents the requirement-issue solutions (5 keys, multi-model, friendly errors, two-pass, pre-flight, light-mode pin). Section C lists future improvement suggestions.
 
 ---
 
 ## How to run it on your own
 
-p```bash
+```bash
 python run.py
 ```
 
@@ -152,6 +161,18 @@ python run.py --detach        # run in the background (CI / scripts)
 6. Errors are classified at the helper layer (`_is_rate_limit_error`) and rendered at the view layer (`_render_friendly_error`). The raw exception is kept in a collapsed `st.expander` for debugging.
 7. The same question twice in one session hits an in-memory cache (no second upstream call).
 8. `/clear` (or the sidebar Reset) wipes the transcript without a server restart.
+
+### Web UI features
+
+The view file (`web/streamlit_app.py`) renders a **production-grade cybersecurity aesthetic** inspired by Microsoft Security Copilot, CrowdStrike Falcon, Palo Alto Cortex, Datadog, and GitHub Enterprise — not a generic ChatGPT look. Specifically:
+
+- **Hero card** — eyebrow + 🛡 **SecMentor** wordmark + new subtitle + tagline + 5 capability badges (Cybersecurity Mentor · Security Research · File Analysis · CTF & Lab Guidance · Multi-Model AI).
+- **Layout mode** (sidebar radio) — Compact / Standard / Wide / Full width. The choice is persisted in `localStorage` and applied to `<body>` via a small inline `<script>`, so the density survives page reloads. CSS variables under each `.layout-*` body class control bubble width, padding, and chat-input width.
+- **Empty-state card** — icon + heading + description + four suggestion chips (`Explain a recent CVE`, `Walk me through a web attack chain`, `Harden a Linux server`, `Review a log excerpt for IOCs`).
+- **Light-mode theme pin** — `.streamlit/config.toml` sets `base = "light"`, `textColor = "#0f172a"`, `backgroundColor = "#f4f6fa"`, `primaryColor = "#1d4ed8"`. The CSS adds `color-scheme: light !important` on `:root` and `body, .stApp, .stApp *` plus high-specificity `!important` rules on every text element in the main column and inside assistant bubbles. This is the **fix for the white-on-white text bug** reported during development — Streamlit's theme follows the OS / browser dark-mode preference, and the unguarded CSS lost the cascade war to the UA stylesheet.
+- **Status pill** — model, model id, slot health, and a thinking-spinner modifier on the right, all in a single styled bar with separator dots.
+- **Chat input** — framed as a card with shadow, accent-blue caret, and a Send button styled to match the rest of the UI.
+- **Dark code blocks** in assistant bubbles — `#0f172a` background, `#e2e8f0` text, so fenced code blocks stay readable inside a light bubble.
 
 ### Teaching mode (sidebar)
 
@@ -228,7 +249,7 @@ The project is a small Streamlit app. There is no database, no auth, no backgrou
 ```bash
 git init
 git add .
-git commit -m "Initial commit — AI Security Chatbot (Stage 1)"
+git commit -m "Initial commit — SecMentor (Stage 1)"
 git branch -M main
 git remote add origin https://github.com/<your-username>/<your-repo>.git
 git push -u origin main
@@ -259,7 +280,7 @@ Streamlit Cloud does not read your `.env` file. It uses its own secrets manager.
    OPENROUTER_API_KEY = "sk-or-v1-PASTE-YOUR-KEY-HERE"
    OPENROUTER_MODEL = "google/gemma-4-31b-it:free"
    OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
-   OPENROUTER_APP_NAME = "AI Security Chatbot (Stage 1)"
+   OPENROUTER_APP_NAME = "SecMentor"
    ```
 
 3. Click **Save**. The app reruns automatically.
@@ -428,5 +449,6 @@ curl -sf http://127.0.0.1:8501/_stcore/health
 
 ## License & credits
 
-This is a personal learning project. The OpenRouter API is used under their terms of service. The system prompt in `app/prompts.py` is original, written for defensive cybersecurity education.
-# SecMentor
+MIT — see `LICENSE`.
+
+This is a personal learning project. The OpenRouter API is used under their terms of service. The system prompts in `app/prompts.py` are original, written for defensive cybersecurity education and lab-scoped offensive mentoring.

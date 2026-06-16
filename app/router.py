@@ -1,0 +1,475 @@
+"""Multi-key, multi-model rotation layer for OpenRouter free-tier calls.
+
+Why this module exists
+----------------------
+
+The OpenRouter *free* tier caps each **account** at roughly 50
+requests per day (per model host), not per API key. Adding a second
+key on the same account does not give us more budget — but adding a
+second key on a **different account** does, and adding a second
+**model id** (a different upstream provider) does too. So the
+practical way to keep the demo running is to rotate across a small
+pool of (api_key, model_id) pairs and to never, ever silently swap
+in a paid model.
+
+This module owns the pool, the per-slot health state, the retry
+policy, and the "did we exceed the daily cap" detection. The view
+(``web/streamlit_app.py``) and the CLI (``cli/chatbot.py``) just call
+``router.chat(messages)`` and treat the result as a string.
+
+Design rules
+------------
+
+1. **Fail loud, not silent.** If every healthy slot is exhausted, the
+   router raises the *last* error it saw so the caller can show a
+   meaningful error to the user. We never return a truncated answer
+   just because "something sort of worked".
+2. **No silent paid fallback.** Every model id handed to the router
+   is checked for the ``:free`` suffix. A non-free id is rejected at
+   ``__init__`` time, not at call time, so a typo cannot burn a
+   credit mid-conversation.
+3. **Auth errors are sticky.** A 401/403 from a slot disables it for
+   the rest of the session. Retrying a dead key just wastes the
+   caller's latency budget.
+4. **Rate limits get a short backoff, then rotate.** A 429 sleeps
+   for ``backoff_seconds`` (or the upstream ``Retry-After`` value if
+   the response sent one) and then tries the same slot once more
+   before moving on.
+5. **Server errors retry once on the same slot, then rotate.** A
+   5xx is usually transient and the same slot will often recover.
+6. **Client errors (4xx other than 401/403/429) are terminal.** The
+   request is malformed or the model is wrong; retrying will not
+   help. We rotate immediately.
+7. **Keys are never logged.** The model id and the error *class* are
+   the only things that go to the logger. The key prefix is masked
+   to its last four characters everywhere it surfaces.
+
+This module imports from ``app.openrouter`` only — it does not
+re-implement HTTP. ``app.openrouter`` does not know about rotation;
+that keeps the boundary clean and makes the router testable in
+isolation with a stubbed ``openrouter.chat``.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Iterable, Iterator, Sequence
+
+from app import openrouter
+
+logger = logging.getLogger(__name__)
+
+
+# --- Public exceptions -------------------------------------------------------
+
+
+class RouterError(RuntimeError):
+    """Base class for every failure the router itself can raise.
+
+    Distinct from ``openrouter.OpenRouterError`` so the caller can
+    branch on "the upstream is the problem" vs "the pool is
+    exhausted". Inherits from ``RuntimeError`` for symmetry with
+    ``OpenRouterError``.
+    """
+
+
+class NoFreeModelConfiguredError(RouterError):
+    """Raised at ``__init__`` time when the caller hands the router
+    a model id that does not end in ``:free``."""
+
+
+class AllSlotsExhaustedError(RouterError):
+    """Raised at call time when every healthy slot has been tried
+    and all of them failed.
+
+    Carries the most recent upstream exception as ``__cause__``,
+    the count of attempted slots, and the list of tried slot
+    labels (with redacted keys) for the UI / CLI to display.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        attempts: int,
+        tried_slots: Sequence[str] = (),
+    ) -> None:
+        super().__init__(message)
+        self.attempts: int = attempts
+        self.tried_slots: list[str] = list(tried_slots)
+
+
+# --- Internal data model -----------------------------------------------------
+
+
+@dataclass
+class KeySlot:
+    """One (api_key, model_id) pair plus its in-memory health state.
+
+    The router owns the health state — ``chat()`` is the only thing
+    that mutates ``disabled`` and ``last_error``. Callers should
+    treat the slot as opaque; they receive the public
+    ``api_key_prefix`` and ``model_id`` for logging only.
+    """
+
+    api_key: str
+    model_id: str
+    # A 401/403 from this slot flips this to True and leaves it True
+    # for the rest of the session. The router skips disabled slots
+    # without burning a round-trip.
+    disabled: bool = False
+    # The most recent error from this slot, kept for diagnostics
+    # only. Never used to make routing decisions — those decisions
+    # are based on the *class* of the error and the disabled flag.
+    last_error: BaseException | None = field(default=None)
+
+    def redacted_key(self) -> str:
+        """Return a key string safe to put in logs / error messages.
+
+        The full key never leaves this module. We keep the last four
+        characters for debuggability (two accounts on the same email
+        is a real thing) and mask the rest.
+        """
+        if len(self.api_key) <= 4:
+            return "****"
+        return "****" + self.api_key[-4:]
+
+    def short_label(self) -> str:
+        """A short, log-friendly identifier for this slot.
+
+        Format: ``"<model_id> via ****abcd"`` — enough to tell two
+        slots apart without leaking the key.
+        """
+        return f"{self.model_id} via {self.redacted_key()}"
+
+
+# --- The router itself -------------------------------------------------------
+
+
+class ModelRouter:
+    """Rotate across a pool of (api_key, model_id) free-tier slots.
+
+    Parameters
+    ----------
+    slots
+        Sequence of ``(api_key, model_id)`` pairs. Order matters: the
+        router starts at slot 0 and wraps around. Duplicate pairs
+        are allowed (two keys on the same model) and the pool is
+        taken as-is.
+    backoff_seconds
+        How long to sleep on a 429 before retrying the same slot.
+        OpenRouter's free providers usually send a ``Retry-After``
+        header in seconds; we use that value if it is present and
+        larger, otherwise this default.
+    max_attempts
+        Hard cap on the number of (slot, retry) pairs we will try
+        for a single ``chat`` call. Defaults to ``len(slots) * 2``:
+        once around the pool, plus one retry on the same slot for
+        transient errors. Set lower to fail fast; the cap exists to
+        guarantee termination even if a bug sets every slot to
+        "transient".
+    sleep
+        Indirection for ``time.sleep`` so tests can fast-forward
+        backoff without actually sleeping. Defaults to
+        ``time.sleep``. Tests pass a no-op.
+    """
+
+    def __init__(
+        self,
+        slots: Sequence[tuple[str, str]],
+        *,
+        backoff_seconds: float = 1.0,
+        max_attempts: int | None = None,
+        sleep: "callable" = time.sleep,
+    ) -> None:
+        if not slots:
+            raise NoFreeModelConfiguredError(
+                "ModelRouter needs at least one (api_key, model_id) slot."
+            )
+
+        # Validate every model id up front. Catching a typo at init
+        # time is far better than catching it on the first user
+        # message at 02:00.
+        for _api_key, model_id in slots:
+            if not model_id.endswith(":free"):
+                raise NoFreeModelConfiguredError(
+                    f"ModelRouter only accepts free-tier model ids "
+                    f"(must end with ':free'). Got: {model_id!r}. "
+                    "Refusing to silently fall back to a paid model."
+                )
+
+        # Defensive copy of the key strings so a caller mutating
+        # their original list does not affect us. (We never mutate
+        # the key ourselves, but copy-on-ingest is cheap and
+        # removes a class of bug.)
+        self._slots: list[KeySlot] = [
+            KeySlot(api_key=api_key, model_id=model_id)
+            for api_key, model_id in slots
+        ]
+        self._start_index: int = 0
+        self._backoff_seconds: float = backoff_seconds
+        self._max_attempts: int = (
+            max_attempts if max_attempts is not None else len(self._slots) * 2
+        )
+        self._sleep = sleep
+
+        logger.info(
+            "ModelRouter initialised with %d slot(s): %s",
+            len(self._slots),
+            ", ".join(s.short_label() for s in self._slots),
+        )
+
+    # --- Introspection (used by the UI caption and the live probe) ----
+
+    def slot_labels(self) -> list[str]:
+        """Return a snapshot of the public labels for every slot,
+        including disabled ones. The UI uses this to render the
+        "current pool" caption."""
+        return [s.short_label() for s in self._slots]
+
+    def healthy_slot_count(self) -> int:
+        """Number of slots that have not been permanently disabled
+        by a 401/403. The UI uses this to show a warning if we are
+        down to the last slot."""
+        return sum(1 for s in self._slots if not s.disabled)
+
+    # --- The main entry point ------------------------------------------
+
+    def chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
+        """Send ``messages`` to a healthy slot and return the
+        assistant's text.
+
+        The router walks the pool starting at ``_start_index``,
+        wrapping around. A slot that returns ``OpenRouterAuthError``
+        is disabled for the rest of the session and we move on
+        immediately. A slot that returns ``OpenRouterRateLimitError``
+        gets a short backoff, then a second chance on the same
+        slot, then rotation. A ``OpenRouterServerError`` is retried
+        once on the same slot, then rotated. A
+        ``OpenRouterClientError`` rotates immediately.
+
+        If every healthy slot has been tried and all of them failed,
+        the router raises ``AllSlotsExhaustedError`` whose
+        ``__cause__`` is the most recent upstream exception.
+
+        The caller's ``messages`` list is passed through unchanged;
+        the router never inspects or rewrites the content.
+        """
+        last_error: BaseException | None = None
+        attempts = 0
+        tried_slots: list[str] = []
+
+        # ``_start_index`` is the "where to begin" cursor. We bump
+        # it after a *successful* call so the next user turn does
+        # not always start at slot 0 — that gives a fair load
+        # distribution across keys even if the user is hammering
+        # the same model.
+        for slot in self._iter_healthy_slots_starting_at(self._start_index):
+            # Each slot gets up to two chances: an initial call and
+            # (for transient errors) one immediate retry after a
+            # short backoff. That maps to the
+            # ``max_attempts = len(slots) * 2`` default.
+            for retry_index in range(2):
+                attempts += 1
+                if attempts > self._max_attempts:
+                    logger.warning(
+                        "ModelRouter hit max_attempts=%d, giving up",
+                        self._max_attempts,
+                    )
+                    raise AllSlotsExhaustedError(
+                        f"ModelRouter exhausted after {self._max_attempts} "
+                        f"attempts across {len(self._slots)} slot(s). "
+                        f"Last error: {last_error}",
+                        attempts=attempts,
+                        tried_slots=tried_slots,
+                    ) from last_error
+
+                try:
+                    text = openrouter.chat(
+                        messages,
+                        model=slot.model_id,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        api_key=slot.api_key,
+                    )
+                except openrouter.OpenRouterAuthError as exc:
+                    # 401/403: the key is dead. Disable for the
+                    # rest of the session and move on immediately.
+                    slot.disabled = True
+                    slot.last_error = exc
+                    last_error = exc
+                    tried_slots.append(slot.short_label())
+                    logger.warning(
+                        "Slot %s returned auth error (status=%s); "
+                        "disabling for this session",
+                        slot.short_label(),
+                        exc.status,
+                    )
+                    break  # out of the inner retry loop
+                except openrouter.OpenRouterRateLimitError as exc:
+                    # 429: transient. Sleep, retry the same slot
+                    # once, then move on if it 429s again.
+                    slot.last_error = exc
+                    last_error = exc
+                    sleep_for = self._backoff_for(exc)
+                    logger.info(
+                        "Slot %s rate-limited (status=%s); sleeping "
+                        "%.2fs before retry",
+                        slot.short_label(),
+                        exc.status,
+                        sleep_for,
+                    )
+                    if retry_index == 0:
+                        self._sleep(sleep_for)
+                        continue  # try the same slot one more time
+                    tried_slots.append(slot.short_label())
+                    logger.info(
+                        "Slot %s still rate-limited after backoff; "
+                        "rotating to next slot",
+                        slot.short_label(),
+                    )
+                    break  # out of the inner retry loop, move to next slot
+                except openrouter.OpenRouterServerError as exc:
+                    # 5xx or network error: transient. Retry once on
+                    # the same slot (with a small sleep), then
+                    # rotate.
+                    slot.last_error = exc
+                    last_error = exc
+                    sleep_for = self._backoff_seconds
+                    if retry_index == 0:
+                        self._sleep(sleep_for)
+                        continue
+                    tried_slots.append(slot.short_label())
+                    logger.info(
+                        "Slot %s returned server error (status=%s); "
+                        "transient, rotated after retry",
+                        slot.short_label(),
+                        exc.status,
+                    )
+                    break  # rotate
+                except openrouter.OpenRouterClientError as exc:
+                    # 4xx other than 401/403/429: the request is
+                    # malformed or the model is wrong. Rotating
+                    # will not help, but we move on rather than
+                    # burning the rest of the pool.
+                    slot.last_error = exc
+                    last_error = exc
+                    tried_slots.append(slot.short_label())
+                    logger.warning(
+                        "Slot %s returned client error (status=%s); "
+                        "rotating (won't retry same slot)",
+                        slot.short_label(),
+                        exc.status,
+                    )
+                    break  # rotate
+                else:
+                    # Success. Advance the start cursor past this
+                    # slot for the next call so the load spreads
+                    # fairly across keys. ``disabled`` slots are
+                    # skipped, so the cursor is over the *healthy*
+                    # pool only.
+                    self._start_index = (
+                        (self._slots.index(slot) + 1) % len(self._slots)
+                    )
+                    return text
+
+        # If we fell out of the for-loop without returning, every
+        # healthy slot is exhausted. Raise with the most recent
+        # error as the cause and the list of tried slots (with
+        # redacted keys) so the UI can show both the upstream
+        # message and which slots were tried.
+        raise AllSlotsExhaustedError(
+            f"ModelRouter tried every healthy slot and all "
+            f"{attempts} attempt(s) failed. Tried: "
+            f"{', '.join(tried_slots) or '<none>'}. "
+            f"Last error: {last_error}",
+            attempts=attempts,
+            tried_slots=tried_slots,
+        ) from last_error
+
+    # --- Internal helpers ----------------------------------------------
+
+    def _iter_healthy_slots_starting_at(self, start: int) -> Iterator[KeySlot]:
+        """Yield each non-disabled slot exactly once, starting at
+        ``start`` and wrapping around.
+
+        A fully-disabled pool yields nothing and the call site
+        raises ``AllSlotsExhaustedError`` with the last error it
+        saw (or, if every slot is disabled before any call was
+        made, with no cause at all).
+        """
+        n = len(self._slots)
+        for offset in range(n):
+            slot = self._slots[(start + offset) % n]
+            if not slot.disabled:
+                yield slot
+
+    def _backoff_for(self, exc: openrouter.OpenRouterRateLimitError) -> float:
+        """Pick a sleep duration for a 429.
+
+        If the exception carries an upstream ``Retry-After`` value
+        (we read it from ``exc.body`` for now — OpenRouter sends
+        it as part of the JSON body on most providers, e.g.
+        ``{"error": {"metadata": {"retry_after": 19}}}``) we use
+        the larger of that and the configured default. Otherwise
+        we use the default.
+        """
+        default = self._backoff_seconds
+        if not exc.body:
+            return default
+        # Best-effort parse: we tolerate both the OpenAI-style
+        # ``{"error": {"message": "...retry_after..."}}`` envelope
+        # and a bare number. We never raise from this helper — a
+        # parse error just means we fall back to the default.
+        try:
+            import json
+            payload = json.loads(exc.body)
+            # OpenRouter typically nests: error.metadata.retry_after
+            retry_after = (
+                payload.get("error", {})
+                .get("metadata", {})
+                .get("retry_after")
+            )
+            if isinstance(retry_after, (int, float)) and retry_after > 0:
+                return max(default, float(retry_after))
+        except (ValueError, AttributeError, TypeError):
+            pass
+        return default
+
+
+# --- Module-level convenience ------------------------------------------------
+
+
+def build_from_config(
+    keys: Iterable[str],
+    models: Iterable[str],
+    **kwargs: object,
+) -> ModelRouter:
+    """Build a ``ModelRouter`` from the config layer's key + model
+    iterables.
+
+    The Cartesian product is intentional: every key is paired with
+    every model, so two keys on three models gives six slots. This
+    is the simplest, most predictable layout — the alternative
+    (round-robin pair, so key1+model1, key2+model2) hides the
+    effective pool size from the user.
+    """
+    keys_list = [k for k in keys if k]  # drop empty strings silently
+    models_list = [m for m in models if m]
+    if not keys_list or not models_list:
+        raise NoFreeModelConfiguredError(
+            "build_from_config needs at least one key and one model."
+        )
+    slots: list[tuple[str, str]] = []
+    for key in keys_list:
+        for model in models_list:
+            slots.append((key, model))
+    return ModelRouter(slots, **kwargs)

@@ -1,0 +1,8 @@
+# Pinned for reproducibility. Add new dependencies here as we use them.
+requests>=2.31.0
+python-dotenv>=1.0.0
+streamlit>=1.39.0,<1.50
+# PDF text extraction for uploaded-file support (Phase 11). PyMuPDF is
+# imported lazily inside `app/file_processor.py` so the rest of the
+# engine still starts on systems where pymupdf is not installed.
+pymupdf>=1.24.0
