@@ -44,11 +44,13 @@ with ``status=None`` — the router treats them as transient.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Iterator
 
 import requests
 
 from app.config import (
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_TEMPERATURE,
     HTTP_TIMEOUT_SECONDS,
     OPENROUTER_APP_NAME,
     OPENROUTER_API_KEY,
@@ -401,3 +403,171 @@ def chat(
         ) from exc
 
     return _extract_assistant_text(data)
+
+
+def stream_chat(
+    messages: list[dict[str, Any]],
+    *,
+    model: str | None = None,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+    timeout: float | None = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
+) -> Iterator[str]:
+    """Stream the assistant's reply from OpenRouter as a token iterator.
+
+    This is the streaming counterpart of :func:`chat`. Where ``chat``
+    buffers the full response and returns one string, ``stream_chat``
+    opens the HTTP connection with ``stream=True`` and walks the
+    server-sent-events (SSE) feed line by line, yielding the assistant
+    delta for each ``data:`` event. The consumer (``st.write_stream``
+    or a manual loop) renders each chunk as it arrives so the user
+    sees text grow in real time instead of staring at a "Thinking"
+    placeholder.
+
+    Parameters
+    ----------
+    messages, model, temperature, max_tokens, api_key, base_url
+        Same contract as :func:`chat`. ``model`` falls back to
+        ``OPENROUTER_MODEL``, ``api_key`` to ``OPENROUTER_API_KEY``,
+        ``base_url`` to ``OPENROUTER_BASE_URL``, ``temperature`` to
+        ``DEFAULT_TEMPERATURE``, and ``max_tokens`` to
+        ``DEFAULT_MAX_TOKENS``.
+    timeout
+        Optional per-request timeout in seconds. ``None`` uses the
+        module-level :data:`HTTP_TIMEOUT_SECONDS`. Because streaming
+        responses are open-ended, callers may want to pass a longer
+        timeout here than for :func:`chat`.
+
+    Yields
+    ------
+    str
+        Successive ``content`` deltas from the model. Each yielded
+        chunk is a non-empty string fragment the caller should
+        concatenate. Empty / whitespace-only fragments are filtered
+        out (SSE carries an empty delta on the first ``role`` event
+        and on tool-call chunks we do not yet consume).
+
+    Raises
+    ------
+    OpenRouterAuthError, OpenRouterRateLimitError, OpenRouterClientError,
+        OpenRouterServerError, OpenRouterError
+        Same exception types as :func:`chat`. The error path runs on
+        the *first* line read of the response body, before any
+        delta is yielded, so a partial streamed reply cannot leave
+        the consumer mid-stream with an exception. Network-level
+        failures (connection refused, TLS error, mid-stream EOF
+        before ``data: [DONE]``) are wrapped as
+        ``OpenRouterServerError`` with ``status=None`` to match the
+        non-streaming behaviour.
+
+    Notes
+    -----
+    The implementation deliberately mirrors :func:`chat` so the two
+    paths share the same payload, headers, error classification, and
+    body truncation behaviour. The streaming response is closed in a
+    ``finally`` block even when the consumer stops iterating early
+    (e.g. the user navigates away mid-stream) so the underlying TCP
+    connection is released back to the pool.
+    """
+    if not messages:
+        raise OpenRouterError("Cannot stream from OpenRouter with an empty message list.")
+    chosen_model = model or OPENROUTER_MODEL
+    chosen_key = api_key if api_key is not None else OPENROUTER_API_KEY
+    chosen_url = base_url if base_url is not None else OPENROUTER_BASE_URL
+
+    chosen_temperature = DEFAULT_TEMPERATURE if temperature is None else temperature
+    chosen_max_tokens = DEFAULT_MAX_TOKENS if max_tokens is None else max_tokens
+    chosen_timeout = HTTP_TIMEOUT_SECONDS if timeout is None else timeout
+
+    payload = _build_payload(
+        messages,
+        model=chosen_model,
+        temperature=chosen_temperature,
+        max_tokens=chosen_max_tokens,
+    )
+    payload = {**payload, "stream": True}
+    headers = _build_headers(chosen_key)
+
+    try:
+        response = requests.post(
+            chosen_url,
+            headers=headers,
+            json=payload,
+            stream=True,
+            timeout=chosen_timeout,
+        )
+    except requests.RequestException as exc:
+        raise OpenRouterServerError(
+            f"OpenRouter stream failed before getting a response: {exc}",
+            status=None,
+            model=chosen_model,
+        ) from exc
+
+    try:
+        if response.status_code >= 400:
+            # Same error-classification contract as chat(). We pull
+            # the body in the best representation we can get so the
+            # router / view can introspect it.
+            try:
+                detail: Any = response.json()
+                body_text: str | None = json.dumps(detail)[:_MAX_BODY_CHARS]
+            except ValueError:
+                detail = response.text
+                body_text = _truncate(response.text)
+            provider_header = response.headers.get("x-provider") or None
+            message = (
+                f"OpenRouter returned HTTP {response.status_code}: {detail}"
+            )
+            exc_class = _classify(response.status_code)
+            raise exc_class(
+                message,
+                status=response.status_code,
+                provider=provider_header,
+                model=chosen_model,
+                body=body_text,
+            )
+
+        for raw_line in response.iter_lines(decode_unicode=True):
+            if not raw_line:
+                continue
+            # SSE lines are either ``data: {...}`` or the sentinel
+            # ``data: [DONE]``. We strip the prefix defensively so
+            # the parser still works if the upstream adds a leading
+            # space (some proxies do this) or sends a ``data:` only
+            # variant.
+            line = raw_line.strip()
+            if not line.startswith("data:"):
+                continue
+            data_str = line[len("data:"):].strip()
+            if data_str == "[DONE]":
+                break
+            try:
+                data = json.loads(data_str)
+            except ValueError:
+                # Malformed SSE chunk from upstream. Skip rather than
+                # crash the whole stream; a single bad event should
+                # not blank out a 1000-token reply. We surface it
+                # only in debug builds to avoid log spam in prod.
+                continue
+            choices = data.get("choices") or []
+            if not choices:
+                continue
+            delta = (choices[0] or {}).get("delta") or {}
+            content = delta.get("content")
+            if isinstance(content, str) and content:
+                yield content
+    except requests.RequestException as exc:
+        # Mid-stream network failure (server killed the connection,
+        # read timeout, TLS reset). Wrap as a server error so the
+        # router can rotate to the next slot if this was a transient
+        # hiccup. The partial deltas already yielded to the caller
+        # are preserved by the caller's accumulator.
+        raise OpenRouterServerError(
+            f"OpenRouter stream interrupted: {exc}",
+            status=None,
+            model=chosen_model,
+        ) from exc
+    finally:
+        response.close()

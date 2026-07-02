@@ -44,7 +44,7 @@ from app.config import (
     iter_api_keys,
     iter_models,
 )
-from app.openrouter import OpenRouterError, chat
+from app.openrouter import OpenRouterError, chat, stream_chat
 from app.router import (
     AllSlotsExhaustedError,
     ModelRouter,
@@ -65,8 +65,11 @@ from web.chat_helpers import (
     _active_system_prompt,
     _bubble_alignment,
     _build_messages,
+    _copy_button_html,
+    _copy_button_html_for_bubble,
     _count_chars,
     _friendly_error_message,
+    _render_copy_button_for_bubble,
     _serialize_for_download,
     _truncate_history,
     build_user_turn_content,
@@ -390,7 +393,9 @@ _CUSTOM_CSS = """
         color: var(--text-primary) !important;
         padding: var(--bubble-pad-y) var(--bubble-pad-x);
         border-radius: 14px 14px 14px 4px;
-        display: inline-block;
+        display: inline-flex;
+        flex-direction: column;
+        align-items: stretch;
         max-width: var(--bubble-max);
         border: 1px solid var(--border-subtle);
         box-shadow: var(--shadow-sm);
@@ -398,6 +403,11 @@ _CUSTOM_CSS = """
         font-size: 0.95rem;
         word-wrap: break-word;
     }
+    /* The first child is the rendered markdown body; everything after
+       it (the copy button, any future action chips) hugs the bottom of
+       the bubble. */
+    .bubble-assistant > :first-child { min-width: 0; }
+    .bubble-assistant > :not(:first-child) { margin-top: 0.45rem; }
     /* Force every element inside the assistant bubble to inherit dark
        text — Streamlit wraps rendered markdown in a <p> which would
        otherwise pick up the page-level white text. */
@@ -467,6 +477,42 @@ _CUSTOM_CSS = """
         font-style: italic;
     }
     .bubble-thinking * { color: var(--text-secondary) !important; }
+
+    /* ---------- Copy-to-clipboard button (Tier 1 #4) ------------------
+       Sits inside the assistant bubble, right-aligned at the bottom,
+       ChatGPT-style. Theme-aware (light surface on the navy page),
+       tiny, hover hint. The whole button is a single inline <button>
+       rendered by ``web.chat_helpers._copy_button_html``; we only
+       style it here. */
+    .bubble-copy-btn {
+        align-self: flex-end;
+        margin-top: 0.45rem;
+        background: transparent !important;
+        color: var(--text-secondary) !important;
+        border: 1px solid var(--border-subtle);
+        border-radius: 999px;
+        padding: 2px 9px;
+        font-size: 0.7rem;
+        font-weight: 500;
+        line-height: 1.4;
+        cursor: pointer;
+        transition: background 120ms ease, border-color 120ms ease,
+                    color 120ms ease, transform 80ms ease;
+        user-select: none;
+        display: inline-flex;
+        align-items: center;
+        gap: 0.3rem;
+    }
+    .bubble-copy-btn:hover {
+        background: var(--bg-surface-2) !important;
+        border-color: var(--border-strong);
+        color: var(--text-primary) !important;
+    }
+    .bubble-copy-btn:active { transform: translateY(1px); }
+    .bubble-copy-btn:focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 2px;
+    }
 
     /* ---------- Role labels (You / SecMentor) ------------------------ */
     .role-label {
@@ -587,6 +633,12 @@ _CUSTOM_CSS = """
 </style>
 """
 st.markdown(_CUSTOM_CSS, unsafe_allow_html=True)
+# Per-bubble copy buttons are rendered inline by
+# ``_render_copy_button_for_bubble`` — one ``st.components.v1.html`` call
+# per assistant message. Each iframe contains the reply text and a
+# self-contained "📋 Copy" button, so no shared init script or delegated
+# listener is needed (and the cross-origin sandbox on Streamlit's
+# component iframe cannot interfere with the click handler).
 
 
 # --- Constants ---------------------------------------------------------------
@@ -1187,12 +1239,23 @@ def _render_bubble(message: ChatMessage) -> None:
         )
     else:
         # Assistant — render markdown via st.markdown inside a styled wrapper.
+        # The copy-to-clipboard button (Tier 1 #4) lives *inside* the
+        # assistant bubble, right after the rendered markdown, ChatGPT
+        # style. The button is its own ``st.components.v1.html`` call so
+        # the click handler runs inside an iframe (same-origin to the
+        # Streamlit server), and ``navigator.clipboard.writeText`` works
+        # as a secure context. The plain-text payload is computed by
+        # ``_render_copy_button_for_bubble`` so the user pastes a
+        # rendered reply, not the markdown source. The HTML escaping
+        # lives in ``web/chat_helpers._copy_button_iframe_html`` and is
+        # unit-tested independently of Streamlit.
         st.markdown(
             f'<div class="row left">{_label_html()}'
             f'<div class="bubble-assistant">',
             unsafe_allow_html=True,
         )
         st.markdown(content)
+        _render_copy_button_for_bubble(content)
         st.markdown("</div></div>", unsafe_allow_html=True)
 
 
@@ -1398,9 +1461,12 @@ def _ask(prompt: str | dict[str, object] | None) -> None:
         return
 
     # 4. Show a thinking bubble and time the call. We render a placeholder
-    #    and update it as the full reply comes back. (OpenRouter's free tier
-    #    doesn't expose token-level SSE, so we wait for the full text and
-    #    then reveal it in one smooth block.)
+    #    and replace it with the streamed reply. Tier 1 #1: the unpinned
+    #    (router-managed) path now streams token-by-token via
+    #    ``st.write_stream``; the pinned (had_files) path still uses the
+    #    blocking ``chat()`` call because vision / PDF payloads are not
+    #    safe to stream — we cannot rotate to a different model mid-turn
+    #    once a partial multimodal reply has started.
     show_label = bool(st.session_state.get("show_role_labels", True))
     label_html = (
         '<div class="role-label">SecMentor</div>' if show_label else ""
@@ -1452,6 +1518,15 @@ def _ask(prompt: str | dict[str, object] | None) -> None:
                  "optionally `OPENROUTER_MODELS` in your environment.")
         st.caption(f"Underlying error: {cfg_exc}")
         return
+    # ``reply`` holds the assembled assistant text. The streaming path
+    # uses ``st.write_stream`` (which returns the concatenated string),
+    # and the pinned path uses the blocking ``chat()`` call directly.
+    # We initialise to an empty string so the cache-write and the
+    # ``append`` below have a value to work with even if every streaming
+    # branch raises before yielding any text (in which case we
+    # ``return`` from the except blocks without reaching the append).
+    reply: str = ""
+    had_streaming_failure: BaseException | None = None
     try:
         if request.get("had_files"):
             # Pinned-model path: bypass the router so the model id is
@@ -1464,13 +1539,44 @@ def _ask(prompt: str | dict[str, object] | None) -> None:
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
+            # Replace the Thinking… placeholder with the final answer
+            # inline. We do not use ``st.write_stream`` here because
+            # the response is multimodal and we cannot rotate slots
+            # mid-stream; the user waits for the full text and then
+            # sees it appear in one block.
+            placeholder.empty()
         else:
-            # Normal path: let the router pick the slot.
-            reply = router.chat(
-                messages_for_api,
-                temperature=temperature,
-                max_tokens=max_tokens,
+            # Streaming path: ``st.write_stream`` consumes the router's
+            # generator and renders each delta into its own auto-managed
+            # container below the page. It returns the concatenated
+            # final text, which becomes ``reply``. If the stream yields
+            # zero deltas (an upstream that swallows content) the
+            # router raises ``OpenRouterError`` *before* ``st.write_stream``
+            # ever produces text, so the placeholder is still on screen
+            # when the except block runs and ``reply`` stays "".
+            reply = st.write_stream(
+                router.stream_chat(
+                    messages_for_api,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
             )
+            # Defensive: a streaming endpoint that *silently* returns an
+            # empty string is a different failure mode from one that
+            # raises (e.g. an upstream that signals "done" without ever
+            # sending ``data: [DONE]``). The router's empty-stream guard
+            # catches the most common case; this branch covers the
+            # corner where the stream completes cleanly with whitespace
+            # only. We treat both as transient failures and surface
+            # the same friendly banner the view already shows for
+            # empty-reply 4xx.
+            if not reply or not reply.strip():
+                raise OpenRouterError(
+                    "Model returned an empty reply.",
+                    status=None,
+                    model=model,
+                )
+            placeholder.empty()
     except AllSlotsExhaustedError as exc:
         # Every (key, model) slot failed in turn. This is a harder
         # error than a single-model 429: render a dedicated banner
@@ -1479,6 +1585,13 @@ def _ask(prompt: str | dict[str, object] | None) -> None:
         # what was tried.
         placeholder.empty()
         st.session_state["last_elapsed"] = None
+        # If the streaming path produced a partial reply before the
+        # final slot failed, surface a thin divider so the user can
+        # tell where the partial text ends and the error banner
+        # begins. The divider is purely cosmetic; it is a `<hr>` and
+        # uses default Streamlit theming.
+        if reply:
+            st.markdown("---")
         st.error(
             "All router slots are exhausted. Every configured "
             "(key, model) pair failed — most likely the daily per-account "
@@ -1501,27 +1614,64 @@ def _ask(prompt: str | dict[str, object] | None) -> None:
         return
     except OpenRouterError as exc:
         # Single-slot OpenRouter error that bubbled out of router.chat
-        # (the router normally handles these internally; reaching here
-        # means something unexpected — e.g. a bad 4xx we don't catch,
-        # or the helper raised before the router could rotate). Show
-        # the user the model id the user *asked* for, not whatever the
-        # router was actually trying, since that's what they recognise.
+        # / router.stream_chat (the router normally handles these
+        # internally; reaching here means something unexpected — e.g.
+        # a bad 4xx we don't catch, or the helper raised before the
+        # router could rotate). On the streaming path, ``reply`` may
+        # hold a partial reply (the router deliberately re-raises
+        # after the first delta so the user keeps what they got);
+        # we render it above the error banner so the user does not
+        # lose the work the model already produced.
         placeholder.empty()
         st.session_state["last_elapsed"] = None
+        if reply:
+            st.markdown("---")
         _render_friendly_error(exc, model)
-        return
+        had_streaming_failure = exc
+        # We intentionally fall through to the cache + history-append
+        # block so a partial reply stays in the conversation. The
+        # history-append is guarded by ``had_streaming_failure is None``
+        # below, so on a *non-partial* error (zero deltas) we do NOT
+        # pollute the transcript with an empty assistant turn.
     elapsed = time.perf_counter() - started
     st.session_state["last_elapsed"] = elapsed
-    st.session_state["response_cache"][cache_key] = reply
 
-    # Commit the reply to history. The history-render loop at the top of
-    # the script (the `for message in st.session_state["messages"][1:]`
-    # block) is what actually paints the assistant bubble to the screen.
-    # We rerun to re-execute the script top-to-bottom with the new turn
+    # Cache only the unpinned path. Multimodal turns are rarely repeated
+    # verbatim, and the cache key is currently model-only, so a vision
+    # request and a text-only request with the same temperature / token
+    # cap would collide.
+    if not request.get("had_files") and reply:
+        st.session_state["response_cache"][cache_key] = reply
+
+    # Commit the reply to history when we actually have one. The
+    # history-render loop at the top of the script (the
+    # ``for message in st.session_state["messages"][1:]`` block) is
+    # what actually paints the assistant bubble to the screen. We
+    # rerun to re-execute the script top-to-bottom with the new turn
     # in session_state. The placeholder above only ever showed the
     # Thinking… state; the revealed answer lives in the history list.
-    st.session_state["messages"].append({"role": "assistant", "content": reply})
-    st.rerun()
+    if reply and had_streaming_failure is None:
+        st.session_state["messages"].append(
+            {"role": "assistant", "content": reply}
+        )
+        # Rerun now: repaint the history loop with the new assistant
+        # turn. See comment above the if/elif for why the partial
+        # branch below omits this call.
+        st.rerun()
+    elif reply and had_streaming_failure is not None:
+        # Partial streamed reply: keep the half-finished text in the
+        # transcript so the user can see what the model produced
+        # before the connection died. Mark it with a trailing note so
+        # the next turn can still be understood in context.
+        st.session_state["messages"].append(
+            {
+                "role": "assistant",
+                "content": (
+                    f"{reply}\n\n"
+                    f"_⚠️ Reply interrupted: {had_streaming_failure}_"
+                ),
+            }
+        )
 
 
 # --- Two-pass continuation ---------------------------------------------------

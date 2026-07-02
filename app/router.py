@@ -55,7 +55,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Iterable, Iterator, Sequence
+from typing import Any, Iterable, Iterator, Sequence
 
 from app import openrouter
 
@@ -394,7 +394,180 @@ class ModelRouter:
             attempts=attempts,
             tried_slots=tried_slots,
         ) from last_error
+    def stream_chat(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> Iterator[str]:
+        """Stream the assistant's reply, rotating across the pool on failure.
 
+        Streaming counterpart of :meth:`chat`. The router walks the
+        same healthy-slot list in the same round-robin order, but
+        because the response is an open-ended iterator we cannot
+        retry "mid-stream" — once we start receiving deltas from a
+        slot we commit to it. The rotation policy is therefore:
+
+        * If the upstream raises **before** yielding any delta
+          (auth error, 4xx, 5xx on the first chunk, or a network
+          failure during the request open), we move to the next
+          slot exactly the way :meth:`chat` does.
+        * If the upstream raises **after** at least one delta has
+          already been yielded, we re-raise the exception: a
+          partial reply is still useful, and the caller (the view)
+          keeps the accumulated text on screen alongside the
+          friendly error toast. Rotating at that point would
+          produce two interleaved streams of text.
+        * If every slot fails before yielding, we raise
+          :class:`AllSlotsExhaustedError` from the last error so
+          the view can show the same slot-debug list it already
+          shows for the non-streaming path.
+
+        Backoff policy matches :meth:`chat`: rate-limit errors
+        honour the upstream ``Retry-After`` hint via
+        :meth:`_backoff_for`; other transient errors get a single
+        retry per slot (the slot pool already gives us the
+        rotation, so an in-slot retry would only matter for
+        two-attempt pools).
+        """
+        last_error: BaseException | None = None
+        attempts = 0
+        tried_slots: list[str] = []
+        start = self._start_index
+        for offset, slot in enumerate(self._iter_healthy_slots_starting_at(start)):
+            attempts += 1
+            tried_slots.append(slot.short_label())
+            try:
+                stream = openrouter.stream_chat(
+                    messages,
+                    model=slot.model_id,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    api_key=slot.api_key,
+                    base_url=None,
+                )
+            except openrouter.OpenRouterError as exc:
+                # The request could not even be opened. Apply the
+                # same per-slot policy as chat() — disable on
+                # auth, sleep on rate-limit, otherwise move on.
+                self._record_slot_failure(slot, exc)
+                if isinstance(exc, openrouter.OpenRouterAuthError):
+                    continue
+                delay = self._backoff_for(exc)
+                if delay > 0:
+                    self._sleep(delay)
+                if (
+                    isinstance(exc, openrouter.OpenRouterRateLimitError)
+                    and self._retries_remaining(slot, offset) > 0
+                ):
+                    continue
+                last_error = exc
+                continue
+
+            # The request opened. Stream the first delta; if it
+            # arrives, commit to this slot for the rest of the
+            # response.
+            try:
+                yielded_any = False
+                for chunk in stream:
+                    if chunk:
+                        yielded_any = True
+                        yield chunk
+                # Stream ended cleanly (data: [DONE]). Reject
+                # zero-chunk replies as transient failures on this
+                # slot — an upstream that swallows the content is
+                # indistinguishable from a flaky connection to the
+                # view, so we rotate instead of presenting a blank
+                # bubble. Also matches the non-streaming path,
+                # where _extract_assistant_text raises on empty
+                # content.
+                if not yielded_any:
+                    raise openrouter.OpenRouterError(
+                        "OpenRouter stream returned no deltas before [DONE].",
+                        status=None,
+                        model=slot.model_id,
+                    )
+                # Stream ended cleanly (data: [DONE]) with at
+                # least one delta. Advance start index and return
+                # — the generator is exhausted and the for-loop
+                # above is the only thing still holding a
+                # reference.
+                self._start_index = (start + offset + 1) % max(len(self._slots), 1)
+                self._record_slot_success(slot)
+                return
+            except openrouter.OpenRouterError as exc:
+                if yielded_any:
+                    # Partial reply is in the caller's accumulator.
+                    # Surface the error so the view can show the
+                    # friendly message; do not rotate, do not
+                    # advance the start index.
+                    raise
+                self._record_slot_failure(slot, exc)
+                if isinstance(exc, openrouter.OpenRouterAuthError):
+                    continue
+                delay = self._backoff_for(exc)
+                if delay > 0:
+                    self._sleep(delay)
+                last_error = exc
+                continue
+
+        if last_error is None and not tried_slots:
+            # No healthy slots at all.
+            raise AllSlotsExhaustedError(
+                "ModelRouter has no healthy slots to stream from.",
+                attempts=attempts,
+                tried_slots=tried_slots,
+            )
+        raise AllSlotsExhaustedError(
+            f"ModelRouter tried every healthy slot and all "
+            f"{attempts} attempt(s) failed before producing any "
+            f"streamed delta. Tried: "
+            f"{', '.join(tried_slots) or '<none>'}. "
+            f"Last error: {last_error}",
+            attempts=attempts,
+            tried_slots=tried_slots,
+        ) from last_error
+
+    def _record_slot_success(self, slot: KeySlot) -> None:
+        """Reset the per-slot health marker after a successful call.
+
+        Mirrors the inline success branch in :meth:`chat` so the
+        streaming and non-streaming paths converge on the same slot
+        health state. Kept as a small helper because both paths
+        need the same three lines and the streaming path is
+        already long.
+        """
+        slot.last_error = None
+        slot.disabled = False
+
+    def _record_slot_failure(
+        self, slot: KeySlot, exc: BaseException
+    ) -> None:
+        """Record a failure on a slot and disable it on auth errors.
+
+        Same policy as the inline block in :meth:`chat`. Splitting
+        it out keeps the streaming and non-streaming call sites in
+        sync and gives a single place to extend (e.g. disabling a
+        slot after N consecutive 429s) later.
+        """
+        slot.last_error = exc
+        if isinstance(exc, openrouter.OpenRouterAuthError):
+            slot.disabled = True
+
+    def _retries_remaining(self, slot: KeySlot, offset: int) -> int:
+        """Best-effort estimate of retries left in this slot.
+
+        Used only to decide whether to take a second swing at the
+        same slot for a 429 (the rate-limit error often resolves
+        after a short sleep). The math matches :meth:`chat`: with
+        ``max_attempts = len(slots) * 2``, each slot gets up to
+        two attempts.
+        """
+        max_attempts = self._max_attempts or len(self._slots) * 2
+        # Offset is the slot's position in the rotation (0..N-1);
+        # we've already made one attempt on this slot.
+        return max(0, max_attempts - 1 - (offset * 2))
     # --- Internal helpers ----------------------------------------------
 
     def _iter_healthy_slots_starting_at(self, start: int) -> Iterator[KeySlot]:

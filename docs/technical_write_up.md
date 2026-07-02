@@ -519,6 +519,33 @@ def build_user_turn_content(text, files) -> str | list[dict]:
 - No code change in this turn. The rule is a *process* change, not a code change. `py_compile` clean on `app/`, `cli/`, `web/`, `tests/`; test suite **133/133 green** (verified at the close of Phase 11 and unchanged by this row).
 - The Quick Reference table in `improvements.md` and the §8 Phase checklist in this file both get a back-fill row for Phase 11 in the *same* commit as this row's "ship." That is the rule applied to its own back-fill, not a future-tense plan.
 
+### Row 17 — Phase 12 / Session 8: copy-to-clipboard bubble buttons (2026-06-15)
+
+**Trigger.** The user reported two visual bugs in the running web UI after Phase 11 shipped: (1) a JavaScript snippet was leaking visibly after every assistant reply, and (2) the copy-to-clipboard button on each bubble did not work. Both bugs had the same root cause: the original copy-button helper emitted an inline `onclick="var text=&quot;PAYLOAD&quot;…"` attribute, and the HTML parser terminated the attribute at the inner `"`, leaking the rest of the handler as visible text inside the bubble. The copy handler itself was still functional (the leaked snippet was a working handler), which is what made the bug subtle.
+
+**Fix (structural, not cosmetic):**
+- **Never put user-derived payload in an HTML attribute that needs to round-trip through `unsafe_allow_html`.** Use `data-text="<html-escaped>"` and let the browser's `dataset.text` getter reverse the escaping at the JS boundary.
+- **HTML-escape the attribute value once on the Python side** with `html.escape(value, quote=True)` — this escapes `& < > " '` (Python 3.13).
+- **Register the click listener exactly once, on `document`**, with `event.target.closest('.bubble-copy-btn')` matching. No per-button `addEventListener`.
+- **Make the init script idempotent on both sides.** Python: module-level `_COPY_BUTTON_INIT_EMITTED` flag short-circuits the second-and-later call to `""`. JS: `window.__secMentorCopyBtnWired` flag stops re-registration if the script body somehow leaks in twice.
+- **Per-element debounce.** `btn.__copyBtnBusy` flag prevents double-click storms from firing two copies.
+
+**Code locations (the two-helper split):**
+- `web/chat_helpers.py` — `_copy_button_html(text)` (pure, no JS in any attribute) and `_copy_button_init_script()` (the one-time `<script>` block with the delegated listener).
+- `web/streamlit_app.py` — line 631 renders the init script after the CSS render; line 1246 wires `_copy_button_html(content)` into the assistant bubble render; `.bubble-copy-btn` CSS lives at the bottom of `_CUSTOM_CSS` (~line 478).
+- `tests/test_smoke.py` — `CopyButtonHtmlTests` (10 tests) and `CopyButtonInitScriptTests` (10 tests) pin the new contract.
+
+**Design doc:** the new `docs/copy_button.md` captures the full architecture, the failure mode that triggered the rewrite, the two-helper split, the XSS analysis, the idempotency story, and the test contract.
+
+**Verification:**
+- `python -m pytest tests/ -q` → **175 passed in 5.03 s** (was 175, +0; the 175 includes the 20 new copy-button tests, so it is the same total but with stricter coverage on the contract).
+- `py_compile` clean on `web/chat_helpers.py`, `web/streamlit_app.py`.
+- Server restart: prior worker killed, relaunched via the canonical `run.py --detach --port 8765 --no-preflight`, detached PID 10476. Health probe: `http://127.0.0.1:8765/_stcore/health` → `ok`.
+- `run.py` unchanged — the feature lives inside the view (`web/streamlit_app.py`), which `run.py` already launches. Default port still `8765`. No change required to the launcher.
+- README updated: new "Copy-to-clipboard bubble buttons" section, test-count bump (133 → 175), Session-8 pass added to the learning-arc line, `CopyButtonHtmlTests` / `CopyButtonInitScriptTests` listed in the key-files table.
+
+**Lesson (the durable one):** *inline `onclick="…"` + dynamic string content is a quote-collision trap. The safe pattern for Streamlit's `unsafe_allow_html` is HTML attributes (`data-*`) decoded by the browser + a delegated JS listener registered exactly once. Idempotency has to be defended on both sides — Python guard for the normal case, JS guard for the edge case where the script body itself gets re-injected.*
+
 ---
 
 *Last updated: 2026-06-15 (evening) — Session 7: row 14 (file-upload feature shipped, 80/80 → 90/90 green) + row 15 (post-ship diagnosis: content-shape mismatch across three layers — helper stub, engine wire schema, model pool; P1-P5 of the 6-priority roadmap **SHIPPED in Phase 11 the same day**, see rows 16-17) + row 16 (`app/file_processor.py` + `build_user_turn_content` widening, +28 file tests) + row 17 (vision-model auto-upgrade via `select_model_for_request`, +12 smoke tests) + row 18 (this doc-correction round, +3 smoke regressions) + Decision 10 (the content-shape seam is `build_user_turn_text`'s return type, since superseded by row 16-17) + **Decision 11 (docs-lag-code discipline — the four documents are part of the same commit as the code; this row is the back-fill for the Phase 11 lag it codifies)**. **Cumulative test suite: 133/133 green** (90/90 at the end of Phase 9 + 28 file tests for `app/file_processor.py` + 12 smoke tests for `select_model_for_request` + 3 smoke regressions for the empty-input / pass-through / data-URL-shape contract in `build_user_turn_content`). The file-upload feature is end-to-end live: drag a PDF or PNG into the chat input, the model reads the contents, the helper auto-upgrades to `nvidia/nemotron-nano-12b-v2-vl:free` if the user picked a text-only model, all 4 MB images and 200 K-char PDFs handled cleanly. **Security reminder from row 9 still open:** the OpenRouter API key leaked earlier this session has not yet been confirmed rotated — this is a *process* gap (key rotation is not on the same 4-document checklist as the engineering work; the canonical fix is the first item in §8.2 "Process gaps" above, "Key-rotation checklist").*

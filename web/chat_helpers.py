@@ -12,6 +12,8 @@ between the engine and the view, and `streamlit_app.py` is the view.
 
 from __future__ import annotations
 
+import json
+import re
 from typing import Callable, Iterable, Mapping, Protocol
 
 from app import prompts as _prompts
@@ -750,3 +752,665 @@ def _active_system_prompt(state: Mapping[str, object] | None) -> str:
     if not isinstance(mode, str):
         return _prompts.CYBERSECURITY_SYSTEM_PROMPT
     return _TEACHING_MODE_TO_PROMPT.get(mode, _prompts.CYBERSECURITY_SYSTEM_PROMPT)
+
+
+# --- Copy-to-clipboard helper (Tier 1 #4) -------------------------------------
+# The assistant bubble is rendered as raw HTML inside `st.markdown(...,
+# unsafe_allow_html=True)` (see the assistant branch of the history loop in
+# `web/streamlit_app.py`). That means a copy button has to be a plain HTML
+# element — Streamlit's own `st.button` cannot live inside a custom HTML
+# block.
+#
+# Design choice — why no inline ``onclick``:
+#   A naive implementation puts a `onclick="..."` attribute on the button
+#   and inlines the assistant text as a JS string literal. That is a
+#   quote-collision landmine: the `onclick` attribute itself is delimited
+#   by quotes, the JS string literal is also delimited by quotes, and the
+#   HTML parser terminates the attribute at the first inner quote it sees.
+#   The button renders, the click handler is silently malformed, and the
+#   rest of the JS leaks out as visible text in the bubble. We hit exactly
+#   that bug in v1 and the screenshot the user posted showed the leaked JS.
+#
+#   The fix is to:
+#     1. put the text in a `data-text` HTML attribute (HTML-escaped once,
+#        no JS involved at all — the browser parses the attribute for us);
+#     2. ship a one-time `<script>` block via `_copy_button_init_script()`
+#        that registers a single delegated `click` listener on `document`,
+#        reads `data-text` from the clicked element, and runs the
+#        clipboard logic.
+#   The init script is idempotent (guarded by a flag), so calling it once
+#   per page render is safe even when Streamlit re-renders during
+#   streaming.
+#
+# Why a pure helper instead of inlining the HTML in the view:
+#   - The escaping logic (HTML attribute escaping for the payload, label
+#     restore) is the only part that can break, and breaking it means an
+#     XSS hole. Keeping it in a pure function means we can unit-test the
+#     escaping with zero browser dependency.
+#   - The view stays readable: one `st.markdown(_copy_button_html(content))`
+#     call next to each assistant bubble.
+#   - Falls back gracefully to a `document.execCommand("copy")` path so the
+#     button still works on older browsers and on the Streamlit Cloud
+#     preview iframe, where `navigator.clipboard` is gated behind a user
+#     gesture and sometimes blocked entirely.
+
+import html as _html  # local import: keeps the helper module self-contained
+# and avoids polluting the module namespace with a name that shadows the
+# standard library at import time.
+
+_COPY_BUTTON_LABEL: str = "📋 Copy"
+_COPY_BUTTON_LABEL_COPIED: str = "✓ Copied"
+_COPY_BUTTON_LABEL_FAILED: str = "⚠ Press Ctrl+C"
+
+# Sentinel for the init-script idempotency guard. A module-level boolean
+# means the same Streamlit process can call ``_copy_button_init_script()``
+# any number of times (including from re-renders during streaming) and
+# the actual ``<script>`` is emitted only once.
+_COPY_BUTTON_INIT_EMITTED: bool = False
+
+
+def _copy_button_html(text: str) -> str:
+    """Return a self-contained HTML <button> that copies ``text`` to the clipboard.
+
+    The returned string is meant to be rendered via
+    ``st.markdown(html, unsafe_allow_html=True)``. It is intentionally
+    tiny:
+
+    - one <button> element with no JavaScript in any attribute
+    - the text lives in a ``data-text`` attribute (HTML-escaped once,
+      decoded back to the original string by the delegated click handler
+      registered in ``_copy_button_init_script``)
+    - the original label lives in ``data-label`` so the click handler can
+      restore it after the 1.4 s confirmation window
+
+    Behaviour (provided by the delegated listener in
+    ``_copy_button_init_script``):
+
+    - On click, calls ``navigator.clipboard.writeText(text)`` (modern API).
+    - If that throws or returns a rejected promise (e.g. insecure context,
+      permission denied), falls back to a hidden <textarea> +
+      ``document.execCommand("copy")`` path so the button still works.
+    - Briefly swaps the button label to "✓ Copied" (or "⚠ Press Ctrl+C"
+      if both paths fail) so the user has feedback.
+    """
+    # HTML-escape the payload so it is safe inside a double-quoted HTML
+    # attribute. ``html.escape`` converts ``&``, ``<``, ``>``, and the
+    # double quote to entities (``&amp;``, ``&lt;``, ``&gt;``, ``&quot;``).
+    # The browser parses the attribute for us, so by the time JS reads
+    # ``btn.dataset.text`` the original string is back, byte-for-byte.
+    #
+    # The double quotes inside the attribute delimiters are guaranteed
+    # safe because ``html.escape`` has turned every inner ``"`` into
+    # ``&quot;`` — there is no way for the parser to close the attribute
+    # early. This is the XSS-safe alternative to inline ``onclick``.
+    safe_text: str = _html.escape(text, quote=True)
+    safe_label: str = _html.escape(_COPY_BUTTON_LABEL, quote=True)
+    return (
+        '<button type="button" '
+        'class="bubble-copy-btn" '
+        f'data-label="{safe_label}" '
+        f'data-text="{safe_text}">'
+        f'{_COPY_BUTTON_LABEL}'
+        '</button>'
+    )
+
+
+# --- Per-bubble iframe copy button -------------------------------------------
+#
+# Why an iframe (instead of st.markdown + delegated listener):
+#   Streamlit's `st.markdown(..., unsafe_allow_html=True)` runs the input
+#   through a markdown sanitizer (bleach / DOMPurify) that strips
+#   ``<script>`` tags and inline event handlers. The delegated listener
+#   approach (``_copy_button_init_script``) tries to work around this by
+#   routing the script through ``st.components.v1.html`` + ``parent.eval``,
+#   but in modern browsers the component iframe is cross-origin and
+#   ``parent.eval`` is blocked by the same-origin policy. Result: the
+#   button renders but clicking it does nothing.
+#
+#   The fix that actually works is to put the entire button + click handler
+#   inside the iframe's own ``srcdoc=``. Streamlit sets ``srcdoc`` as an
+#   attribute on the iframe element; that attribute value is parsed by
+#   the browser as raw HTML (no Streamlit sanitizer touches it). The
+#   iframe is served same-origin by the Streamlit server, so:
+#
+#     - inline ``<script>`` runs inside the iframe's own window
+#     - ``navigator.clipboard.writeText(...)`` is allowed (secure context)
+#     - the click event never crosses the parent/iframe boundary, so
+#       same-origin policy is irrelevant
+#     - the payload lives on a ``data-text`` attribute on the button
+#       itself (HTML-escaped once), and the click handler reads it back
+#       via ``btn.dataset.text`` -- the browser decodes the attribute
+#       automatically, so no manual unescaping is needed on the JS side
+#       and there is no XSS hole from round-tripping user bytes through
+#       an HTML attribute into a JS string literal
+#
+# One iframe per assistant message means a per-message component, which
+# is cheap (Streamlit components are tiny) and keeps each button's
+# handler fully isolated from every other button's handler.
+def _copy_button_iframe_html(text: str) -> str:
+    """Return a full HTML document for an iframe-hosted copy button.
+
+    The document contains **only** a small "📋 Copy" button. The reply
+    text is NOT rendered inside the iframe -- the Streamlit view already
+    renders it (as markdown) directly above the button. If we duplicated
+    it inside the iframe the user would see the reply twice: once as the
+    rendered markdown, once inside the iframe's <pre>.
+
+    Instead, the payload lives on a ``data-text`` attribute on the button
+    itself (HTML-escaped once with ``html.escape(quote=True)`` so it is
+    XSS-safe and cannot break the attribute quoting). The click handler
+    runs inside the iframe's own window, reads ``btn.dataset.text``, and
+    copies it to the clipboard:
+
+      1. ``navigator.clipboard.writeText(payload)`` (modern API; the
+         iframe is same-origin to the Streamlit server so it is a secure
+         context and the API is allowed).
+      2. If that rejects, falls back to a hidden ``<textarea>`` +
+         ``document.execCommand('copy')`` path.
+      3. Briefly swaps the button label to "✓ Copied" (or "⚠ Press Ctrl+C"
+         on total failure) and restores it after 1.4 s.
+
+    Why this works where the previous design did not:
+
+    The earlier design wired a *single* delegated click listener on the
+    parent ``document`` via ``st.components.v1.html`` + ``parent.eval``.
+    The component iframe is sandboxed (``allow-scripts`` without
+    ``allow-same-origin``) so ``parent.eval(...)`` is blocked by the
+    same-origin policy and the listener never registered. Putting the
+    handler *inside* the iframe removes the cross-origin hop entirely
+    -- the click never crosses the parent/iframe boundary, and
+    ``navigator.clipboard.writeText`` is allowed because the iframe is
+    served same-origin by the Streamlit server.
+    """
+    # The payload is HTML-escaped once and put in a ``data-text``
+    # attribute. ``html.escape(..., quote=True)`` converts ``&``, ``<``,
+    # ``>``, ``"``, and ``'`` to entities, which guarantees the
+    # attribute's double-quote delimiter can never be closed by any byte
+    # in the payload. The browser decodes the attribute for us, so by
+    # the time JS reads ``btn.dataset.text`` the original string is back.
+    safe_text: str = _html.escape(text, quote=True)
+    safe_label: str = _html.escape(_COPY_BUTTON_LABEL, quote=True)
+    # Build the JS body with ``json.dumps`` so the string literals are
+    # unambiguously quoted -- any byte in the label, copied-text, or
+    # failed-text constants can be embedded without breaking the parser.
+    # ``</script>`` inside the body is also rewritten to ``<\/script>``
+    # on the wire so the browser's HTML parser does not terminate the
+    # wrapper script tag at the body's own closer.
+    import json as _json
+
+    handler_js = (
+        "(function(){\n"
+        "  var btn = document.getElementById('copy-btn');\n"
+        "  if (!btn) { return; }\n"
+        "  function show(label){\n"
+        "    btn.textContent = label;\n"
+        "    setTimeout(function(){ btn.textContent = " + _json.dumps(_COPY_BUTTON_LABEL) + "; }, 1400);\n"
+        "  }\n"
+        "  function fallback(text){\n"
+        "    try {\n"
+        "      var ta = document.createElement('textarea');\n"
+        "      ta.value = text;\n"
+        "      ta.setAttribute('readonly', '');\n"
+        "      ta.style.position = 'absolute';\n"
+        "      ta.style.left = '-9999px';\n"
+        "      document.body.appendChild(ta);\n"
+        "      ta.select();\n"
+        "      var ok = document.execCommand && document.execCommand('copy');\n"
+        "      document.body.removeChild(ta);\n"
+        "      show(ok ? " + _json.dumps(_COPY_BUTTON_LABEL_COPIED) + " : " + _json.dumps(_COPY_BUTTON_LABEL_FAILED) + ");\n"
+        "    } catch (e) {\n"
+        "      show(" + _json.dumps(_COPY_BUTTON_LABEL_FAILED) + ");\n"
+        "    }\n"
+        "  }\n"
+        "  btn.addEventListener('click', function(ev){\n"
+        "    ev.preventDefault();\n"
+        "    var text = btn.dataset.text || '';\n"
+        "    if (navigator.clipboard && navigator.clipboard.writeText) {\n"
+        "      navigator.clipboard.writeText(text).then(\n"
+        "        function(){ show(" + _json.dumps(_COPY_BUTTON_LABEL_COPIED) + "); },\n"
+        "        function(){ fallback(text); }\n"
+        "      );\n"
+        "    } else {\n"
+        "      fallback(text);\n"
+        "    }\n"
+        "  });\n"
+        "})();\n"
+    ).replace("</script>", "<\\/script>")
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<style>\n"
+        "html, body { margin: 0; padding: 0; background: transparent; "
+        "font-family: inherit; }\n"
+        "body { display: inline-flex; padding: 0; }\n"
+        "button#copy-btn { align-self: flex-end; "
+        "background: transparent; color: #555; "
+        "border: 1px solid #ddd; border-radius: 999px; "
+        "padding: 2px 10px; font-size: 0.72rem; "
+        "font-family: inherit; cursor: pointer; "
+        "line-height: 1.2; }\n"
+        "button#copy-btn:hover { background: rgba(0,0,0,0.04); }\n"
+        "button#copy-btn:focus-visible { outline: 2px solid #6aa9ff; "
+        "outline-offset: 1px; }\n"
+        "</style></head><body>"
+        f"<button type='button' id='copy-btn' "
+        f"data-label='{safe_label}' "
+        f"data-text='{safe_text}'>{_COPY_BUTTON_LABEL}</button>"
+        f"<script>{handler_js}</script>"
+        "</body></html>"
+    )
+
+
+# --- Markdown -> plain-text for the copy button --------------------------------
+# The assistant reply that lands in the view is *markdown source* (the
+# Streamlit render call uses ``st.markdown(content)``, not the HTML variant).
+# If we naively put that source into ``data-text``, clicking Copy pastes
+# ``# Heading``, ``**bold**``, and ````code`` blocks into the user's
+# chat/email/doc — useless for sharing.
+#
+# The fix is to convert the markdown to a readable plain-text rendering of
+# the same content before stuffing it into ``data-text``. The conversion is
+# deliberately conservative: it strips the markdown syntax that gets in the
+# way of reading (heading hashes, bold/italic delimiters, link brackets,
+# inline-code backticks, fenced-code fences) while preserving the words,
+# code contents, list markers, paragraph breaks, and link URLs.
+#
+# The rules, in order:
+#   1. Fenced code blocks (```...```) — keep the inner code verbatim,
+#      drop the fence. The code IS the content.
+#   2. ATX headings (#, ##, ###...) — drop the leading hashes, keep the
+#      heading text. (Hashes are pure markdown syntax, no semantic content.)
+#   3. Bold (**...** / __...__) — drop the delimiters, keep the text.
+#   4. Italic (*...* / _..._) — drop the delimiters, keep the text.
+#   5. Inline code (`...`) — keep the inner code verbatim, drop the
+#      backticks. (Same reasoning as fenced blocks: the code IS the
+#      content.)
+#   6. Links ([text](url)) — render as ``text (url)`` so neither piece
+#      of information is lost.
+#   7. Images (![alt](url)) — render as ``[image: alt]`` (alt text only;
+#      a raw URL is not useful in a chat paste).
+#   8. Blockquote markers (> ...) — drop the leading ``>`` characters,
+#      keep the quote text.
+#   9. Unordered list markers (- * +) — keep the marker, drop nothing.
+#  10. Ordered list markers (1. 2. ...) — keep the marker, drop nothing.
+#  11. Horizontal rules (--- *** ___) — drop the line entirely.
+#  12. HTML entities (``&amp;`` / ``&lt;`` / ``&quot;``) — decoded to the
+#      literal char so a chat paste of ``<x>`` does not become ``&lt;x&gt;``.
+#  13. Trailing whitespace per line and triple+ blank lines normalized
+#      to a single blank line.
+#
+# The order matters: fences and inline code are processed *before* bold/
+# italic, so an asterisk inside a code block is not misread as emphasis.
+# The implementation is a single pass with a small state machine for
+# fenced code; everything else is a regex substitution.
+_MARKDOWN_FENCE_RE = re.compile(r"```([^\n`]*)\n(.*?)```", flags=re.DOTALL)
+_MARKDOWN_HEADING_RE = re.compile(r"(?m)^#{1,6}\s+")
+_MARKDOWN_BOLD_STAR_RE = re.compile(r"\*\*(.+?)\*\*")
+_MARKDOWN_BOLD_UNDER_RE = re.compile(r"__(.+?)__")
+_MARKDOWN_ITALIC_STAR_RE = re.compile(r"(?<!\*)\*([^\*\n]+?)\*(?!\*)")
+_MARKDOWN_ITALIC_UNDER_RE = re.compile(r"(?<!_)_([^_\n]+?)_(?!_)")
+_MARKDOWN_INLINE_CODE_RE = re.compile(r"`([^`\n]+?)`")
+_MARKDOWN_LINK_RE = re.compile(r"\[([^\]\n]+)\]\(([^)\n]+)\)")
+_MARKDOWN_IMAGE_RE = re.compile(r"!\[([^\]\n]*)\]\(([^)\n]+)\)")
+_MARKDOWN_BLOCKQUOTE_RE = re.compile(r"(?m)^[ \t]*>\s?")
+_MARKDOWN_HR_RE = re.compile(r"(?m)^\s*([-*_])\s*\1\s*\1[\1\s-]*$")
+_MARKDOWN_TRAILING_WS_RE = re.compile(r"[ \t]+\n", flags=re.MULTILINE)
+_MARKDOWN_BLANK_LINES_RE = re.compile(r"\n{3,}")
+
+
+_MARKDOWN_INLINE_SENTINEL_RE = re.compile(r"\x00INLINE(\d+)\x00")
+
+
+def _split_on_inline_code(text: str) -> tuple[str, list[str]]:
+    """Replace inline-code spans with sentinels; return (sentinelized, originals).
+
+    Inline code (`` `like this` ``) needs the same protection from later
+    regex passes as fenced code blocks do: a ``*`` inside `` `*star*` ``
+    must not be read as italic, and ``&amp;`` inside `` `&amp;` `` must
+    not be HTML-decoded. We can't reuse the fence sentinel namespace
+    because inline-code and fences can be interleaved in the same reply
+    (e.g. a sentence mentioning both). A second, independent list of
+    inline-code payloads, swapped back in *after* entity decoding,
+    solves both problems cleanly.
+    """
+    inline_blocks: list[str] = []
+
+    def _stash_inline(match: "re.Match[str]") -> str:
+        inline_blocks.append(match.group(1))
+        return f"\x00INLINE{len(inline_blocks) - 1}\x00"
+
+    return _MARKDOWN_INLINE_CODE_RE.sub(_stash_inline, text), inline_blocks
+
+
+def _swap_inline_back(text: str, inline_blocks: list[str]) -> str:
+    """Inverse of :func:`_split_on_inline_code`."""
+    def _restore(match: "re.Match[str]") -> str:
+        return inline_blocks[int(match.group(1))]
+    return _MARKDOWN_INLINE_SENTINEL_RE.sub(_restore, text)
+
+
+def _markdown_to_plain_text(content: str) -> str:
+    """Convert an LLM markdown reply into clean, copy-pasteable plain text.
+
+    The result is what a user expects to land in their clipboard when they
+    click "Copy" on a chat bubble: the *rendered* response, with markdown
+    syntax stripped and the actual content (words, code, list markers,
+    link URLs) preserved. See the rule list above for the exact behaviour.
+
+    The function is pure (input string in, output string out, no I/O, no
+    globals, no side effects) and is unit-tested independently of
+    Streamlit — see ``MarkdownToPlainTextTests`` in ``tests/test_smoke.py``.
+
+    Edge cases:
+
+    - Empty / None input returns the empty string.
+    - Fenced code blocks are protected: an asterisk *inside* a fenced
+      block is preserved as a literal asterisk, not interpreted as
+      italic. HTML entities inside fenced code are *not* decoded (they
+      may be part of the code).
+    - Inline code spans (single backticks) get the same protection: a
+      ``*`` inside `` `*star*` `` is preserved verbatim and entities
+      inside `` `&amp;` `` stay encoded.
+    - The language tag on a fenced block (`` ```python ``) is dropped,
+      not echoed as an HTML comment, because the comment would leak
+      into the clipboard and confuse the reader.
+    - Malformed markdown (unclosed ``**``, stray backticks) is treated
+      as plain text. The output may contain the stray delimiter, but
+      it will not crash or hang.
+    """
+    if not content:
+        return ""
+
+    # 1) Fenced code blocks: extract the inner code, drop the fence.
+    #    We replace fenced blocks with a sentinel that survives the
+    #    later substitutions, then swap the sentinels back. This keeps
+    #    bold/italic/link regexes from corrupting code contents.
+    fence_blocks: list[str] = []
+
+    def _stash_fence(match: "re.Match[str]") -> str:
+        body = match.group(2)
+        # The language tag (e.g. ``python``) is dropped here. The
+        # common case is that the code body itself is readable enough
+        # without the tag, and echoing the tag as an HTML comment
+        # would pollute the clipboard with markup noise.
+        fence_blocks.append(body)
+        return f"\x00FENCE{len(fence_blocks) - 1}\x00"
+
+    text = _MARKDOWN_FENCE_RE.sub(_stash_fence, content)
+
+    # 1b) Inline code spans: same protection, second pass on whatever
+    #     is left after fences are out of the way. Inline code can
+    #     contain backticks of its own? No — the spec disallows an
+    #     unescaped backtick inside an inline-code span, so this
+    #     regex is sound.
+    text, inline_blocks = _split_on_inline_code(text)
+
+    # 2-11) The rest of the rules. Order matters less once fences and
+    #    inline code are out of the way, but bold must run before
+    #    italic (an italic inside a bold would otherwise be
+    #    mis-parsed).
+    text = _MARKDOWN_HEADING_RE.sub("", text)            # 2
+    text = _MARKDOWN_BOLD_STAR_RE.sub(r"\1", text)       # 3a
+    text = _MARKDOWN_BOLD_UNDER_RE.sub(r"\1", text)      # 3b
+    text = _MARKDOWN_ITALIC_STAR_RE.sub(r"\1", text)     # 4a
+    text = _MARKDOWN_ITALIC_UNDER_RE.sub(r"\1", text)    # 4b
+    text = _MARKDOWN_IMAGE_RE.sub(r"[image: \1]", text)  # 7 (before links)
+    text = _MARKDOWN_LINK_RE.sub(r"\1 (\2)", text)       # 6
+    text = _MARKDOWN_BLOCKQUOTE_RE.sub("", text)         # 8
+    text = _MARKDOWN_HR_RE.sub("", text)                 # 11
+
+    # 12) Decode HTML entities OUTSIDE code. We split-and-rejoin so
+    #     the inside-code segments are not entity-decoded.
+    parts: list[str] = []
+    cursor = 0
+    for sentinel_match in re.finditer(r"\x00FENCE(\d+)\x00", text):
+        parts.append(_html.unescape(text[cursor:sentinel_match.start()]))
+        idx = int(sentinel_match.group(1))
+        fence_body = fence_blocks[idx]
+        # Inside code we deliberately do NOT decode entities — they may
+        # be part of the actual code (e.g. ``if (a &amp;&amp; b)``).
+        parts.append(fence_body)
+        cursor = sentinel_match.end()
+    parts.append(_html.unescape(text[cursor:]))
+    text = "".join(parts)
+
+    # 1c) Swap inline-code sentinels back. Done AFTER entity decoding so
+    #     inline-code payloads retain their original entities (the spec
+    #     is: backtick-delimited text is verbatim).
+    text = _swap_inline_back(text, inline_blocks)
+
+    # 13) Whitespace tidy.
+    text = _MARKDOWN_TRAILING_WS_RE.sub("\n", text)
+    text = _MARKDOWN_BLANK_LINES_RE.sub("\n\n", text)
+
+    return text.strip("\n")
+
+
+def _copy_button_html_for_bubble(content: str) -> str:
+    """Wrap an LLM markdown reply as a copy button whose payload is plain text.
+
+    This is the helper the Streamlit view should call from the assistant
+    branch of the history render. It runs ``_markdown_to_plain_text`` on
+    the raw markdown ``content`` so the user pastes a *rendered* reply
+    into chat/email/doc, not the markdown source.
+
+    Falls back to the raw ``content`` if the plain-text conversion
+    returns the empty string (defensive — should not happen in practice
+    but keeps the button useful for edge cases like an assistant
+    returning only ``"\n"`` or only punctuation).
+    """
+    plain = _markdown_to_plain_text(content)
+    if not plain:
+        plain = content or ""
+    return _copy_button_html(plain)
+
+
+def _render_copy_button_for_bubble(content: str) -> None:
+    """Emit a per-message ``st.components.v1.html`` copy button for an
+    assistant reply.
+
+    Why a component (and not ``st.markdown`` of a tiny ``<button>``):
+
+    ``st.markdown(..., unsafe_allow_html=True)`` runs its input through
+    Streamlit's sanitizer which strips ``<script>`` tags AND inline
+    event handlers. Either path leaves a button that renders but does
+    nothing on click. A ``st.components.v1.html`` call wraps the HTML in
+    an iframe whose ``srcdoc`` attribute is set directly — the browser
+    parses it as raw HTML, scripts run inside the iframe's own window,
+    and the iframe is same-origin to the Streamlit server, so
+    ``navigator.clipboard.writeText`` is allowed (secure context).
+
+    Each call renders one tiny iframe per assistant message. The iframe
+    contains **only** the "📋 Copy" button — the reply itself is
+    rendered directly above (via ``st.markdown(content)`` in the view)
+    so the user sees it exactly once. The payload rides on a
+    ``data-text`` attribute on the button (HTML-escaped once) and the
+    click handler reads it back via ``btn.dataset.text`` — no
+    parent/iframe boundary crossing, no ``parent.eval`` (which the
+    cross-origin sandbox blocks), no delegated listener that has to be
+    wired through a separate ``<script>`` block.
+    """
+    plain = _markdown_to_plain_text(content)
+    if not plain:
+        plain = content or ""
+    # Imported lazily because ``streamlit`` is not a hard dep of the
+    # helpers module (the CLI/tests pull this module without Streamlit
+    # installed in some sandboxes). The view always has Streamlit
+    # available so the runtime path is fine.
+    import streamlit as _st
+
+    srcdoc = _copy_button_iframe_html(plain)
+    # Tiny iframe -- it only hosts the button. ``height`` is the visible
+    # vertical space, ``width`` is the available horizontal space; the
+    # button right-aligns itself inside via CSS.
+    _st.components.v1.html(
+        srcdoc, height=32, scrolling=False, width=720
+    )
+
+
+def _copy_button_init_script() -> str:
+    """Return a one-time ``<script>`` block that wires up copy buttons.
+
+    Call this exactly once per page render (idempotent: subsequent calls
+    return an empty string so re-renders during streaming do not pile up
+    duplicate listeners). The returned block registers a *delegated*
+    click listener on ``document`` so every ``.bubble-copy-btn`` on the
+    page — current and future — copies its ``data-text`` payload to the
+    clipboard.
+
+    Why a delegated listener and not one ``addEventListener`` per button:
+
+    - Streamlit re-renders the chat history on every assistant turn.
+      Adding a listener per button would leak listeners across renders.
+    - The listener is registered once and matches against the
+      ``.bubble-copy-btn`` class via ``event.target.closest(...)``.
+    - It is also safe inside the Streamlit Cloud preview iframe, where
+      inline event handlers in dynamically-injected HTML are sometimes
+      blocked by a strict Content Security Policy.
+
+    Behaviour on click:
+
+    1. Reads ``btn.dataset.text`` (the HTML-decoded original assistant
+       reply) and ``btn.dataset.label`` (the original button caption).
+    2. Tries ``navigator.clipboard.writeText(text)`` (modern API).
+    3. If that throws or returns a rejected promise (e.g. insecure
+       context, permission denied), falls back to a hidden ``<textarea>``
+       + ``document.execCommand('copy')`` path so the button still
+       works.
+    4. Briefly swaps the button label to "✓ Copied" (or "⚠ Press Ctrl+C"
+       if both paths fail) and restores it after 1.4 s.
+    5. Uses a per-element ``__copyBtnBusy`` guard so rapid double-clicks
+       do not stack overlapping timeouts.
+    """
+    # Idempotency guard. The module-level flag flips on the first call so
+    # subsequent calls (Streamlit re-renders, hot reloads) return '' and
+    # do not stack duplicate ``document.addEventListener`` registrations.
+    # We mutate a module global instead of a closure so the guard
+    # survives a Streamlit script rerun.
+    global _COPY_BUTTON_INIT_EMITTED
+    if _COPY_BUTTON_INIT_EMITTED:
+        return ""
+    _COPY_BUTTON_INIT_EMITTED = True
+
+    # The script is built with single-quoted JS string literals inside
+    # the surrounding HTML script tag so the outer HTML parser never has
+    # to disambiguate anything. The strings we embed are all ASCII and
+    # contain no single quotes, so there is no escape needed.
+    return (
+        "<script>\n"
+        "(function(){\n"
+        "  if (window.__secMentorCopyBtnWired) { return; }\n"
+        "  window.__secMentorCopyBtnWired = true;\n"
+        "  function show(btn, lbl){\n"
+        "    btn.textContent = lbl;\n"
+        "    setTimeout(function(){\n"
+        "      btn.textContent = btn.dataset.label || '';\n"
+        "    }, 1400);\n"
+        "  }\n"
+        "  function fallback(btn, text){\n"
+        "    try {\n"
+        "      var ta = document.createElement('textarea');\n"
+        "      ta.value = text;\n"
+        "      ta.setAttribute('readonly', '');\n"
+        "      ta.style.position = 'absolute';\n"
+        "      ta.style.left = '-9999px';\n"
+        "      document.body.appendChild(ta);\n"
+        "      ta.select();\n"
+        "      var ok = document.execCommand && document.execCommand('copy');\n"
+        "      document.body.removeChild(ta);\n"
+        "      show(btn, ok ? '"
+        + _COPY_BUTTON_LABEL_COPIED
+        + "' : '"
+        + _COPY_BUTTON_LABEL_FAILED
+        + "');\n"
+        "    } catch (e) {\n"
+        "      show(btn, '"
+        + _COPY_BUTTON_LABEL_FAILED
+        + "');\n"
+        "    }\n"
+        "  }\n"
+        "  document.addEventListener('click', function(ev){\n"
+        "    var btn = ev.target && ev.target.closest && ev.target.closest('.bubble-copy-btn');\n"
+        "    if (!btn) { return; }\n"
+        "    if (btn.__copyBtnBusy) { return; }\n"
+        "    btn.__copyBtnBusy = true;\n"
+        "    setTimeout(function(){ btn.__copyBtnBusy = false; }, 1500);\n"
+        "    var text = btn.dataset.text || '';\n"
+        "    if (navigator.clipboard && navigator.clipboard.writeText) {\n"
+        "      navigator.clipboard.writeText(text).then(\n"
+        "        function(){ show(btn, '"
+        + _COPY_BUTTON_LABEL_COPIED
+        + "'); },\n"
+        "        function(){ fallback(btn, text); }\n"
+        "      );\n"
+        "    } else {\n"
+        "      fallback(btn, text);\n"
+        "    }\n"
+        "  });\n"
+        "})();\n"
+        "</script>"
+    )
+
+
+def _emit_copy_button_init_script() -> None:
+    """Emit the one-time init script to the page so the click handler runs.
+
+    Why this is *not* ``st.markdown(_copy_button_init_script(),
+    unsafe_allow_html=True)``: Streamlit's markdown sanitizer strips
+    ``<script>`` tags (and inline event handlers) from the rendered HTML
+    even when ``unsafe_allow_html=True`` is passed. That means the
+    delegated ``click`` listener in the script body never gets registered
+    in the browser, and clicking the copy button does nothing.
+
+    The escape hatch is ``st.components.v1.html(...)``: it injects the
+    HTML into an iframe via ``srcdoc=`` (so ``<script>`` tags actually
+    execute — DOMPurify and the markdown sanitizer never see them).
+
+    Subtlety: scripts inside an iframe run in the **iframe's** window,
+    not the parent. The copy button is rendered in the parent document,
+    so a ``document.addEventListener('click', ...)`` inside the iframe
+    would never fire for clicks on the parent's button. We work around
+    that by wrapping the body in a tiny bootstrapper that
+    ``parent.eval(...)``s the body inside the parent window — so the
+    existing delegated-listener body (which uses bare ``window``,
+    ``document``, and ``navigator``) runs against the parent and catches
+    clicks on the copy button.
+
+    The body string itself is unchanged, so the 20 structural tests in
+    ``CopyButtonInitScriptTests`` still pin its behaviour (delegated
+    listener, ``closest`` matching, modern + legacy clipboard paths,
+    busy guard, label restore, payload read from ``data-text``, window
+    guard).
+    """
+    body = _copy_button_init_script()
+    if not body:
+        # Idempotent: the module-level guard has already flipped, so the
+        # first emission wins and subsequent calls become a no-op. This
+        # is important across Streamlit reruns.
+        return
+    # Local import: keeps ``web.chat_helpers`` importable from tests
+    # that don't have a Streamlit script-run context.
+    import streamlit.components.v1 as components
+    import json as _json
+    # The body itself contains a literal ``</script>`` (its own closing
+    # tag). When we drop the body into a JS string literal inside the
+    # wrapper ``<script>...</script>`` block, the HTML5 parser scans for
+    # ``</script>`` *as text* and would terminate the wrapper at the
+    # body's own closer -- so the body would be truncated and the
+    # delegated listener would never register. The standard escape is
+    # to replace ``</script>`` with ``<\/script>`` in the source text
+    # *before* the browser sees it. Inside a JS string literal, the
+    # backslash-before-slash is interpreted as an escape sequence whose
+    # value is just ``/``, so the resulting string at runtime is the
+    # original body verbatim -- the wire bytes are unchanged, only the
+    # parsed literal differs.
+    body_for_wire = body.replace("</script>", "<\\/script>")
+    parent_eval_call = (
+        "<script>\n"
+        "try {\n"
+        "  parent.eval(" + _json.dumps(body_for_wire) + ");\n"
+        "} catch (e) {\n"
+        "  console.error('secMentor copy init failed:', e);\n"
+        "}\n"
+        "</script>"
+    )
+    components.html(parent_eval_call, height=0, width=0, scrolling=False)

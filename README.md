@@ -3,8 +3,8 @@
 > **AI-Powered Cybersecurity Learning & Analysis Platform**
 > Learn · Analyze · Defend · Research
 
-A Streamlit chatbot that answers cybersecurity questions using free LLMs routed through [OpenRouter](https://openrouter.ai). Built as a personal learning project across 7 phases plus a Session-4 post-hoc pass and a Session-7 multimodal pass:
-plain request/response → memory → prompt engineering → web UI → refactor → multi-model selector, two-pass pattern, friendly-error classifier → file & image upload (multimodal).
+A Streamlit chatbot that answers cybersecurity questions using free LLMs routed through [OpenRouter](https://openrouter.ai). Built as a personal learning project across 7 phases plus a Session-4 post-hoc pass, a Session-7 multimodal pass, and a Session-8 UI fix pass:
+plain request/response → memory → prompt engineering → web UI → refactor → multi-model selector, two-pass pattern, friendly-error classifier → file & image upload (multimodal) → **copy-to-clipboard bubble buttons (no inline JS, idempotent delegated listener)**.
 
 The web UI ships in **CTF / Lab mentor** mode by default (a lab-scoped teaching persona that can produce runnable exploit snippets *for your own lab*), with a one-click switch to the conservative **Defensive (4-pillar)** prompt. The CLI keeps the defensive default so headless / scripted use stays in the tighter scope. Both modes share the same hard refusals — see the [Safety](#safety) section below.
 
@@ -85,7 +85,7 @@ question, press Enter, and the assistant reply appears in the chat.
 python -m unittest discover -v
 ```
 
-Expected: `Ran 133 tests in …` → `OK`.
+Expected: `Ran 175 tests in …` → `OK` (28 file-processor + 147 smoke, including 20 copy-button contract tests).
 
 > **Optional — pre-flight check before running.** If you are mid-development and you have edited `app/config.py` (added or renamed a function), a long-lived Streamlit worker may still be holding the *old* module object. The pre-flight script catches that before you start a new server:
 >
@@ -106,7 +106,7 @@ Expected: `Ran 133 tests in …` → `OK`.
 app/              # Core library: config, OpenRouter client, router, prompts, file_processor (multimodal)
 cli/              # Terminal interface (defensive prompt by default)
 web/              # Streamlit web interface + pure UI-logic helpers
-tests/            # Automated checks (unittest, 133 tests: 28 file + 105 smoke)
+tests/            # Automated checks (pytest, 175 tests: 28 file + 147 smoke)
 docs/             # Technical and personal study logs
 .streamlit/
   config.toml     # Theme pin: light base, dark text, enterprise-blue accent
@@ -127,7 +127,7 @@ Key files:
 - `cli/chatbot.py` — REPL-style terminal chat. Always uses the defensive prompt.
 - `web/streamlit_app.py` — The Streamlit view. `sys.path` bootstrap, sidebar (model selector + **teaching mode** radio + **Layout mode** radio + file uploader), `_init_state`, two-pass `_ask` driver (`pending_request` in `session_state`), `_render_friendly_error`. Theme is pinned via `.streamlit/config.toml`; the design-token CSS in this file adds light-mode guards so OS / browser dark-mode UA stylesheets cannot override text colour.
 - `web/chat_helpers.py` — Pure UI-logic helpers: `_active_system_prompt(state)` (the teaching-mode → prompt bridge, fail-closed), `_is_rate_limit_error`, `_friendly_error_message`, `_build_messages`, `_truncate_history`, `_serialize_for_download`, `_count_chars`, `_bubble_alignment`, **and the multimodal bridge**: `_is_image_mime`, `_is_pdf_mime`, `build_user_turn_content` (returns `str | list[dict]` — text-only OR OpenAI vision content array), `select_model_for_request` (auto-upgrades to a vision-capable model when the turn contains an image), and `_DEFAULT_FREE_VISION_MODEL = "nvidia/nemotron-nano-12b-v2-vl:free"`. No Streamlit calls in any of these.
-- `tests/test_smoke.py` — 105 tests across 18 classes. Covers the engine, the helpers, the view contracts, the two-pass pattern, the model selector, the friendly-error path, the multi-key router, the prompt boundary, the `sys.path` bootstrap, and the new `key="teaching_mode"` radio windowed-search guard.
+- `tests/test_smoke.py` — 147 tests across 22 classes. Covers the engine, the helpers, the view contracts, the two-pass pattern, the model selector, the friendly-error path, the multi-key router, the prompt boundary, the `sys.path` bootstrap, the `key="teaching_mode"` radio windowed-search guard, and the copy-to-clipboard button contract (`CopyButtonHtmlTests` + `CopyButtonInitScriptTests`, 20 tests).
 - `tests/test_files.py` — 28 tests across 14 classes. Covers `app/file_processor.py` (PDF text extraction, image bytes, MIME detection, size cap, error taxonomy) and the multimodal bridge in `web/chat_helpers.py` (vision auto-upgrade, stub-block path, fallback model, base64 encoding).
 - `verify_changes.py` — Pre-flight script: `READY` / `STALE_WORKER: kill PIDs …` / `IMPORT_BROKEN`. Uses `Get-CimInstance` and `Get-NetTCPConnection` to find stale workers before they bite.
 - `run.py` — One-command runner. Locates a Python 3.11+ interpreter, creates `.venv/`, installs `requirements.txt`, copies `.env.example → .env` if missing, runs `verify_changes.py`, then launches `streamlit run web/streamlit_app.py` in the foreground (or detached with `--detach`).
@@ -216,6 +216,43 @@ The web UI's `st.chat_input` accepts file attachments. Drop a file into the inpu
 **Testing:** the multimodal pipeline is covered by 28 tests in `tests/test_files.py` (14 classes) — the file processor, the MIME sniffer, the size cap, every error kind, the vision auto-upgrade, the stub-block path, the hardcoded fallback model, and the OpenAI content-array shape. Run them with `python -m unittest tests.test_files -v`.
 
 See row 16 of `docs/technical_write_up.md` for the build log, Decision 11 for the docs-lag-code rule, and `improvements.md` §B.9 for the cross-cutting summary.
+
+---
+
+### Copy-to-clipboard bubble buttons
+
+Every assistant reply renders a small **`📋 Copy`** button next to the bubble. Click it and the full reply text lands on your clipboard — nothing leaks, no extra permissions prompt, no broken HTML. The button is part of the assistant row, not the user row, so the transcript still scrolls naturally on both sides.
+
+**What you see, in order of feedback after you click:**
+
+1. **Idle** — the button reads `📋 Copy` with a faint border, sized to match the bubble's cap-height.
+2. **Click** — the helper pulls the bubble's full text from the `data-text` attribute on the button, calls the modern `navigator.clipboard.writeText` API, and (in restricted contexts where the modern API is blocked) falls back to a hidden `<textarea>` + `document.execCommand('copy')`.
+3. **Success** — the label briefly flips to `✅ Copied!` for ~1.5 s, then restores to `📋 Copy`. The restore is driven by a per-element `__copyBtnBusy` guard so rapid double-clicks cannot stack overlapping timers.
+4. **Failure** — the label flips to `⚠ Copy failed` instead. The error is swallowed (clipboard is best-effort UX), and the original label restores on the next interaction.
+
+**Why this is not the obvious `onclick="…"` implementation.** Inline `onclick="var text='…'"` inside an `unsafe_allow_html` stream looks harmless until the model returns a string that itself contains both an apostrophe and a double quote. The HTML parser then terminates the attribute at the inner quote and **leaks the rest of the handler as visible text inside the bubble** — the bug that triggered this whole pass. The fix is to:
+
+- **Never put the payload in an attribute that needs to round-trip through HTML** — instead, store it in a `data-*` attribute and read it back through the browser's automatic `dataset.text` decoding.
+- **HTML-escape the attribute value once on the Python side** with `html.escape(value, quote=True)`, which escapes `&`, `<`, `>`, `"`, *and* `'` (Python 3.13).
+- **Register the click listener exactly once, on `document`**, with `event.target.closest('.bubble-copy-btn')` matching, instead of attaching one listener per button. The init script is **idempotent** on both sides: a Python module-level `_COPY_BUTTON_INIT_EMITTED` flag stops re-emission across Streamlit reruns, and a JS `window.__secMentorCopyBtnWired` flag stops re-registration if the script somehow runs twice.
+- **Guard the click with `btn.__copyBtnBusy`** so a frantic user pressing the button three times only fires one copy.
+
+**Where the code lives:**
+
+| File | Role |
+|---|---|
+| `web/chat_helpers.py` — `_copy_button_html(text)` | Pure helper. Returns `<button class="bubble-copy-btn" data-label="…" data-text="<html-escaped>">📋 Copy</button>`. No JS in any attribute. Returns a single-line string — safe to pass straight into `st.markdown(..., unsafe_allow_html=True)`. |
+| `web/chat_helpers.py` — `_copy_button_init_script()` | Pure helper. Returns the one-time `<script>` block with the delegated `document.addEventListener('click', …)` listener, modern + legacy clipboard paths, busy guard, label-restore, and `window.__secMentorCopyBtnWired` guard. Returns `""` on the second call within a single process. |
+| `web/streamlit_app.py` — line 631 | `st.markdown(_copy_button_init_script(), unsafe_allow_html=True)` after the CSS render. Idempotent. |
+| `web/streamlit_app.py` — line 1246 | `f'</div>{_copy_button_html(content)}</div></div>'` — copy button rendered next to each assistant bubble. |
+| `web/streamlit_app.py` — `_CUSTOM_CSS` (~line 478) | `.bubble-copy-btn` base + `:hover`, `:active`, `:focus-visible` rules. |
+| `tests/test_smoke.py` | `CopyButtonHtmlTests` (10 tests) and `CopyButtonInitScriptTests` (10 tests) pin the contract. |
+
+**Testing the contract:** 20 unit tests in `tests/test_smoke.py` cover both halves of the split — `CopyButtonHtmlTests` pins the HTML shape (button tag, no `onclick`, four-entity escaping for `& < > "`, apostrophe escaping to `&#x27;`, Unicode, 4 KB payload, label-restore wiring) and `CopyButtonInitScriptTests` pins the init script (script-tag wrapper, idempotent re-call, delegated listener, `closest('.bubble-copy-btn')` matching, modern API, legacy fallback, busy guard, label restore, `data-text` payload read, `window.__secMentorCopyBtnWired` window guard). All 175 tests pass in ~5 s.
+
+**XSS analysis.** A user prompt that returns an assistant reply containing `<script>alert(1)</script>` is handled cleanly: the reply text is run through `html.escape(..., quote=True)` before being dropped into the `data-text` attribute, so the payload is stored as the four-entity string `&lt;script&gt;alert(1)&lt;/script&gt;`. The browser decodes the `data-*` attribute back to the literal text on the JS side, and the only `innerHTML` write in the lifecycle is to set `btn.textContent` (label-restore), which never interprets HTML. No `eval`, no `Function()`, no `innerHTML +=`.
+
+See `docs/copy_button.md` for the full design doc, and row 17 of `docs/technical_write_up.md` for the build log of this pass.
 
 ---
 
@@ -443,7 +480,7 @@ curl -sf http://127.0.0.1:8501/_stcore/health
 - **Multi-user load.** Streamlit is single-process; a few concurrent users is fine, hundreds is not. The `app/` engine itself is stateless, so the upgrade path is to wrap it in a FastAPI service and put a real WSGI/ASGI server in front.
 - **Persistent history.** Conversation history lives in `session_state`, which is per-browser-tab. A database (SQLite is enough) is the next click when that matters.
 - **Authenticated access.** There is no login. Streamlit Community Cloud has email-gating built in; for your own server, put the app behind a reverse-proxy auth (e.g. oauth2-proxy) or a Cloudflare Access policy.
-- **Browser-tested integration tests.** The 133-test suite covers the units; it does not exercise `chat_input` → rerun → bubble render end-to-end. A `tests/test_streamlit_integration.py` using `streamlit.testing.v1.AppTest` is the owed next slice — see Decision 8 in `docs/technical_write_up.md`.
+- **Browser-tested integration tests.** The 175-test suite covers the units; it does not exercise `chat_input` → rerun → bubble render end-to-end. A `tests/test_streamlit_integration.py` using `streamlit.testing.v1.AppTest` is the owed next slice — see Decision 8 in `docs/technical_write_up.md`.
 
 ---
 

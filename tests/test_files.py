@@ -34,6 +34,10 @@ import sys
 import unittest
 from unittest.mock import patch
 
+import pytest
+
+pytestmark = pytest.mark.smoke
+
 # --- Path bootstrap ----------------------------------------------------------
 # Mirror the project-root-cd pattern used in tests/test_smoke.py so this file
 # works no matter where the user invokes `python -m unittest` from.

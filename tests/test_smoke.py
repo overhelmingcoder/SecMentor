@@ -19,11 +19,16 @@ import os
 import re
 import sys
 import unittest
+from unittest import mock
 from unittest.mock import patch
+
+import pytest
 
 from app import config, openrouter, prompts
 from app.openrouter import OpenRouterError, chat
 from web.chat_helpers import _active_system_prompt
+
+pytestmark = pytest.mark.smoke
 
 # Absolute path to the Streamlit view script. Used by the sys.path
 # bootstrap tests below so they can exec the bootstrap block in an
@@ -1749,6 +1754,827 @@ class StreamlitChatInputFileUploadTests(unittest.TestCase):
             "view must guard against empty prompts (files-only with "
             "no recognised content would otherwise call _ask('')).",
         )
+
+
+# --- Copy-to-clipboard helper (Tier 1 #4) -----------------------------------
+# Verifies that ``web.chat_helpers._copy_button_html`` produces a tiny,
+# self-contained HTML <button> whose payload cannot break out of the
+# ``data-text`` HTML attribute — the one thing that can go wrong with
+# a clipboard helper is XSS in the embedded reply text, so we test
+# the escaping behaviour explicitly with payloads an LLM might
+# realistically emit (apostrophes, double-quotes, angle brackets,
+# ampersands, backticks, control chars, Unicode, very long strings).
+#
+# The companion init script (``_copy_button_init_script``) is tested
+# separately by ``CopyButtonInitScriptTests`` further down.
+
+
+class CopyButtonHtmlTests(unittest.TestCase):
+    """Structural + safety tests for the copy-to-clipboard helper.
+
+    The helper emits a tiny HTML ``<button>`` whose payload lives in a
+    ``data-text="<html-escaped>"`` attribute. The browser parses the
+    attribute for us, so by the time the delegated JS listener reads
+    ``btn.dataset.text`` the original string is back, byte-for-byte —
+    there is no XSS hole even if the assistant's reply contains
+    ``<script>``, ``"xss"``, backticks, or Unicode.
+
+    These tests pin that contract from the outside by extracting the
+    raw ``data-text`` attribute body (entities intact) and then
+    ``html.unescape``-ing it to check round-trip correctness.
+    """
+
+    def setUp(self) -> None:
+        from web import chat_helpers  # local import: keeps the top-of-file
+        # import list minimal and matches the lazy style used elsewhere.
+        self._module = chat_helpers
+        self._render = chat_helpers._copy_button_html
+
+    def test_returns_a_button_element(self) -> None:
+        html = self._render("hello world")
+        self.assertTrue(html.lstrip().startswith("<button"))
+        self.assertTrue(html.rstrip().endswith("</button>"))
+
+    @staticmethod
+    def _extract_data_text(html: str) -> str:
+        """Return the HTML-decoded value of the ``data-text`` attribute.
+
+        The helper embeds the assistant text as
+        ``data-text="<html-escaped>"``. We extract the raw attribute
+        body (so the safety tests can assert that dangerous raw chars
+        never appear inside it) and then ``html.unescape`` it back to
+        the original string for round-trip checks.
+        """
+        import html as _html_mod  # local import — only the tests need it
+        match = re.search(r'data-text="([^"]*)"', html)
+        if not match:
+            raise AssertionError("`data-text=\"...\"` not found in rendered HTML")
+        # The captured group is the raw attribute body (entities intact).
+        # Decode it so round-trip checks see the original string.
+        return _html_mod.unescape(match.group(1))
+
+    def test_embeds_payload_as_html_escaped_attribute(self) -> None:
+        # The new design puts the payload in a ``data-text`` HTML
+        # attribute. The browser parses the attribute for us so JS can
+        # just read ``btn.dataset.text`` and get the original string
+        # back. We pin that:
+        #   1. the attribute is present with a double-quoted body;
+        #   2. the body round-trips to the original string via
+        #      ``html.unescape`` (which is what the browser does).
+        html = self._render("hello world")
+        self.assertIn('data-text="', html)
+        decoded = self._extract_data_text(html)
+        self.assertEqual(decoded, "hello world")
+
+    def test_no_inline_onclick_attribute(self) -> None:
+        # Regression guard for the v1 bug: an inline ``onclick="..."``
+        # attribute on a button whose payload is also double-quoted is
+        # a quote-collision landmine (the HTML parser terminates the
+        # attribute at the first inner ``"`` and the rest of the JS
+        # leaks out as visible text). The new design intentionally has
+        # NO ``onclick`` attribute — the JS lives in a delegated
+        # listener registered once via ``_copy_button_init_script``.
+        html = self._render("payload")
+        self.assertNotIn("onclick=", html,
+                         "button must not have an inline onclick attribute; "
+                         "the delegated listener in _copy_button_init_script "
+                         "handles all clicks")
+
+    def test_escapes_apostrophes(self) -> None:
+        # LLM copy is full of "don't", "user's input", "it's". On
+        # CPython 3.13 ``html.escape(quote=True)`` actually escapes
+        # apostrophes to ``&#x27;`` as well (defence-in-depth — even
+        # though apostrophes cannot close a *double*-quoted HTML
+        # attribute, an over-eager future refactor that flips the
+        # attribute to single quotes must not silently break). We pin
+        # that:
+        #   1. Apostrophes appear as ``&#x27;`` in the raw body (so a
+        #      naive switch to single-quoted attributes can't leak).
+        #   2. The body round-trips to the original string via
+        #      ``html.unescape`` (which is what the browser does).
+        original = "Don't trust user input — it's adversarial."
+        html = self._render(original)
+        match = re.search(r'data-text="([^"]*)"', html)
+        self.assertIsNotNone(match, "data-text attribute must be present")
+        raw_body = match.group(1)
+        # No raw apostrophes in the attribute body — they are all
+        # entity-escaped to &#x27;.
+        self.assertNotIn("'", raw_body)
+        self.assertIn("&#x27;", raw_body)
+        # Round-trip back to the original string.
+        self.assertEqual(self._extract_data_text(html), original)
+
+    def test_escapes_double_quotes(self) -> None:
+        # An unescaped ``"`` inside the ``data-text="..."`` body would
+        # close the HTML attribute early and let the rest of the reply
+        # leak as visible text (the exact v1 bug we are guarding
+        # against). ``html.escape(quote=True)`` MUST turn every inner
+        # quote into ``&quot;``. We pin that:
+        #   1. The escaped form ``&quot;`` actually appears in the
+        #      body (proving escaping happened — not just deletion).
+        #   2. The body has no raw ``"`` chars after the opening one
+        #      that would close the attribute.
+        original = 'say "hello" and <script>alert(1)</script>'
+        html = self._render(original)
+        match = re.search(r'data-text="([^"]*)"', html)
+        self.assertIsNotNone(match, "data-text attribute must be present")
+        raw_body = match.group(1)
+        self.assertIn("&quot;", raw_body,
+                      "inner double quotes must be entity-escaped so the "
+                      "HTML attribute cannot terminate early")
+        # The attribute body must not contain any raw angle brackets or
+        # ampersands (all of which are HTML-significant).
+        self.assertNotIn("<", raw_body)
+        self.assertNotIn(">", raw_body)
+        # Round-trip back to the original string.
+        self.assertEqual(self._extract_data_text(html), original)
+
+    def test_escapes_angle_brackets_and_ampersand(self) -> None:
+        # Angle brackets and ``&`` are HTML-significant even inside an
+        # attribute value: ``<`` could open a new tag, ``>`` is a tag
+        # terminator in some parsers, and ``&`` starts a character
+        # reference. ``html.escape(quote=True)`` MUST convert all
+        # three to entities. We pin that here so a future refactor
+        # that calls ``html.escape(value)`` without ``quote=True``
+        # (which would skip ``"``) is caught — and also so a future
+        # refactor that swaps the escape function entirely (e.g. to a
+        # naive ``str.replace``) cannot silently drop one of the four
+        # required substitutions.
+        original = "<a href=\"x\">A & B</a>"
+        html = self._render(original)
+        match = re.search(r'data-text="([^"]*)"', html)
+        self.assertIsNotNone(match, "data-text attribute must be present")
+        raw_body = match.group(1)
+        self.assertIn("&lt;", raw_body)
+        self.assertIn("&gt;", raw_body)
+        self.assertIn("&amp;", raw_body)
+        # No raw dangerous chars in the attribute body.
+        self.assertNotIn("<", raw_body)
+        self.assertNotIn(">", raw_body)
+        # Note: ``&quot;`` is also expected (from the inner quotes)
+        # but the four-entity assertion above already covers it.
+        # Round-trip back to the original.
+        self.assertEqual(self._extract_data_text(html), original)
+
+    def test_handles_unicode(self) -> None:
+        # Security copy is heavy on em-dashes, curly quotes, and the
+        # occasional CJK character. ``html.escape`` does NOT touch
+        # non-ASCII codepoints by default — they are valid inside an
+        # HTML attribute as raw UTF-8 bytes. We pin that em-dashes and
+        # CJK chars round-trip through the attribute without being
+        # turned into numeric entities (which would bloat the HTML
+        # for no security gain).
+        original = "Use \u2014 em-dash and \u4e2d\u6587 in CTF notes."
+        html = self._render(original)
+        match = re.search(r'data-text="([^"]*)"', html)
+        self.assertIsNotNone(match, "data-text attribute must be present")
+        raw_body = match.group(1)
+        # Em-dash and CJK must appear as themselves, not as &#...;.
+        self.assertIn("\u2014", raw_body)
+        self.assertIn("\u4e2d\u6587", raw_body)
+        self.assertEqual(self._extract_data_text(html), original)
+
+    def test_handles_long_strings(self) -> None:
+        # An assistant can dump a 4 KB code block. The helper must
+        # accept it without truncation or stack-blowing recursion (the
+        # implementation is one f-string concat, so there is no risk,
+        # but we pin the behaviour so a future refactor does not
+        # regress).
+        original = "x" * 4096
+        html = self._render(original)
+        decoded = self._extract_data_text(html)
+        self.assertEqual(len(decoded), 4096)
+        self.assertEqual(decoded, original)
+
+    def test_modern_and_legacy_clipboard_paths_live_in_init_script(self) -> None:
+        # v1 inlined both the modern ``navigator.clipboard.writeText``
+        # path AND the legacy ``document.execCommand('copy')`` fallback
+        # into the button's onclick handler. v2 splits them out: the
+        # button HTML has NEITHER (so it stays tiny and parseable), and
+        # BOTH live in the init script. We pin the split here so a
+        # future refactor doesn't quietly re-inline the JS into the
+        # button (re-introducing the v1 quote-collision risk).
+        html = self._render("payload")
+        self.assertNotIn("navigator.clipboard", html,
+                         "modern clipboard API must live in the init script, "
+                         "not in the button HTML")
+        self.assertNotIn("execCommand", html,
+                         "legacy clipboard fallback must live in the init "
+                         "script, not in the button HTML")
+
+    def test_stores_original_label_for_restore(self) -> None:
+        # The init script restores the button caption after the 1.4 s
+        # confirmation window by reading ``btn.dataset.label`` and
+        # writing it back. The label must therefore live in a
+        # ``data-label`` attribute on the button. We match by regex so
+        # we don't depend on whether the helper stores the emoji as a
+        # surrogate pair or a single code unit (both forms are equal
+        # under ``==`` but break a substring check).
+        html = self._render("payload")
+        self.assertRegex(
+            html,
+            r'data-label="[^"]*\bCopy\b[^"]*"',
+            "data-label must carry the original button label so the "
+            "init script can restore it after the 1.4 s confirmation",
+        )
+        # The init script (tested separately in
+        # ``CopyButtonInitScriptTests``) must reference dataset.label;
+        # we double-pin it here so the two ends stay in sync.
+        init_script = self._module._copy_button_init_script()
+        self.assertIn("dataset.label", init_script)
+
+    def test_view_wires_helper(self) -> None:
+        # The Streamlit view must import and call the helper from the
+        # assistant branch of the history render. If a future refactor
+        # drops the import or stops calling it, the button disappears
+        # silently -- this test pins the wiring.
+        src = _read_streamlit_view()
+        self.assertIn("_render_copy_button_for_bubble", src,
+                      "view must import _render_copy_button_for_bubble so "
+                      "the assistant copy button is rendered as a per-bubble "
+                      "iframe component")
+        self.assertIn("web.chat_helpers", src)
+        # And it must be rendered as a call to the iframe helper (the
+        # whole point of the helper is to live inside a custom HTML
+        # block, not a st.button that would lose the styling).
+        self.assertRegex(
+            src,
+            r"_render_copy_button_for_bubble\(",
+            "view must call _render_copy_button_for_bubble(...) from the "
+            "assistant branch of the history render so each copy button "
+            "becomes its own iframe component (the click handler lives "
+            "inside the iframe, where navigator.clipboard works as a "
+            "secure context -- a delegated listener in the parent window "
+            "is blocked by Streamlit's component iframe sandbox)",
+        )
+        # And it must NOT route through the legacy helpers -- those
+        # were broken by the same cross-origin sandbox and are no
+        # longer the correct wiring.
+        self.assertNotIn(
+            "_copy_button_init_script", src,
+            "view must NOT wire the legacy _copy_button_init_script "
+            "helper -- that path is broken by Streamlit's cross-origin "
+            "component sandbox and the button shows but does nothing",
+        )
+        self.assertNotIn(
+            "_emit_copy_button_init_script", src,
+            "view must NOT wire the legacy _emit_copy_button_init_script "
+            "helper -- its parent.eval(...) bootstrapper is silently "
+            "swallowed by the same-origin policy inside Streamlit's "
+            "component iframe",
+        )
+
+
+class CopyButtonInitScriptTests(unittest.TestCase):
+    """Structural + safety tests for the one-time delegated-listener script.
+
+    The helper emits a single ``<script>`` block (idempotent: only the
+    first call per process returns the block; later calls return ``""``).
+    The block registers a click listener on ``document`` that handles
+    every ``.bubble-copy-btn`` on the page. We pin:
+
+      * the listener is registered on ``document`` (delegated, survives
+        Streamlit re-renders);
+      * it matches via ``.closest('.bubble-copy-btn')`` so clicks on
+        child nodes (e.g. a future icon inside the button) still work;
+      * the modern path uses ``navigator.clipboard.writeText`` and the
+        legacy fallback uses ``document.execCommand('copy')``;
+      * the busy-guard prevents double-click storms;
+      * the original button label is restored from ``dataset.label``;
+      * re-invoking the helper returns ``""`` (no duplicate listeners).
+    """
+
+    def setUp(self) -> None:
+        # Force the helper to "re-emit" by resetting the module-level
+        # guard. This makes the test independent of any earlier helper
+        # call in the same process and lets us assert the idempotency
+        # behaviour afterwards.
+        from web import chat_helpers
+        self._module = chat_helpers
+        self._original_flag = chat_helpers._COPY_BUTTON_INIT_EMITTED
+        chat_helpers._COPY_BUTTON_INIT_EMITTED = False
+
+    def tearDown(self) -> None:
+        # Restore whatever the rest of the suite expected so we do not
+        # leak the test's override into other tests.
+        self._module._COPY_BUTTON_INIT_EMITTED = self._original_flag
+
+    def test_returns_a_script_block(self) -> None:
+        html = self._module._copy_button_init_script()
+        self.assertTrue(html.lstrip().startswith("<script"))
+        self.assertTrue(html.rstrip().endswith("</script>"))
+
+    def test_second_call_returns_empty(self) -> None:
+        # The guard must flip on the first call so a second call in
+        # the same process (e.g. after a Streamlit rerun) returns ""
+        # and does not stack duplicate listeners.
+        first = self._module._copy_button_init_script()
+        self.assertTrue(first.startswith("<script"))
+        second = self._module._copy_button_init_script()
+        self.assertEqual(second, "",
+                         "second call must return empty string to avoid "
+                         "stacking duplicate document.addEventListener "
+                         "registrations across Streamlit reruns")
+
+    def test_uses_delegated_document_listener(self) -> None:
+        html = self._module._copy_button_init_script()
+        self.assertIn("document.addEventListener", html,
+                      "must register a delegated listener on document so "
+                      "buttons created by later Streamlit reruns still work")
+        self.assertIn("'click'", html,
+                      "must listen for click events on the delegated target")
+
+    def test_matches_via_closest_selector(self) -> None:
+        # The handler must find the .bubble-copy-btn via .closest(...) so
+        # clicks on a future icon child of the button still resolve to
+        # the button itself.
+        html = self._module._copy_button_init_script()
+        self.assertIn("closest('.bubble-copy-btn')", html)
+
+    def test_uses_modern_clipboard_api(self) -> None:
+        html = self._module._copy_button_init_script()
+        self.assertIn("navigator.clipboard.writeText", html)
+
+    def test_uses_legacy_fallback(self) -> None:
+        # The fallback must be there so the button still works on older
+        # browsers and inside the Streamlit Cloud preview iframe, where
+        # navigator.clipboard is gated behind a user gesture and
+        # sometimes blocked entirely.
+        html = self._module._copy_button_init_script()
+        self.assertIn("document.execCommand('copy')", html)
+
+    def test_uses_busy_guard(self) -> None:
+        # A per-element __copyBtnBusy flag must be set so rapid
+        # double-clicks do not stack overlapping timeouts.
+        html = self._module._copy_button_init_script()
+        self.assertIn("__copyBtnBusy", html)
+
+    def test_restores_label_from_dataset(self) -> None:
+        # The handler must restore the original label from
+        # btn.dataset.label so the "Copied" / "Failed" feedback clears
+        # after the 1.4 s confirmation window.
+        html = self._module._copy_button_init_script()
+        self.assertIn("dataset.label", html)
+
+    def test_reads_payload_from_dataset_text(self) -> None:
+        # The handler must read the payload from btn.dataset.text
+        # (the HTML-decoded original assistant reply) -- this is the
+        # whole point of the new design.
+        html = self._module._copy_button_init_script()
+        self.assertIn("dataset.text", html)
+
+    def test_inner_window_guard_for_duplicate_wiring(self) -> None:
+        # Belt-and-braces: the script itself guards against being
+        # evaluated twice on the same page (e.g. if a future refactor
+        # accidentally calls the helper without the module-level
+        # idempotency guard).
+        html = self._module._copy_button_init_script()
+        self.assertIn("__secMentorCopyBtnWired", html)
+
+
+class CopyButtonEmitterTests(unittest.TestCase):
+    """Pin ``_emit_copy_button_init_script``'s contract.
+
+    The emitter routes the init script through
+    ``streamlit.components.v1.html`` (which uses an iframe via
+    ``srcdoc=`` so ``<script>`` tags survive), wrapped in a
+    ``parent.eval(...)`` bootstrapper so the delegated listener runs in
+    the **parent** document -- where the copy button actually lives.
+
+    We assert:
+
+      * the emitter calls ``st.components.v1.html`` exactly once,
+      * the emitted HTML is wrapped in a ``<script>`` tag,
+      * the bootstrapper calls ``parent.eval(...)`` (so the listener
+        registers on the parent window, not the iframe),
+      * the body's own ``</script>`` closer is escaped to ``<\\/script>``
+        on the wire so the HTML parser does not terminate the wrapper
+        prematurely (the same bug class that motivated the data-text
+        rewrite, just one level up),
+      * the original init-script body is preserved verbatim inside the
+        JSON-encoded argument (the 20 ``CopyButtonInitScriptTests``
+        still pin the body shape -- the emitter must not mutate it),
+      * a second call is a no-op (idempotency guard),
+      * the emitter returns ``None`` (it pushes to the page, it does
+        not return the HTML to the caller).
+    """
+
+    def setUp(self) -> None:
+        from web import chat_helpers
+        self._module = chat_helpers
+        self._original_flag = chat_helpers._COPY_BUTTON_INIT_EMITTED
+        chat_helpers._COPY_BUTTON_INIT_EMITTED = False
+
+    def tearDown(self) -> None:
+        self._module._COPY_BUTTON_INIT_EMITTED = self._original_flag
+
+    def _capture(self) -> list[dict]:
+        """Run the emitter inside a real Streamlit script-run context.
+
+        We patch ``st.components.v1.html`` with a recording mock and
+        collect every call. ``streamlit.components.v1.html`` only works
+        inside a script-run context, so we borrow one from ``AppTest``
+        for the duration of the call. The ``AppTest`` body never runs
+        (we never call ``.run()``) -- we just need the context object.
+        """
+        captured: list[dict] = []
+
+        def _recorder(html, **kwargs):
+            captured.append({"html": html, "kwargs": kwargs})
+
+        # Stand up a real Streamlit script-run context so the helper
+        # can call ``st.components.v1.html`` without raising.
+        from streamlit.testing.v1 import AppTest
+
+        at = AppTest.from_string("import streamlit as st\nst.write('')\n")
+        at.run()
+        try:
+            with mock.patch(
+                "streamlit.components.v1.html", side_effect=_recorder
+            ):
+                result = self._module._emit_copy_button_init_script()
+        finally:
+            # ``AppTest`` does not expose a teardown; the context object
+            # is held on ``at`` and will be collected when the test exits.
+            pass
+        self.assertIsNone(
+            result,
+            "emitter must push the bootstrapper to the page, not return "
+            "HTML to the caller -- callers do not want to st.markdown "
+            "the result (that would route it back through the sanitizer "
+            "we are trying to escape)",
+        )
+        return captured
+
+    def test_emits_via_components_html(self) -> None:
+        captured = self._capture()
+        self.assertEqual(
+            len(captured),
+            1,
+            "emitter must call st.components.v1.html exactly once on its "
+            "first invocation -- multiple calls would stack duplicate "
+            "iframes and the parent's __secMentorCopyBtnWired guard "
+            "would still gate them, but it's wasteful",
+        )
+        kwargs = captured[0]["kwargs"]
+        self.assertEqual(kwargs.get("height"), 0)
+        self.assertEqual(kwargs.get("width"), 0)
+        self.assertEqual(kwargs.get("scrolling"), False)
+
+    def test_emits_a_script_block(self) -> None:
+        captured = self._capture()
+        payload = captured[0]["html"]
+        self.assertTrue(payload.lstrip().startswith("<script>"))
+        self.assertTrue(payload.rstrip().endswith("</script>"))
+
+    def test_uses_parent_eval_bootstrapper(self) -> None:
+        # The bootstrapper must call parent.eval(...) so the delegated
+        # listener (which references bare ``window``/``document``/
+        # ``navigator``) runs in the parent document where the copy
+        # button lives. Without ``parent.eval`` the listener would
+        # register inside the iframe's window and never catch parent
+        # clicks.
+        captured = self._capture()
+        payload = captured[0]["html"]
+        self.assertIn("parent.eval(", payload)
+        self.assertIn("try {", payload)
+        self.assertIn("catch (e)", payload)
+        self.assertIn("console.error", payload)
+
+    def test_escapes_inline_closer(self) -> None:
+        # The init-script body has a literal ``</script>`` (its own
+        # closing tag). When JSON-encoded and dropped into the wrapper
+        # ``<script>...</script>`` block, that literal closer would
+        # terminate the wrapper prematurely -- the HTML parser scans
+        # for ``</script>`` as text, not as a JS token. The standard
+        # fix is to replace ``</script>`` with ``<\/script>`` in the
+        # wire bytes (which JSON then encodes as ``<\\/script>``).
+        # Inside a JS string literal, the ``\/`` is just ``/`` -- the
+        # runtime string is unchanged.
+        captured = self._capture()
+        payload = captured[0]["html"]
+        self.assertIn(
+            "<\\\\/script>",
+            payload,
+            "the body's own </script> closer must be escaped to <\\\\/script> "
+            "on the wire so the HTML parser does not terminate the "
+            "wrapper script tag at the body's own closer -- otherwise "
+            "the body would be truncated and the delegated listener "
+            "would never register.",
+        )
+
+    def test_preserves_original_body(self) -> None:
+        # The 20 structural tests in ``CopyButtonInitScriptTests`` pin
+        # the body shape -- the emitter must not mutate it. We confirm
+        # the body is byte-identical (modulo the ``</script>`` ->
+        # ``<\\/script>`` escape) by checking that every distinctive
+        # marker is still present inside the JSON-encoded argument.
+        captured = self._capture()
+        payload = captured[0]["html"]
+        body = self._module._copy_button_init_script()
+        # The body is JSON-encoded inside ``parent.eval("...")`` so the
+        # JSON-escape sequence for ``/`` is just ``/`` (no escape).
+        # ``\n`` survives as a real newline, ``\"`` survives as ``\"``.
+        body_on_wire = body.replace("</script>", "<\\/script>")
+        self.assertIn(
+            body_on_wire.replace("\n", "\\n").replace('"', '\\"'),
+            payload,
+            "the original init-script body (modulo the </script> -> "
+            "<\\/script> wire escape and JSON string escaping) must be "
+            "present verbatim inside the parent.eval argument so the 20 "
+            "structural tests in CopyButtonInitScriptTests still apply "
+            "to the runtime string",
+        )
+        # And the distinct markers are present directly.
+        for marker in (
+            "document.addEventListener",
+            "'click'",
+            "closest('.bubble-copy-btn')",
+            "navigator.clipboard.writeText",
+            "document.execCommand('copy')",
+            "__copyBtnBusy",
+            "dataset.label",
+            "dataset.text",
+            "__secMentorCopyBtnWired",
+        ):
+            self.assertIn(marker, payload, f"missing marker: {marker!r}")
+
+    def test_second_call_is_noop(self) -> None:
+        # The module-level idempotency guard must short-circuit the
+        # second call. Without it, every Streamlit rerun would push a
+        # new iframe and (worse) re-execute the body in the parent
+        # window -- the body's own window guard catches it, but the
+        # duplicated wire bytes are still wasted bandwidth.
+        captured = self._capture()
+        self.assertEqual(len(captured), 1)
+        # Now capture again -- this time we expect zero calls because
+        # the guard flipped on the first capture.
+        second = []
+        from streamlit.testing.v1 import AppTest
+
+        at = AppTest.from_string("import streamlit as st\nst.write('')\n")
+        at.run()
+        with mock.patch(
+            "streamlit.components.v1.html",
+            side_effect=lambda html, **kw: second.append(html),
+        ):
+            self._module._emit_copy_button_init_script()
+        self.assertEqual(
+            len(second),
+            0,
+            "second call must be a no-op (module-level idempotency "
+            "guard) -- otherwise every Streamlit rerun would push a "
+            "duplicate iframe",
+        )
+
+
+class CopyButtonIframeHtmlTests(unittest.TestCase):
+    """Structural + safety tests for ``_copy_button_iframe_html``.
+
+    The helper builds a self-contained HTML document for a per-message
+    ``st.components.v1.html`` iframe. The iframe hosts the assistant
+    reply and a small "📋 Copy" button whose click handler runs inside
+    the iframe's own window. This avoids the cross-origin parent/iframe
+    dance that broke the previous delegated-listener design (where
+    ``parent.eval(...)`` was blocked by the same-origin policy in
+    Streamlit's component iframe).
+
+    We pin:
+
+      * the document is a valid HTML5 doctype,
+      * the payload is rendered inside a ``<pre>`` so newlines and
+        whitespace survive, and ``html.escape(quote=True)`` keeps any
+        markup in the reply from being interpreted as HTML,
+      * the click handler calls ``navigator.clipboard.writeText`` (the
+        modern API -- the iframe is same-origin to the Streamlit
+        server, so it counts as a secure context),
+      * a legacy ``document.execCommand('copy')`` fallback is included
+        for older browsers and sandboxes that gate ``navigator.clipboard``
+        behind a user gesture,
+      * the user gets visible feedback: the button label briefly
+        becomes "✓ Copied" (or "⚠ Press Ctrl+C" on total failure) and
+        then restores itself to the original label after a short delay,
+      * the inline ``</script>`` closer (if any) is rewritten to
+        ``<\\/script>`` on the wire so the HTML parser does not
+        terminate the wrapper script tag at the body's own closer.
+    """
+
+    def setUp(self) -> None:
+        from web import chat_helpers
+        self._module = chat_helpers
+
+    def _render(self, text: str) -> str:
+        return self._module._copy_button_iframe_html(text)
+
+    def test_returns_full_html_document(self) -> None:
+        html = self._render("hello")
+        self.assertTrue(html.lstrip().lower().startswith("<!doctype html>"),
+                        "iframe srcdoc must be a complete HTML document so "
+                        "the browser parses it as a real document (Streamlit "
+                        "sets it as the ``srcdoc`` attribute, not as a "
+                        "fragment)")
+        self.assertIn("<html", html.lower())
+        self.assertIn("<body", html.lower())
+
+    def test_renders_payload_on_data_text(self) -> None:
+        # The reply must NOT be rendered inside the iframe (the view
+        # already renders it via ``st.markdown(content)``; rendering it
+        # again would show the reply twice). Instead the payload lives
+        # on a ``data-text`` attribute on the button, HTML-escaped once.
+        html = self._render("line one\n  line two")
+        self.assertNotIn(
+            "<pre", html,
+            "iframe must NOT contain a <pre> -- the view already renders "
+            "the reply directly above the button; an extra <pre> would "
+            "duplicate the reply in the bubble",
+        )
+        self.assertIn(
+            "data-text=", html,
+            "payload must live on a data-text attribute on the button "
+            "(HTML-escaped) so the click handler can read it via "
+            "btn.dataset.text without crossing the iframe boundary",
+        )
+        # The payload is in the attribute, escaped. We check the
+        # ampersand escape because that is the simplest XSS guarantee.
+        amp_html = self._render("Tom & Jerry")
+        self.assertIn(
+            "Tom &amp; Jerry", amp_html,
+            "ampersands in the payload must be HTML-escaped inside the "
+            "data-text attribute so they survive the round-trip through "
+            "the browser's attribute decoder",
+        )
+        # Newlines survive too (the attribute value just contains a
+        # literal \n; html.escape leaves it alone).
+        nl_html = self._render("line one\nline two")
+        self.assertIn("line one\nline two", nl_html,
+                      "newlines in the payload must survive verbatim "
+                      "(html.escape does not touch whitespace)")
+
+    def test_renders_copy_button(self) -> None:
+        html = self._render("hello")
+        self.assertIn('id="copy-btn"', html,
+                      "iframe must contain exactly one copy button so the "
+                      "click handler can find it by id")
+        self.assertIn("type=\"button\"", html)
+
+    def test_includes_modern_clipboard_api(self) -> None:
+        html = self._render("hello")
+        self.assertIn("navigator.clipboard.writeText", html,
+                      "the click handler must use the modern clipboard API; "
+                      "the iframe is same-origin to the Streamlit server, "
+                      "so this counts as a secure context and the API is "
+                      "allowed")
+        self.assertIn("navigator.clipboard && navigator.clipboard.writeText",
+                      html,
+                      "must guard the modern API behind a feature check so "
+                      "the legacy fallback runs in older browsers")
+
+    def test_includes_legacy_fallback(self) -> None:
+        html = self._render("hello")
+        self.assertIn("document.execCommand('copy')", html,
+                      "must include the legacy execCommand fallback so the "
+                      "button still works inside sandboxes that gate the "
+                      "modern API behind a user gesture")
+
+    def test_uses_dataset_text_for_payload(self) -> None:
+        # The handler must read the payload from ``btn.dataset.text``,
+        # which the browser populates by decoding the ``data-text``
+        # attribute. The attribute is HTML-escaped once, so the JS side
+        # gets the original bytes back without any further unescaping.
+        html = self._render("hello")
+        self.assertIn(
+            "dataset.text", html,
+            "must read the payload from btn.dataset.text (the browser's "
+            "automatic decoding of the data-text attribute) -- this is "
+            "the only safe way to round-trip a user-supplied string "
+            "through an HTML attribute into JS without an XSS hole",
+        )
+
+    def test_shows_copied_feedback(self) -> None:
+        html = self._render("hello")
+        self.assertIn("Copied", html,
+                      "button must show a 'Copied' confirmation on "
+                      "success so the user knows the click registered")
+        # And a failure label for the no-clipboard case.
+        self.assertIn("Ctrl", html,
+                      "button must show a 'Press Ctrl+C' hint on total "
+                      "failure so the user has a manual path")
+
+    def test_restores_label_after_timeout(self) -> None:
+        html = self._render("hello")
+        self.assertIn("setTimeout", html,
+                      "handler must use setTimeout to restore the original "
+                      "label after the confirmation window")
+
+    def test_escapes_inline_closer(self) -> None:
+        # Wire-escape any literal ``</script>`` inside the body so the
+        # browser does not terminate the wrapper script tag at the
+        # body's own closer.
+        html = self._render("hello </script> world")
+        self.assertIn("<\\/script>", html,
+                      "any literal </script> in the body must be rewritten "
+                      "to <\\/script> on the wire so the browser's HTML "
+                      "parser does not terminate the wrapper script tag "
+                      "prematurely (the same wire-escape the delegated "
+                      "init script uses, one level down)")
+
+    def test_includes_dataset_label(self) -> None:
+        # The button's ``data-label`` carries the original label so the
+        # handler can restore it (mirror of the legacy behaviour).
+        html = self._render("hello")
+        self.assertIn('data-label=', html)
+
+
+class CopyButtonIframeRendererTests(unittest.TestCase):
+    """Wire-level tests for ``_render_copy_button_for_bubble``.
+
+    The renderer is the public entry point used by the Streamlit view:
+    it takes an assistant message, converts markdown to plain text,
+    builds the iframe srcdoc, and pushes it via
+    ``st.components.v1.html``. We pin:
+
+      * the renderer calls ``st.components.v1.html`` exactly once,
+      * the kwargs route it through the same iframe-component path
+        that ``_emit_copy_button_init_script`` uses (so the iframe
+        inherits Streamlit's secure-context permissions),
+      * the pushed HTML is the srcdoc from ``_copy_button_iframe_html``
+        with the assistant message converted to plain text (not the
+        raw markdown source -- otherwise the user pastes ``**bold**``
+        into their email and sees asterisks),
+      * the renderer returns ``None`` (it pushes to the page, like
+        ``st.markdown``).
+    """
+
+    def setUp(self) -> None:
+        from web import chat_helpers
+        self._module = chat_helpers
+
+    def _capture(self, content: str) -> list[dict]:
+        captured: list[dict] = []
+
+        def _recorder(html, **kwargs):
+            captured.append({"html": html, "kwargs": kwargs})
+
+        from streamlit.testing.v1 import AppTest
+
+        at = AppTest.from_string("import streamlit as st\nst.write('')\n")
+        at.run()
+        with mock.patch(
+            "streamlit.components.v1.html", side_effect=_recorder
+        ):
+            result = self._module._render_copy_button_for_bubble(content)
+        self.assertIsNone(
+            result,
+            "renderer must push the iframe to the page, not return HTML "
+            "to the caller (the caller must not st.markdown the result, "
+            "which would route it back through the sanitizer)",
+        )
+        return captured
+
+    def test_emits_via_components_html(self) -> None:
+        captured = self._capture("hello world")
+        self.assertEqual(
+            len(captured), 1,
+            "renderer must call st.components.v1.html exactly once per "
+            "assistant message -- multiple calls would stack duplicate "
+            "iframes per bubble",
+        )
+
+    def test_routes_through_iframe(self) -> None:
+        captured = self._capture("hello world")
+        kwargs = captured[0]["kwargs"]
+        self.assertEqual(kwargs.get("scrolling"), False,
+                         "must disable iframe scroll bars so the bubble "
+                         "sizes itself to its content")
+
+    def test_passes_plain_text_payload(self) -> None:
+        # Markdown source -> plain text. Without the conversion the user
+        # would paste ``**bold**`` into chat and see asterisks.
+        captured = self._capture("**bold** and _italic_ and `code`")
+        html = captured[0]["html"]
+        # Markdown markers stripped.
+        self.assertNotIn("**", html,
+                         "renderer must strip markdown emphasis markers "
+                         "from the payload (otherwise the user pastes "
+                         "** into their email)")
+        self.assertNotIn("`code`", html,
+                         "renderer must strip backticks from inline code")
+        # But the words survive.
+        self.assertIn("bold", html)
+        self.assertIn("italic", html)
+        self.assertIn("code", html)
+
+    def test_falls_back_to_raw_content(self) -> None:
+        # Edge case: plain-text conversion returns empty string for
+        # inputs like ``"\n"`` or only punctuation. The renderer must
+        # fall back to the raw content so the user can still copy
+        # something useful.
+        captured = self._capture("\n")
+        # If the fallback fired, the iframe contains the raw ``"\n"``
+        # (escaped to the HTML entity). It might also be the empty
+        # string, but it should not crash and must produce one iframe.
+        self.assertEqual(len(captured), 1)
+        self.assertIn("<pre", captured[0]["html"])
 
 
 if __name__ == "__main__":
