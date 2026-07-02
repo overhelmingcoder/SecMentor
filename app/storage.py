@@ -639,6 +639,7 @@ def load_messages(
     chat_id: str,
     *,
     path: Optional[Path] = None,
+    limit: Optional[int] = None,
 ) -> list[dict]:
     """Return all messages for a chat, ordered by ``ord`` ASC.
 
@@ -652,6 +653,10 @@ def load_messages(
         chat_id: The chat to load.
         path: Override the on-disk location. ``None`` uses
             :func:`db_path`.
+        limit: If set, return at most this many messages, keeping the
+            *most recent* ones (highest ``ord``). ``None`` (default)
+            returns every message. The sidebar uses this to bound
+            payload size when a chat has grown large.
 
     Returns:
         A **new** ``list`` of ``dict`` (one per message). Mutating
@@ -659,15 +664,27 @@ def load_messages(
         materialised from the rows so they are safe to mutate.
     """
     with _connect(path) as conn:
-        rows = conn.execute(
-            """
-            SELECT id, chat_id, role, content, created_at, ord
-            FROM messages
-            WHERE chat_id = ?
-            ORDER BY ord ASC
-            """,
-            (chat_id,),
-        ).fetchall()
+        sql = (
+            "SELECT id, chat_id, role, content, created_at, ord "
+            "FROM messages WHERE chat_id = ? ORDER BY ord ASC"
+        )
+        params: tuple = (chat_id,)
+        if limit is not None:
+            # Take the most-recent ``limit`` turns (highest ord) so a
+            # truncated list still reads naturally as the conversation
+            # tail. We do the trim in SQL via a subquery rather than
+            # fetching all and slicing in Python, so the cost stays
+            # bounded by ``limit`` regardless of chat length.
+            sql = (
+                "SELECT id, chat_id, role, content, created_at, ord "
+                "FROM ("
+                "  SELECT id, chat_id, role, content, created_at, ord "
+                "  FROM messages WHERE chat_id = ? "
+                "  ORDER BY ord DESC LIMIT ?"
+                ") ORDER BY ord ASC"
+            )
+            params = (chat_id, int(limit))
+        rows = conn.execute(sql, params).fetchall()
     out: list[dict] = []
     for r in rows:
         d = dict(r)
