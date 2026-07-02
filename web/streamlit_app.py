@@ -1581,6 +1581,108 @@ def _render_friendly_error(
         st.exception(exc)
 
 
+def _request_stop() -> bool:
+    """Render a small "Stop" button next to the in-flight bubble.
+
+    Returns ``True`` when the user has clicked it (and therefore wants
+    the current streaming turn to abort at the next chunk boundary),
+    ``False`` otherwise.
+
+    The button is wired via a session-state flag rather than a callback
+    so a Streamlit rerun can be triggered from the click *and* the
+    chunk-loop in :func:`_ask` can still observe the flag on its next
+    iteration. Without a session flag the loop would never know the
+    button was clicked because the click and the rerun it triggers both
+    happen between chunk iterations.
+
+    The key is namespaced (``chat_stop_button``) so a future second
+    stop button (e.g. for a sidebar action) cannot collide.
+    """
+    # Reset the flag at the *start* of a fresh turn so a stale click
+    # from a previous turn cannot cancel the new one. ``_ask`` writes
+    # ``_stop_requested`` back to ``False`` when a new turn begins.
+    if "stop_requested" not in st.session_state:
+        st.session_state["stop_requested"] = False
+    clicked = st.button(
+        "Stop",
+        key="chat_stop_button",
+        help="Cancel the current request at the next token boundary. "
+             "Anything the model has already streamed stays in the transcript.",
+        type="secondary",
+    )
+    if clicked:
+        st.session_state["stop_requested"] = True
+    return bool(st.session_state["stop_requested"])
+
+
+def _consume_stop_flag() -> bool:
+    """Read and clear the cooperative stop flag.
+
+    Used at the start of :func:`_ask` so a brand-new turn starts with a
+    clean slate (and so a user clicking Stop between turns does not
+    poison the next request).
+    """
+    flag = bool(st.session_state.pop("stop_requested", False))
+    # Always re-seed as False so subsequent reads inside the same
+    # session see the canonical default.
+    st.session_state["stop_requested"] = False
+    return flag
+
+
+def _render_chatbox_model_picker() -> None:
+    """Render the compact model picker that sits next to the chat input.
+
+    This is a *shortcut* to the same ``st.session_state["model"]`` that
+    the sidebar dropdown writes to — both pickers stay in sync because
+    they share the same backing key. The chatbox picker is the one the
+    user is most likely to reach for mid-conversation (see the Claude
+    UI reference) so it gets the full label set plus the live "vision"
+    badge; the sidebar picker keeps its advanced expander and pool-size
+    readout.
+    """
+    if not FREE_MODEL_CHOICES:
+        return
+    labels = [m["label"] for m in FREE_MODEL_CHOICES]
+    current = st.session_state.get("model") or (
+        FREE_MODEL_CHOICES[DEFAULT_SELECTED_MODEL_INDEX]["id"]
+    )
+    current_label = next(
+        (m["label"] for m in FREE_MODEL_CHOICES if m["id"] == current),
+        labels[DEFAULT_SELECTED_MODEL_INDEX],
+    )
+    chosen_label = st.selectbox(
+        "Model",
+        labels,
+        index=labels.index(current_label),
+        key="chatbox_model_picker",
+        label_visibility="collapsed",
+        help="Quick model switcher. The same selection is mirrored in "
+             "the sidebar picker — change it in either place.",
+    )
+    chosen_id = next(
+        m["id"] for m in FREE_MODEL_CHOICES if m["label"] == chosen_label
+    )
+    # Only write when the value actually changed so we do not trigger
+    # a useless rerun on every script re-execution.
+    if chosen_id != current:
+        st.session_state["model"] = chosen_id
+        # The cache key in _ask() includes the model id, so a swap
+        # means the next turn cannot accidentally hit a stale cached
+        # reply from the previous model. No explicit cache invalidation
+        # is needed — the key change is sufficient.
+    # Inline blurb so the user can confirm what they just picked
+    # without scrolling back up to the sidebar.
+    chosen = next(
+        m for m in FREE_MODEL_CHOICES if m["label"] == chosen_label
+    )
+    role_badge = f" · {chosen['role']}" if chosen.get("role") else ""
+    st.caption(
+        f"`{chosen['id']}`{role_badge} — {chosen['blurb']}",
+        help="Live preview. Switch back via the sidebar for the full "
+             "advanced expander.",
+    )
+
+
 _visible_messages = st.session_state["messages"][1:]  # skip the system prompt
 if not _visible_messages:
     # First-run / post-"New chat" experience. A single card with the
@@ -1755,6 +1857,13 @@ def _ask(prompt: str | dict[str, object] | None) -> None:
 
         st.session_state["pending_request"] = request
         st.session_state["pending_started_at"] = time.perf_counter()
+        # Reset the cooperative stop flag so a click from a previous
+        # turn does not abort the one we are about to dispatch. The
+        # widget itself is keyed and only visible while a request is
+        # in flight; flipping the flag to ``False`` here is purely a
+        # belt-and-braces guarantee against a stale click that landed
+        # in the same rerun cycle as the rerun above.
+        st.session_state["stop_requested"] = False
         st.rerun()
         return
 
@@ -1763,6 +1872,14 @@ def _ask(prompt: str | dict[str, object] | None) -> None:
     # again so the assistant bubble actually appears.
     request = st.session_state.pop("pending_request", None)
     started = st.session_state.pop("pending_started_at", time.perf_counter())
+    # Re-seed the stop flag to ``False`` at the *start* of every
+    # pass-2 turn. This is the canonical "fresh slate" — even if the
+    # flag was somehow left ``True`` by a buggy earlier session
+    # version (or by the user clicking Stop between pass 1 and pass
+    # 2, which can happen because the placeholders are visible
+    # during the rerun), this guarantees the new turn starts
+    # uninterruptible until the new placeholders render.
+    _consume_stop_flag()
     if not request:
         return  # defensive: nothing to do
     # Legacy fallback: a bare string might have been left in
@@ -1847,13 +1964,31 @@ def _ask(prompt: str | dict[str, object] | None) -> None:
     label_html = (
         '<div class="role-label">SecMentor</div>' if show_label else ""
     )
-    placeholder = st.empty()
-    placeholder.markdown(
-        f'<div class="row left">{label_html}'
-        f'<div class="bubble-thinking">'
-        f'<span class="pulse"></span>Thinking…</div></div>',
-        unsafe_allow_html=True,
-    )
+    # Co-locate the thinking bubble and the Stop button in the same
+    # Streamlit container so they render as one row. ``st.columns``
+    # is the supported way to do this: the bubble takes the wider
+    # fraction, the button takes a small narrow fraction on the right.
+    # The placeholder is inside the left column so the markdown
+    # rewrite loop (``placeholder.markdown(...)`` further down) keeps
+    # working without re-acquiring a widget handle.
+    _thinking_cols = st.columns([0.88, 0.12])
+    with _thinking_cols[0]:
+        placeholder = st.empty()
+        placeholder.markdown(
+            f'<div class="row left">{label_html}'
+            f'<div class="bubble-thinking">'
+            f'<span class="pulse"></span>Thinking…</div></div>',
+            unsafe_allow_html=True,
+        )
+    with _thinking_cols[1]:
+        # Render the Stop control. The click itself does not interrupt
+        # a blocking httpx call from outside the Python process — we
+        # can only observe the flag at the next chunk boundary — but
+        # the rerun it triggers frees the Streamlit script and lets
+        # the user send a different message or refresh state. The
+        # chunk loops below also check the flag directly so the visual
+        # placeholder updates on the next delta.
+        _user_stopped = _request_stop()
     # Browser-level toast in case the page itself is unresponsive (the
     # chat bubble above won't redraw until chat() returns, so the user
     # might think the app is frozen). Toast is non-blocking and appears
@@ -1951,6 +2086,19 @@ def _ask(prompt: str | dict[str, object] | None) -> None:
             )
             try:
                 for _chunk, _source in _chunk_iter:
+                    # Cooperative stop: check the flag on every chunk
+                    # so a user click between deltas aborts the turn
+                    # without waiting for the upstream to finish.
+                    # ``stop_requested`` is reset at the start of
+                    # every new turn by ``_consume_stop_flag``, so a
+                    # stale click from a previous turn cannot poison
+                    # this one.
+                    if st.session_state.get("stop_requested"):
+                        st.toast(
+                            "Stopped. Partial reply kept.",
+                            icon="⏹",
+                        )
+                        break
                     if _source == "degraded":
                         # The vision stream failed before yielding any
                         # delta; the helper is about to emit text chunks
@@ -1997,13 +2145,29 @@ def _ask(prompt: str | dict[str, object] | None) -> None:
             # router raises ``OpenRouterError`` *before* ``st.write_stream``
             # ever produces text, so the placeholder is still on screen
             # when the except block runs and ``reply`` stays "".
-            reply = st.write_stream(
-                router.stream_chat(
+            # ``st.write_stream`` consumes a generator and renders each
+            # yielded delta into a single auto-managed Streamlit
+            # container; it returns the concatenated string once the
+            # generator is exhausted. To let the user cancel a long
+            # run, we wrap the router generator in a thin
+            # stop-checking shim. The shim is intentionally tiny: a
+            # dict lookup on ``stop_requested`` per chunk is cheaper
+            # than the network round-trip it gates.
+            def _stream_with_stop() -> "Iterator[str]":
+                for delta in router.stream_chat(
                     messages_for_api,
                     temperature=temperature,
                     max_tokens=max_tokens,
-                )
-            )
+                ):
+                    if st.session_state.get("stop_requested"):
+                        st.toast(
+                            "Stopped. Partial reply kept.",
+                            icon="⏹",
+                        )
+                        return
+                    yield delta
+
+            reply = st.write_stream(_stream_with_stop())
             # Defensive: a streaming endpoint that *silently* returns an
             # empty string is a different failure mode from one that
             # raises (e.g. an upstream that signals "done" without ever
