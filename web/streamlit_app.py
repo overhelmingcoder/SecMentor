@@ -80,7 +80,9 @@ from web.chat_helpers import (
     _truncate_history,
     build_user_turn_content,
     build_user_turn_text,
+    consume_stop_flag,
     parse_recon_command,
+    resolve_chatbox_model_id,
     select_model_for_request,
     stream_vision_turn_with_fallback,
     vision_timeout_seconds,
@@ -354,17 +356,10 @@ _CUSTOM_CSS = """
     section[data-testid="stSidebar"] label,
     section[data-testid="stSidebar"] .stMarkdown small,
     section[data-testid="stSidebar"] .stCaption { color: #cbd5e1 !important; }
-    section[data-testid="stSidebar"] .stButton > button {
-        background: rgba(255,255,255,0.06);
-        color: #f1f5f9;
-        border: 1px solid rgba(255,255,255,0.12);
-        border-radius: var(--radius-sm);
-        font-weight: 500;
-    }
-    section[data-testid="stSidebar"] .stButton > button:hover {
-        background: rgba(255,255,255,0.1);
-        border-color: rgba(255,255,255,0.2);
-    }
+    /* The base sidebar button palette is overridden globally below
+       (see the dark-slate section). Keep this selector out so the
+       `.stButton > button` rules further down can paint every
+       sidebar button with the new dark surface. */
     section[data-testid="stSidebar"] .stDownloadButton > button {
         background: linear-gradient(135deg, #1d4ed8 0%, #1e40af 100%);
         color: #fff;
@@ -382,6 +377,190 @@ _CUSTOM_CSS = """
         justify-content: flex-start;
         font-size: 0.82rem;
         color: #cbd5e1;
+    }
+
+    /* ---------- Sidebar premium cards (new layout) ------------------- */
+    /* A soft, rounded card that groups a related set of widgets. Used
+       for the core-picks block, the recon help block, the chat-history
+       list, and the overview block. The card sits on top of the dark
+       sidebar gradient and gives the sidebar a layered, panel-based
+       look — closer to a productised desktop client than a long
+       flat form. */
+    .sm-card {
+        background: linear-gradient(180deg, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.02) 100%);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 12px;
+        padding: 0.85rem 0.9rem 0.95rem 0.9rem;
+        margin-bottom: 0.65rem;
+        box-shadow: 0 1px 0 rgba(0,0,0,0.25), 0 6px 18px rgba(0,0,0,0.18);
+    }
+    .sm-card .sm-card-title {
+        display: flex; align-items: center; gap: 0.45rem;
+        font-size: 0.72rem; font-weight: 700;
+        text-transform: uppercase; letter-spacing: 0.1em;
+        color: #93c5fd !important;
+        margin: 0 0 0.55rem 0;
+    }
+    .sm-card .sm-card-title .dot {
+        width: 6px; height: 6px; border-radius: 50%;
+        background: #38bdf8;
+        box-shadow: 0 0 8px rgba(56,189,248,0.6);
+    }
+    .sm-card .sm-card-sub {
+        font-size: 0.78rem; color: #94a3b8 !important;
+        margin: -0.25rem 0 0.6rem 0; line-height: 1.35;
+    }
+    /* Inline code chip — used to render the `/recon` syntax. */
+    .sm-inline-code {
+        background: rgba(56,189,248,0.12);
+        border: 1px solid rgba(56,189,248,0.28);
+        color: #7dd3fc !important;
+        padding: 0.1rem 0.35rem;
+        border-radius: 6px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 0.82rem;
+    }
+    /* Mini-pill list inside a card — used to enumerate recon
+       arguments and the example-prompt row. */
+    .sm-pill-list {
+        display: flex; flex-wrap: wrap; gap: 0.3rem;
+        margin: 0.2rem 0 0.55rem 0;
+    }
+    .sm-pill-list .sm-pill {
+        font-size: 0.72rem;
+        padding: 0.18rem 0.55rem;
+        border-radius: 999px;
+        background: rgba(255,255,255,0.06);
+        border: 1px solid rgba(255,255,255,0.10);
+        color: #cbd5e1 !important;
+    }
+    /* Compact chat-row styling for the in-card history list. */
+    .sm-chat-row {
+        display: flex; align-items: center; gap: 0.35rem;
+        padding: 0.18rem 0.4rem;
+        border-radius: 7px;
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(255,255,255,0.05);
+        margin-bottom: 0.22rem;
+        min-height: 1.6rem;
+    }
+    .sm-chat-row.is-active {
+        background: rgba(56,189,248,0.14);
+        border-color: rgba(56,189,248,0.45);
+        box-shadow: inset 0 0 0 1px rgba(56,189,248,0.15);
+    }
+    .sm-chat-row .sm-chat-title {
+        flex: 1; min-width: 0;
+        font-size: 0.80rem; color: #e2e8f0 !important;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        line-height: 1.05;
+    }
+    .sm-chat-row .sm-chat-meta {
+        font-size: 0.62rem; color: #94a3b8 !important;
+        text-transform: uppercase; letter-spacing: 0.04em;
+    }
+    /* Override Streamlit's default white button inside chat rows so the
+       rows render as slim, dark, in-card pills instead of pale slabs. */
+    section[data-testid="stSidebar"] .sm-chat-row .stButton > button,
+    section[data-testid="stSidebar"] .sm-chat-row button {
+        background: transparent !important;
+        background-color: transparent !important;
+        border: none !important;
+        box-shadow: none !important;
+        color: #e2e8f0 !important;
+        font-weight: 400 !important;
+        padding: 0.05rem 0.25rem !important;
+        min-height: 1.4rem !important;
+        line-height: 1.05 !important;
+        text-align: left !important;
+        justify-content: flex-start !important;
+    }
+    section[data-testid="stSidebar"] .sm-chat-row button:hover {
+        background: rgba(56,189,248,0.10) !important;
+        color: #f0f9ff !important;
+    }
+    section[data-testid="stSidebar"] .sm-chat-row button:focus {
+        background: rgba(56,189,248,0.18) !important;
+        color: #f0f9ff !important;
+        box-shadow: none !important;
+    }
+    section[data-testid="stSidebar"] .sm-chat-row .sm-chat-trash button {
+        color: #64748b !important;
+        padding: 0.05rem 0.35rem !important;
+    }
+    section[data-testid="stSidebar"] .sm-chat-row .sm-chat-trash button:hover {
+        color: #fca5a5 !important;
+        background: rgba(248,113,113,0.10) !important;
+    }
+    /* Active chat row: sky-tinted title text. */
+    .sm-chat-row.is-active .sm-chat-title { color: #bae6fd !important; }
+    /* Trim Streamlit's vertical padding inside cards so the sidebar
+       stays compact and the cards don't bleed into the next section. */
+    section[data-testid="stSidebar"] .sm-card .block-container { padding: 0; }
+    section[data-testid="stSidebar"] .sm-card .element-container { margin-bottom: 0.35rem; }
+    /* Hide the Streamlit expander label colour clash inside our cards. */
+    section[data-testid="stSidebar"] .sm-card details summary { color: #cbd5e1 !important; }
+    /* Recolor the in-card selectbox (recon scope picker) so it stops
+       looking like a pale slab against the dark card background. */
+    section[data-testid="stSidebar"] .sm-card [data-baseweb="select"] > div {
+        background: rgba(15,23,42,0.6) !important;
+        border-color: rgba(148,163,184,0.25) !important;
+        color: #e2e8f0 !important;
+    }
+    section[data-testid="stSidebar"] .sm-card [data-baseweb="select"] > div:hover {
+        border-color: rgba(56,189,248,0.45) !important;
+    }
+    section[data-testid="stSidebar"] .sm-card [data-baseweb="select"] svg {
+        color: #94a3b8 !important;
+    }
+
+    /* Override every sidebar button (regardless of which card it sits
+       in) with the dark slate surface. Streamlit renders each widget
+       as its own root under the sidebar column — the `.sm-card` div
+       is *not* an ancestor of `.stButton`, so the `.sm-card .stButton`
+       selector matches nothing. We therefore style every sidebar
+       button globally; the chat-row rules above still win inside
+       `.sm-chat-row` because their selector has higher specificity
+       (`.sm-card .sm-chat-row .stButton > button`). The dark surface
+       removes the pale "clears on hover" effect. */
+    section[data-testid="stSidebar"] .stButton > button,
+    section[data-testid="stSidebar"] [data-testid="stDownloadButton"] > button,
+    section[data-testid="stSidebar"] [data-testid="baseButton-secondary"] {
+        background-color: rgba(30,41,59,0.92) !important;
+        background: rgba(30,41,59,0.92) !important;
+        border: 1px solid rgba(148,163,184,0.40) !important;
+        color: #f8fafc !important;
+        font-weight: 600 !important;
+        -webkit-text-fill-color: #f8fafc !important;
+        transition: background-color 0.12s ease,
+                    border-color 0.12s ease, color 0.12s ease !important;
+    }
+    section[data-testid="stSidebar"] .stButton > button:hover,
+    section[data-testid="stSidebar"] [data-testid="stDownloadButton"] > button:hover,
+    section[data-testid="stSidebar"] [data-testid="baseButton-secondary"]:hover {
+        background-color: rgba(56,189,248,0.22) !important;
+        background: rgba(56,189,248,0.22) !important;
+        border-color: rgba(56,189,248,0.65) !important;
+        color: #ffffff !important;
+        -webkit-text-fill-color: #ffffff !important;
+    }
+    section[data-testid="stSidebar"] .stButton > button:focus,
+    section[data-testid="stSidebar"] [data-testid="stDownloadButton"] > button:focus,
+    section[data-testid="stSidebar"] [data-testid="baseButton-secondary"]:focus {
+        background-color: rgba(56,189,248,0.26) !important;
+        background: rgba(56,189,248,0.26) !important;
+        border-color: rgba(56,189,248,0.75) !important;
+        color: #ffffff !important;
+        -webkit-text-fill-color: #ffffff !important;
+        box-shadow: none !important;
+    }
+    section[data-testid="stSidebar"] .stButton > button:active,
+    section[data-testid="stSidebar"] [data-testid="stDownloadButton"] > button:active {
+        background-color: rgba(56,189,248,0.34) !important;
+        background: rgba(56,189,248,0.34) !important;
+        border-color: rgba(56,189,248,0.85) !important;
+        color: #ffffff !important;
+        -webkit-text-fill-color: #ffffff !important;
     }
 
     /* ---------- Hero (replaces the old h1+p block) ------------------- */
@@ -973,8 +1152,22 @@ _init_state()
 
 
 # --- Sidebar -----------------------------------------------------------------
+# All sidebar widgets live in ``_render_sidebar`` so main() stays linear and
+# the layout is easy to reason about. The new layout is card-based (CSS in
+# ``_CUSTOM_CSS``: .sm-card / .sm-card-title / .sm-pill / .sm-chat-row) and
+# orders sections by user value:
+#
+#   1. Brand block
+#   2. CORE PICKS  — Layout, Teaching mode, Model, Display, Advanced
+#   3. Try a question
+#   3. RECON HELP   (always visible — discoverable, not buried)
+#   4. CONVERSATION — New chat + Download transcript
+#   5. CHAT HISTORY (always open, no expander)
+#   7. OVERVIEW     — four-pillar summary and where-to-practice legally
+def _render_sidebar() -> None:
+    """Render the full sidebar — brand + cards + chat history + recon help."""
 
-with st.sidebar:
+    # --- Brand -----------------------------------------------------------------
     st.markdown(
         """
         <div class="sm-brand">
@@ -988,7 +1181,17 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
     st.caption("Cybersecurity learning & analysis")
-    st.divider()
+
+    # =========================================================================
+    # Card 1 — CORE PICKS: layout, teaching mode, model, display, advanced
+    # =========================================================================
+    st.markdown(
+        '<div class="sm-card">'
+        '<div class="sm-card-title"><span class="dot"></span>Core picks</div>'
+        '<div class="sm-card-sub">The three controls that change how the '
+        "chat feels and what it's allowed to teach.</div>",
+        unsafe_allow_html=True,
+    )
 
     # Layout mode toggle. Drives a class on <body> (`.layout-compact`,
     # `.layout-standard`, `.layout-wide`, `.layout-full`) so the CSS
@@ -998,7 +1201,6 @@ with st.sidebar:
     # client-side script that runs on every page load and applies the
     # class from `localStorage`. The script is idempotent: calling it
     # twice with the same value is a no-op.
-    st.markdown("### Layout mode")
     _LAYOUT_OPTIONS: list[str] = ["compact", "standard", "wide", "full"]
     _LAYOUT_LABELS: dict[str, str] = {
         "compact":  "Compact",
@@ -1013,8 +1215,13 @@ with st.sidebar:
         "full":     "Edge-to-edge · maximum density",
     }
     _previous_layout = st.session_state.get("layout_mode", "standard")
+    st.markdown(
+        '<div style="font-size:0.78rem;color:#94a3b8;margin:0.35rem 0 0.25rem 0;">'
+        "Layout density</div>",
+        unsafe_allow_html=True,
+    )
     _chosen_layout = st.radio(
-        "Density",
+        "Layout density",
         options=_LAYOUT_OPTIONS,
         format_func=lambda key: _LAYOUT_LABELS.get(key, key),
         index=_LAYOUT_OPTIONS.index(_previous_layout)
@@ -1045,49 +1252,16 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-    st.divider()
-
-    st.markdown("### Conversation")
-    if st.button("➕  New chat", use_container_width=True):
-        # Re-seed the system prompt from the current teaching mode so
-        # a "New chat" started in mentor mode keeps mentor scope (and
-        # vice versa). The helper fails closed to the defensive
-        # prompt on any unexpected state.
-        st.session_state["messages"] = [
-            {
-                "role": "system",
-                "content": _active_system_prompt(st.session_state),
-            }
-        ]
-        st.session_state["response_cache"] = {}
-        st.session_state["last_elapsed"] = None
-        st.rerun()
-
-    transcript = _serialize_for_download(
-        st.session_state["messages"], model=st.session_state["model"]
-    )
-    st.download_button(
-        "⬇️  Download transcript",
-        data=transcript,
-        file_name=f"secmentor-transcript-{int(time.time())}.txt",
-        mime="text/plain",
-        use_container_width=True,
-    )
-
-    st.divider()
-    st.markdown("### Teaching mode")
-    # The radio lets the user switch between the safer four-pillar
-    # defensive prompt (default) and the CTF/lab "SecMentor" prompt.
-    # When the choice changes, swap the system message in place so the
-    # next model call uses the new scope — no need to start a new
-    # chat. We compare against the current value explicitly so the
-    # rerun that Streamlit triggers after a widget change is the only
-    # one that actually mutates session_state (Streamlit's default
-    # already writes the new value to the key, so we just react to
-    # the delta and re-derive the system message).
-    # Order matters: the first entry is the radio's default when no
-    # previous-mode index can be derived, so "mentor" is listed first to
-    # make the wider, lab-scoped persona the visible default.
+    # Teaching mode radio. When the choice changes, swap the system
+    # message in place so the next model call uses the new scope —
+    # no need to start a new chat. Streamlit's default already writes
+    # the new value to ``st.session_state["teaching_mode"]`` before
+    # this body runs on the rerun-after-click, so we read the
+    # "previous" mirror key (updated *after* the swap block below)
+    # to detect a real change. For a fresh session we fall back to
+    # the live key — which is initialised to "mentor" by _init_state,
+    # matching the fallback string here so a brand-new session with
+    # no previous key is still self-consistent.
     _TEACHING_OPTIONS: list[str] = ["mentor", "defensive"]
     _TEACHING_LABELS: dict[str, str] = {
         "defensive": "🛡️  Defensive (4 pillars)",
@@ -1107,42 +1281,33 @@ with st.sidebar:
             "Decision 6 in docs/technical_write_up.md."
         ),
     }
-    # We track the *previous* teaching mode in a separate session_state key
-    # ("teaching_mode_previous") instead of reading the live "teaching_mode"
-    # key, because the radio widget with `key="teaching_mode"` writes the
-    # user's new selection into st.session_state["teaching_mode"] *before*
-    # this script body runs on the rerun-after-click. Reading the live key
-    # here would always see the new value, so `_chosen_mode != _previous_mode`
-    # would never be true and the swap block below would never fire.
-    # We only update "teaching_mode_previous" *after* the swap runs, so the
-    # comparison is stable across reruns. For a fresh session, fall back to
-    # the live key (which is initialized to "mentor" by _init_state — that
-    # is the web UI's default teaching mode). The fallback string here must
-    # match `_init_state`'s seed so a brand-new session with no previous
-    # key is still self-consistent and does not spuriously swap.
     _previous_mode = st.session_state.get(
         "teaching_mode_previous",
         st.session_state.get("teaching_mode", "mentor"),
     )
+    st.markdown(
+        '<div style="font-size:0.78rem;color:#94a3b8;margin:0.55rem 0 0.25rem 0;">'
+        "Teaching mode</div>",
+        unsafe_allow_html=True,
+    )
     _chosen_mode = st.radio(
-        "Scope",
+        "Teaching mode",
         options=_TEACHING_OPTIONS,
         format_func=lambda key: _TEACHING_LABELS.get(key, key),
         index=_TEACHING_OPTIONS.index(_previous_mode)
         if _previous_mode in _TEACHING_OPTIONS
         else 0,
         key="teaching_mode",
+        label_visibility="collapsed",
         help="Pick the scope for the next model call. "
              "Switching mid-chat swaps the system prompt in place.",
     )
     st.caption(_TEACHING_HELP.get(_chosen_mode, ""))
-    # If the radio produced a new value, swap the live system message
-    # so subsequent calls in this session use the new prompt. We do
-    # NOT clear the chat — only the system role at index 0 changes.
-    # We also drop the response cache because the *system prompt* is
-    # an implicit input to every reply and stale cache entries from
-    # the old scope would be confusing.
     if _chosen_mode != _previous_mode:
+        # We do NOT clear the chat — only the system role at index 0
+        # changes. We do drop the response cache because the *system
+        # prompt* is an implicit input to every reply and stale cache
+        # entries from the old scope would be confusing.
         st.session_state["messages"][0] = {
             "role": "system",
             "content": _active_system_prompt(st.session_state),
@@ -1155,21 +1320,13 @@ with st.sidebar:
             icon="🔁",
         )
 
-    st.divider()
-    st.markdown("### Model settings")
-    st.session_state["show_role_labels"] = st.checkbox(
-        "Show 'You' / 'SecMentor' labels",
-        value=bool(st.session_state["show_role_labels"]),
-        help="Adds a small label above each bubble so the question and "
-             "answer are clearly separated.",
-    )
-    st.session_state["concise"] = st.checkbox(
-        "Concise mode",
-        value=bool(st.session_state["concise"]),
-        help="Ask the model for short answers. Significantly faster on free-tier models.",
-    )
     # Model selector. Curated free-tier list is the easy default;
-    # the expander below is for users who want a different id.
+    # the advanced expander is for users who want a different id.
+    st.markdown(
+        '<div style="font-size:0.78rem;color:#94a3b8;margin:0.55rem 0 0.25rem 0;">'
+        "Model</div>",
+        unsafe_allow_html=True,
+    )
     if FREE_MODEL_CHOICES:
         _labels = [m["label"] for m in FREE_MODEL_CHOICES]
         _current = st.session_state["model"]
@@ -1181,6 +1338,7 @@ with st.sidebar:
             "Model",
             _labels,
             index=_labels.index(_current_label),
+            label_visibility="collapsed",
             help="Free OpenRouter models. The engine response cache keys "
                  "on the model id, so switching gives you a clean cache miss.",
         )
@@ -1212,7 +1370,30 @@ with st.sidebar:
             # a one-liner in the sidebar so the misconfig is visible
             # before they type a message.
             st.caption(f"⚠️ Router misconfigured: {_router_cfg_err}")
-        with st.expander("Advanced: custom model ID", expanded=False):
+    else:
+        # Curated list is empty (shouldn't happen, but be defensive).
+        st.session_state["model"] = st.text_input(
+            "OpenRouter model",
+            value=st.session_state["model"],
+            help="Any OpenRouter model ID. Free models end with :free.",
+        )
+
+    # Display toggles.
+    st.session_state["show_role_labels"] = st.checkbox(
+        "Show 'You' / 'SecMentor' labels",
+        value=bool(st.session_state["show_role_labels"]),
+        help="Adds a small label above each bubble so the question and "
+             "answer are clearly separated.",
+    )
+    st.session_state["concise"] = st.checkbox(
+        "Concise mode",
+        value=bool(st.session_state["concise"]),
+        help="Ask the model for short answers. Significantly faster on free-tier models.",
+    )
+
+    # Advanced expander — custom model id + the three sliders.
+    with st.expander("Advanced model & limits", expanded=False):
+        if FREE_MODEL_CHOICES:
             _custom = st.text_input(
                 "Custom OpenRouter model",
                 value="",
@@ -1223,38 +1404,31 @@ with st.sidebar:
             ).strip()
             if _custom:
                 st.session_state["model"] = _custom
-    else:
-        # Curated list is empty (shouldn't happen, but be defensive).
-        st.session_state["model"] = st.text_input(
-            "OpenRouter model",
-            value=st.session_state["model"],
-            help="Any OpenRouter model ID. Free models end with :free.",
+        st.session_state["temperature"] = st.slider(
+            "Temperature",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(st.session_state["temperature"]),
+            step=0.05,
+            help="0.0 = focused, 1.0 = creative. ~0.3 for security Q&A.",
         )
-    st.session_state["temperature"] = st.slider(
-        "Temperature",
-        min_value=0.0,
-        max_value=1.0,
-        value=float(st.session_state["temperature"]),
-        step=0.05,
-        help="0.0 = focused, 1.0 = creative. ~0.3 for security Q&A.",
-    )
-    st.session_state["max_tokens"] = st.slider(
-        "Max tokens",
-        min_value=128,
-        max_value=2048,
-        value=int(st.session_state["max_tokens"]),
-        step=64,
-        help="Cap on the assistant reply length. Lower = faster.",
-    )
-    st.session_state["max_history"] = st.slider(
-        "Max history turns",
-        min_value=4,
-        max_value=40,
-        value=int(st.session_state["max_history"]),
-        step=2,
-        help="Older turns are dropped. System prompt is always kept. "
-             "Lower = faster first-token time on free-tier models.",
-    )
+        st.session_state["max_tokens"] = st.slider(
+            "Max tokens",
+            min_value=128,
+            max_value=2048,
+            value=int(st.session_state["max_tokens"]),
+            step=64,
+            help="Cap on the assistant reply length. Lower = faster.",
+        )
+        st.session_state["max_history"] = st.slider(
+            "Max history turns",
+            min_value=4,
+            max_value=40,
+            value=int(st.session_state["max_history"]),
+            step=2,
+            help="Older turns are dropped. System prompt is always kept. "
+                 "Lower = faster first-token time on free-tier models.",
+        )
 
     # Apply the cap now (cheap; runs on every rerun).
     st.session_state["messages"] = _truncate_history(
@@ -1262,60 +1436,66 @@ with st.sidebar:
         max_messages=st.session_state["max_history"],
     )
 
-    st.divider()
-    st.markdown("### Try a question")
+    st.markdown("</div>", unsafe_allow_html=True)  # close CORE PICKS card
+
+    # =========================================================================
+    # Card 2 — TRY A QUESTION
+    # =========================================================================
+    st.markdown(
+        '<div class="sm-card">'
+        '<div class="sm-card-title"><span class="dot"></span>Try a question</div>'
+        '<div class="sm-card-sub">One-click prompts to see how the persona '
+        "responds.</div>",
+        unsafe_allow_html=True,
+    )
     for prompt in EXAMPLE_PROMPTS:
         if st.button(prompt, key=f"ex_{prompt[:24]}", use_container_width=True):
             st.session_state["pending_prompt"] = prompt
             st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)  # close Try a question card
+    st.markdown("</div>", unsafe_allow_html=True)  # close Try a question card
 
-    st.divider()
-    with st.expander("ℹ️  About / scope", expanded=False):
-        st.markdown(
-            """
-**Four pillars** this assistant is engineered to teach:
-- 🛡️ **Defensive security** — threat modeling, IR, hardening, IAM, network.
-- 🔁 **DevSecOps** — secure SDLC, SAST/DAST, supply chain, secrets, K8s.
-- 🧠 **AI / ML security** — prompt injection, OWASP LLM Top 10, agent safety.
-- 🎯 **Offensive-security education** — *concept-level*: structure of an attack,
-  why it works, what defeats it. Not turn-key exploits.
-
-**Teaching mode** (sidebar above) lets you swap the system prompt mid-session:
-- *Defensive (4 pillars)* — default. Concept-level only.
-- *CTF / Lab mentor* — unlocks lab scope (HTB, THM, PortSwigger, DVWA, WebGoat).
-  May produce runnable exploit snippets framed for the lab, always paired
-  with the defensive countermeasure. See `docs/technical_write_up.md` Decision 6.
-
-**Out of scope (both modes):** working exploit code against a specific real
-system, malware, droppers, C2, payloads against specific real WAFs/EDRs/MFAs,
-brand-new malware strains, critical-infrastructure targets.
-
-|**Where to practice legally:** HackTheBox, TryHackMe, PortSwigger Academy,
-DVWA, WebGoat, PicoCTF.
-            """,
-            unsafe_allow_html=True,
-        )
-
-# --- Sidebar (continued): recon scope token + chat history widget --------
-# Streamlit lets you open the sidebar more than once; subsequent blocks
-# just append to the same column. Keeping these two widgets in their own
-# block (rather than at the bottom of the original 887-1208 one) keeps
-# the diff focused and makes it easy to move them later.
-
-# (1) Recon scope-token override. The operator can pin a non-default
-#     scope (engagement / ctf / labs / redteam / personal-lab /
-#     bugbounty) for the rest of the session. We render a one-line
-#     warning so a misconfigured value cannot accidentally be used
-#     against a real public-internet target.
-with st.sidebar:
-    st.divider()
-    with st.expander("🔍 Recon scope", expanded=False):
-        st.caption(
-            "Optional override for `/recon` scope. The orchestrator's "
-            "**safety layer** refuses targets outside the chosen scope; "
-            "production targets need `engagement` and explicit written "
-            "authorisation."
-        )
+    # =========================================================================
+    # Card 3 — RECON QUICK START (always visible, slim)
+    # =========================================================================
+    # `/recon <target> [scope=<token>]` is one of the platform's flagship
+    # features but it is only useful if the user knows it exists. This card
+    # sits right above the conversation controls so the slash command is
+    # discoverable without scrolling.
+    st.markdown(
+        '<div class="sm-card">'
+        '<div class="sm-card-title"><span class="dot"></span>Recon quick start</div>'
+        '<div class="sm-card-sub">Type a target with <span class="sm-inline-code">/recon</span>'
+        " to get a multi-tool passive report. Always stay inside the chosen scope.</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        """
+        <div class="sm-pill-list">
+          <span class="sm-pill">/recon example.com</span>
+          <span class="sm-pill">scope=engagement</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Valid scope tokens: engagement · ctf · labs · redteam · "
+        "personal-lab · bugbounty."
+    )
+    _recon_row = st.columns([3, 2])
+    with _recon_row[0]:
+        if st.button(
+            "▶ Try /recon now",
+            key="_recon_quickstart_btn",
+            use_container_width=True,
+            help="Inserts `/recon example.com scope=engagement` into "
+                 "the chat box and reruns the page.",
+        ):
+            st.session_state["pending_prompt"] = (
+                "/recon example.com scope=engagement"
+            )
+            st.rerun()
+    with _recon_row[1]:
         _scope_options = [
             "(use default)",
             "engagement", "ctf", "labs", "redteam",
@@ -1331,104 +1511,140 @@ with st.sidebar:
         except ValueError:
             _scope_index = 0
         _picked = st.selectbox(
-            "Scope token",
+            "Scope",
             options=_scope_options,
             index=_scope_index,
             key="_recon_scope_picker",
-            help=(
-                "Sets the scope used by every `/recon <target>` turn "
-                "in this session. Defaults to the orchestrator's "
-                "DEFAULT_RECON_SCOPE_TOKEN."
-            ),
+            label_visibility="collapsed",
+            help="Sets the scope used by every `/recon <target>` turn.",
         )
-        # Mirror to session_state so ``_handle_recon_command`` can pick
-        # it up. ``None`` = "let the orchestrator decide".
         st.session_state["recon_scope_token"] = (
             None if _picked == "(use default)" else _picked
         )
+    st.markdown("</div>", unsafe_allow_html=True)  # close Recon quick start card
 
-# (2) Chat history widget. Lists recent chats (cached in
-#     ``st.session_state["chats"]``), lets the user switch between them,
-#     soft-delete the unwanted ones, or start a new chat. The DB schema
-#     (``chats`` + ``messages``) is the source of truth; the sidebar
-#     cache is rebuilt on demand so multi-tab behaviour stays sane.
-with st.sidebar:
-    st.divider()
-    with st.expander("💬 Chat history", expanded=False):
-        # Surface the one-time DB-init warning if storage init failed
-        # earlier in ``_init_state``. We do not re-attempt init here:
-        # a flaky DB stays flaky, and retrying would mask the cause.
-        _init_warn = st.session_state.get("db_init_warning")
-        if _init_warn:
-            st.warning(_init_warn, icon="⚠️")
-        elif not st.session_state.get("db_initialised", False):
-            st.warning(
-                "Chat history is not initialised this session.",
-                icon="⚠️",
-            )
+    # =========================================================================
+    # Card 4 — CONVERSATION (New chat + Download transcript)
+    # Moved above CHAT HISTORY so the duplicate "+ New chat" button can
+    # be dropped from the chat card. The chat card now only lists past
+    # sessions; starting a fresh one is a single click here.
+    # =========================================================================
+    st.markdown(
+        '<div class="sm-card">'
+        '<div class="sm-card-title"><span class="dot"></span>Conversation</div>'
+        '<div class="sm-card-sub">Reset the chat or export the current '
+        "transcript.</div>",
+        unsafe_allow_html=True,
+    )
+    if st.button("➕  New chat", key="_conv_new", use_container_width=True):
+        # Re-seed the system prompt from the current teaching mode so
+        # a "New chat" started in mentor mode keeps mentor scope (and
+        # vice versa). The helper fails closed to the defensive
+        # prompt on any unexpected state.
+        st.session_state["messages"] = [
+            {
+                "role": "system",
+                "content": _active_system_prompt(st.session_state),
+            }
+        ]
+        st.session_state["response_cache"] = {}
+        st.session_state["last_elapsed"] = None
+        st.rerun()
+    _transcript = _serialize_for_download(
+        st.session_state["messages"], model=st.session_state["model"]
+    )
+    st.download_button(
+        "⬇️  Download transcript",
+        data=_transcript,
+        file_name=f"secmentor-transcript-{int(time.time())}.txt",
+        mime="text/plain",
+        use_container_width=True,
+    )
+    st.markdown("</div>", unsafe_allow_html=True)  # close Conversation card
 
-        # Refresh + New chat — wired through module-level helpers so
-        # Streamlit's ``on_click`` can resolve them by name (PR-C spec).
-        _col_a, _col_b = st.columns([1, 1])
-        with _col_a:
-            if st.button(
-                "↻ Refresh",
-                key="_chats_refresh",
-                use_container_width=True,
-            ):
-                try:
-                    st.session_state["chats"] = _list_chats(limit=20)
-                except Exception as exc:  # noqa: BLE001
-                    st.error(f"Could not list chats: {exc}")
-                    st.session_state["chats"] = []
-        with _col_b:
-            # ``_new_chat`` is the canonical helper from PR-C: it clears
-            # the active chat id, invalidates the cache, and lets the
-            # next user message create a fresh ``chats`` row.
-            st.button(
-                "➕  New chat",
-                key="_chats_new",
-                use_container_width=True,
-                on_click=_new_chat,
-            )
+    # =========================================================================
+    # Card 5 — CHAT HISTORY (compact: 3 rows visible, no inner New chat)
+    # =========================================================================
+    st.markdown(
+        '<div class="sm-card">'
+        '<div class="sm-card-title"><span class="dot"></span>Chat history</div>'
+        '<div class="sm-card-sub">Stored locally · soft-delete keeps them '
+        "recoverable.</div>",
+        unsafe_allow_html=True,
+    )
+    # Surface the one-time DB-init warning if storage init failed earlier
+    # in ``_init_state``. We do not re-attempt init here: a flaky DB
+    # stays flaky, and retrying would mask the cause.
+    _init_warn = st.session_state.get("db_init_warning")
+    if _init_warn:
+        st.warning(_init_warn, icon="⚠️")
+    elif not st.session_state.get("db_initialised", False):
+        st.warning(
+            "Chat history is not initialised this session.",
+            icon="⚠️",
+        )
 
-        # Lazy-load the list on first render so users without DB still
-        # see a usable sidebar (just an empty list).
-        if not st.session_state["chats"] and st.session_state.get(
-            "db_initialised", False
-        ):
-            try:
-                st.session_state["chats"] = _list_chats(limit=20)
-            except Exception as exc:  # noqa: BLE001
-                st.error(f"Could not list chats: {exc}")
-                st.session_state["chats"] = []
+    # Lazy-load the list on first render so users without DB still see
+    # a usable sidebar (just an empty list).
+    if not st.session_state["chats"] and st.session_state.get(
+        "db_initialised", False
+    ):
+        try:
+            st.session_state["chats"] = _list_chats(limit=20)
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Could not list chats: {exc}")
+            st.session_state["chats"] = []
 
-        for _chat in st.session_state["chats"]:
+    _chat_list = st.session_state.get("chats") or []
+    if not _chat_list:
+        st.caption("No saved chats yet — start a conversation to see it here.")
+    else:
+        # Compact: one slim pill per row. The whole row is clickable
+        # (Open) and a tiny trash icon on the right soft-deletes.
+        # Cap to 8 always-visible rows so the card stays small; older
+        # rows live behind a single "Show all" expander.
+        _MAX_VISIBLE = 3
+        _visible = _chat_list[:_MAX_VISIBLE]
+        _overflow = _chat_list[_MAX_VISIBLE:]
+
+        def _render_chat_row(_chat: dict) -> None:
+            """Render one chat row as a single slim pill (Open + 🗑)."""
             _cid = _chat.get("id")
             _title = _chat.get("title") or "(untitled)"
             _updated = _chat.get("updated_at") or ""
-            # Truncate title to keep the row readable.
             _title_display = (
-                _title if len(_title) <= 48 else _title[:45] + "..."
+                _title if len(_title) <= 30 else _title[:27] + "…"
             )
             _is_active = _cid == st.session_state.get("active_chat_id")
-            _label_prefix = "🟢 " if _is_active else "   "
-            _row = st.columns([5, 1])
-            with _row[0]:
-                # ``_open_chat`` re-binds ``messages`` from the DB and
-                # sets ``active_chat_id``. ``st.button`` runs the
-                # callback before the rerun, so no extra rerun call.
+            _row_cls = "sm-chat-row is-active" if _is_active else "sm-chat-row"
+            _meta = (
+                _format_chat_timestamp(_updated) if _updated else "—"
+            )
+            # One row: dot + title (Open button, takes the full width
+            # via use_container_width=False so it inherits the pill
+            # surface) + tiny trash button on the right.
+            _row_cols = st.columns([11, 1], gap="small")
+            with _row_cols[0]:
+                st.markdown(
+                    f'<div class="{_row_cls}">'
+                    + ("●" if _is_active else "·")
+                    + f'<span class="sm-chat-title">{_title_display}</span>'
+                    f'<span class="sm-chat-meta">{_meta}</span>'
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
                 st.button(
-                    f"{_label_prefix}{_title_display}",
+                    "Open",
                     key=f"_open_chat_{_cid}",
-                    use_container_width=True,
-                    help=_format_chat_timestamp(_updated)
-                    if _updated
-                    else "Open this chat",
+                    help=(_meta if _updated else "Open this chat"),
                     on_click=_open_chat,
                     args=(_cid,),
                 )
-            with _row[1]:
+            with _row_cols[1]:
+                st.markdown(
+                    '<div class="sm-chat-trash">',
+                    unsafe_allow_html=True,
+                )
                 st.button(
                     "🗑",
                     key=f"_del_chat_{_cid}",
@@ -1436,6 +1652,63 @@ with st.sidebar:
                     on_click=_soft_delete_chat,
                     args=(_cid,),
                 )
+                st.markdown("</div>", unsafe_allow_html=True)
+
+        for _chat in _visible:
+            _render_chat_row(_chat)
+
+        if _overflow:
+            with st.expander(
+                f"Show all ({len(_chat_list)} total)", expanded=False
+            ):
+                for _chat in _overflow:
+                    _render_chat_row(_chat)
+    st.markdown("</div>", unsafe_allow_html=True)  # close Chat history card
+
+    # =========================================================================
+    # Card 6 — OVERVIEW (four pillars + where-to-practice, moved to bottom)
+    # =========================================================================
+    st.markdown(
+        '<div class="sm-card">'
+        '<div class="sm-card-title"><span class="dot"></span>Overview</div>'
+        '<div class="sm-card-sub">Four pillars and the legal practice '
+        "playgrounds.</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        """
+**Four pillars** this assistant is engineered to teach:
+- 🛡️ **Defensive security** — threat modeling, IR, hardening, IAM, network.
+- 🔁 **DevSecOps** — secure SDLC, SAST/DAST, supply chain, secrets, K8s.
+- 🧠 **AI / ML security** — prompt injection, OWASP LLM Top 10, agent safety.
+- 🎯 **Offensive-security education** — *concept-level*: structure of an attack,
+  why it works, what defeats it. Not turn-key exploits.
+
+**Teaching mode** (Core picks) lets you swap the system prompt mid-session:
+- *Defensive (4 pillars)* — default. Concept-level only.
+- *CTF / Lab mentor* — unlocks lab scope (HTB, THM, PortSwigger, DVWA, WebGoat).
+  May produce runnable exploit snippets framed for the lab, always paired
+  with the defensive countermeasure. See `docs/technical_write_up.md` Decision 6.
+
+**Out of scope (both modes):** working exploit code against a specific real
+system, malware, droppers, C2, payloads against specific real WAFs/EDRs/MFAs,
+brand-new malware strains, critical-infrastructure targets.
+
+**Where to practice legally:** HackTheBox, TryHackMe, PortSwigger Academy,
+DVWA, WebGoat, PicoCTF.
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown("</div>", unsafe_allow_html=True)  # close Overview card
+
+
+# Single call-site — opens the sidebar exactly once, then delegates the
+# whole card-based layout to ``_render_sidebar``. Streamlit lets you
+# open the sidebar more than once; we keep this single call so the
+# order of cards is fixed and easy to reason about.
+with st.sidebar:
+    _render_sidebar()
+
 
 # --- Header ------------------------------------------------------------------
 
@@ -1620,25 +1893,31 @@ def _consume_stop_flag() -> bool:
 
     Used at the start of :func:`_ask` so a brand-new turn starts with a
     clean slate (and so a user clicking Stop between turns does not
-    poison the next request).
+    poison the next request). The pure read/clear logic lives in
+    :func:`web.chat_helpers.consume_stop_flag` so it is unit-testable
+    without booting Streamlit.
     """
-    flag = bool(st.session_state.pop("stop_requested", False))
-    # Always re-seed as False so subsequent reads inside the same
-    # session see the canonical default.
-    st.session_state["stop_requested"] = False
-    return flag
+    return consume_stop_flag(st.session_state)
 
 
 def _render_chatbox_model_picker() -> None:
-    """Render the compact model picker that sits next to the chat input.
+    """Render a compact model chip above the chat input.
 
-    This is a *shortcut* to the same ``st.session_state["model"]`` that
-    the sidebar dropdown writes to — both pickers stay in sync because
-    they share the same backing key. The chatbox picker is the one the
-    user is most likely to reach for mid-conversation (see the Claude
-    UI reference) so it gets the full label set plus the live "vision"
-    badge; the sidebar picker keeps its advanced expander and pool-size
-    readout.
+    The chip is a single button-shaped pill on the left side of the
+    chat composer (mirroring the Claude UI's "Sonnet 5 ▾" placement).
+    Tapping it opens a popover that lists every entry in
+    :data:`FREE_MODEL_CHOICES`; picking one updates
+    ``session_state["model"]`` so the sidebar dropdown stays in sync.
+
+    The chip label shows *only* the chosen model name — no role badge,
+    no blurb, no complexity knob. Keeping the surface minimal matches
+    the user's request for a plain "tap → list → pick" switch.
+
+    The pure label→id resolution and the "did the value actually
+    change?" check live in
+    :func:`web.chat_helpers.resolve_chatbox_model_id` so the contract
+    is pinned by a unit test without booting Streamlit. The helper
+    is a no-op when :data:`FREE_MODEL_CHOICES` is empty.
     """
     if not FREE_MODEL_CHOICES:
         return
@@ -1646,41 +1925,58 @@ def _render_chatbox_model_picker() -> None:
     current = st.session_state.get("model") or (
         FREE_MODEL_CHOICES[DEFAULT_SELECTED_MODEL_INDEX]["id"]
     )
-    current_label = next(
-        (m["label"] for m in FREE_MODEL_CHOICES if m["id"] == current),
-        labels[DEFAULT_SELECTED_MODEL_INDEX],
+    current_row = next(
+        (m for m in FREE_MODEL_CHOICES if m["id"] == current),
+        FREE_MODEL_CHOICES[DEFAULT_SELECTED_MODEL_INDEX],
     )
-    chosen_label = st.selectbox(
-        "Model",
-        labels,
-        index=labels.index(current_label),
-        key="chatbox_model_picker",
-        label_visibility="collapsed",
-        help="Quick model switcher. The same selection is mirrored in "
-             "the sidebar picker — change it in either place.",
+    current_label = current_row["label"]
+
+    # --- Chip column ------------------------------------------------------
+    # A single popover button. The face label shows *only* the model
+    # name (no "· Balanced", no role, no complexity tier). A chevron
+    # is appended so the affordance reads as "tap to expand".
+    with st.popover(
+        f"{current_label}  ▾",
+        use_container_width=False,
+    ):
+        # Plain radio-style picker inside the popover: a vertical list
+        # of every curated model name. No descriptors, no captions,
+        # no role/balanced/complexity options — exactly what the user
+        # asked for.
+        chosen_label = st.radio(
+            "Available models",
+            options=labels,
+            index=labels.index(current_label),
+            key="chatbox_model_picker",
+            label_visibility="collapsed",
+        )
+
+    # --- Pure label→id resolution ----------------------------------------
+    # The picker is a no-op when the chosen label matches the current
+    # one, so a popover-open/close cycle does not needlessly invalidate
+    # the ``_ask`` cache key. The fallback to ``current`` keeps the
+    # helper safe against a curated list that has drifted.
+    chosen_id, changed = resolve_chatbox_model_id(
+        FREE_MODEL_CHOICES,
+        chosen_label=st.session_state.get(
+            "chatbox_model_picker", current_label
+        ),
+        current_id=current,
     )
-    chosen_id = next(
-        m["id"] for m in FREE_MODEL_CHOICES if m["label"] == chosen_label
-    )
-    # Only write when the value actually changed so we do not trigger
-    # a useless rerun on every script re-execution.
-    if chosen_id != current:
+    if changed:
         st.session_state["model"] = chosen_id
-        # The cache key in _ask() includes the model id, so a swap
+        # The cache key in ``_ask()`` includes the model id, so a swap
         # means the next turn cannot accidentally hit a stale cached
         # reply from the previous model. No explicit cache invalidation
         # is needed — the key change is sufficient.
-    # Inline blurb so the user can confirm what they just picked
-    # without scrolling back up to the sidebar.
-    chosen = next(
-        m for m in FREE_MODEL_CHOICES if m["label"] == chosen_label
-    )
-    role_badge = f" · {chosen['role']}" if chosen.get("role") else ""
-    st.caption(
-        f"`{chosen['id']}`{role_badge} — {chosen['blurb']}",
-        help="Live preview. Switch back via the sidebar for the full "
-             "advanced expander.",
-    )
+
+
+# The helpers above are intentionally kept in the view module so the
+# Streamlit decorators (``@st.cache_resource``) and the constant
+# ``FREE_MODEL_CHOICES`` are in scope. The pure-logic parts of the
+# cooperative-stop contract are re-exported to ``web.chat_helpers`` for
+# unit-testing without booting the whole UI module — see the matching
+# ``_stop_flag_logic`` shim there.
 
 
 _visible_messages = st.session_state["messages"][1:]  # skip the system prompt
@@ -2066,9 +2362,12 @@ def _ask(prompt: str | dict[str, object] | None) -> None:
             # reuses the same slot health state the text path uses; the
             # ``model=`` pin keeps it on the vision slot for the first
             # attempt and on the text slot for the degrade. ``timeout``
-            # comes from ``vision_timeout_seconds()`` (currently 90s,
-            # capped at 120s) because the vision model needs more
-            # head-room than the 60s default.
+            # comes from ``vision_timeout_seconds()`` (currently 45s;
+            # the degrade path absorbs anything longer). The shrink
+            # matters because a stuck vision slot used to burn the full
+            # 90s before the user saw any text — now the text fallback
+            # kicks in within ~45s of the click, which is the threshold
+            # at which users start to perceive a stall.
             _vision_degraded = False
             _vision_buffer = ""
             _chunk_iter = stream_vision_turn_with_fallback(
@@ -2618,6 +2917,29 @@ _ACCEPTED_FILE_TYPES: list[str] = [
     # PDFs — text is extracted page-by-page and inlined as text.
     "pdf",
 ]
+# --- Claude-style chatbox row ---------------------------------------------
+# Render the compact model chip directly above the chat input, hugging
+# the left edge the same way Claude's "Sonnet 5 ▾" pill hugs the input
+# row. The chip is a popover that opens the full model picker so the
+# user can swap models without scrolling back up to the sidebar. Both
+# the popover and the sidebar dropdown write to
+# ``st.session_state["model"]`` so they stay in lock-step.
+#
+# Layout (no second column — a stranded right-side hint just left a
+# gap in the screenshot):
+#
+#   ┌─────────────────────────┐
+#   │ Gemma 4 31B (default) ▾ │   <- chip, popover opens picker
+#   └─────────────────────────┘
+#   ┌─────────────────────────┐
+#   │ Ask a cybersecurity …   │   <- chat input (full width)
+#   └─────────────────────────┘
+#
+# The chip's button uses ``use_container_width=False`` so it sizes to
+# its content; placing it at the top of a single-column container
+# leaves its right edge anchored to the chat input's left edge below.
+_render_chatbox_model_picker()
+
 user_chat = st.chat_input(
     "Ask a cybersecurity question… (attach files with the 📎 button)",
     accept_file="multiple",

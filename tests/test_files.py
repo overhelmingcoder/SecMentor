@@ -36,6 +36,8 @@ from unittest.mock import patch
 
 import pytest
 
+from web.chat_helpers import consume_stop_flag, resolve_chatbox_model_id
+
 pytestmark = pytest.mark.smoke
 
 # --- Path bootstrap ----------------------------------------------------------
@@ -1202,6 +1204,194 @@ class StreamVisionTurnWithFallbackTests(unittest.TestCase):
             ("text-from-fallback", "text"),
         ])
         self.assertEqual(len(router.calls), 2)
+
+
+# --- Cooperative stop + chatbox picker ----------------------------------------
+# Lightweight unit tests for the pure helpers added in the
+# "Stop button + chatbox model picker" pass. The widget-rendering
+# code (which calls ``st.button`` / ``st.selectbox``) lives in
+# ``web/streamlit_app.py`` because it needs the live Streamlit
+# context; the pure read/clear + label→id logic lives in
+# ``web/chat_helpers.py`` and is tested here directly so we do not
+# have to boot Streamlit or maintain a deep module stub.
+
+
+class _FakeSessionState(dict):
+    """Minimal ``st.session_state`` stand-in for pure-logic tests.
+
+    Tests pass an instance to ``consume_stop_flag`` /
+    ``resolve_chatbox_model_id`` instead of ``st.session_state`` so
+    the helpers can be exercised without Streamlit.
+    """
+
+
+class ChatboxPickerTests(unittest.TestCase):
+    """Pin the chatbox model-picker label→id resolution contract.
+
+    The picker is a view-layer shortcut for the sidebar dropdown —
+    the two write to the same ``session_state['model']`` key so a
+    change in either place is reflected on the next turn. The pure
+    resolution (label → id, and "did the value actually change?")
+    lives in :func:`web.chat_helpers.resolve_chatbox_model_id`; the
+    tests pin that contract.
+    """
+
+    def test_resolves_known_label_to_id(self):
+        choices = [
+            {"id": "google/gemma-4-31b-it:free", "label": "Gemma 4 31B (default)"},
+            {"id": "meta-llama/llama-3.3-70b-instruct:free", "label": "Llama 3.3 70B"},
+        ]
+        new_id, changed = resolve_chatbox_model_id(
+            choices,
+            chosen_label="Llama 3.3 70B",
+            current_id="google/gemma-4-31b-it:free",
+        )
+        self.assertEqual(new_id, "meta-llama/llama-3.3-70b-instruct:free")
+        self.assertTrue(changed)
+
+    def test_unchanged_selection_reports_no_change(self):
+        choices = [
+            {"id": "google/gemma-4-31b-it:free", "label": "Gemma 4 31B (default)"},
+        ]
+        new_id, changed = resolve_chatbox_model_id(
+            choices,
+            chosen_label="Gemma 4 31B (default)",
+            current_id="google/gemma-4-31b-it:free",
+        )
+        self.assertEqual(new_id, "google/gemma-4-31b-it:free")
+        self.assertFalse(changed)
+
+    def test_unknown_label_falls_back_to_current_id(self):
+        # Defensive: if the curated list ever drifts from a stale
+        # label in session_state we must not crash and we must not
+        # silently swap to an unknown model.
+        choices = [
+            {"id": "google/gemma-4-31b-it:free", "label": "Gemma 4 31B (default)"},
+        ]
+        new_id, changed = resolve_chatbox_model_id(
+            choices,
+            chosen_label="Mystery Model",
+            current_id="google/gemma-4-31b-it:free",
+        )
+        self.assertEqual(new_id, "google/gemma-4-31b-it:free")
+        self.assertFalse(changed)
+
+    def test_view_delegate_writes_only_on_change(self):
+        # The view's wrapper should *only* write ``session_state['model']``
+        # when the resolved id differs from the current one. Simulate
+        # that contract directly against a plain dict using a small
+        # local choices table (the real ``FREE_MODEL_CHOICES`` lives
+        # in ``web/streamlit_app.py`` and would force a Streamlit
+        # import — see :func:`web.streamlit_app._render_chatbox_model_picker`).
+        state = _FakeSessionState()
+        state["model"] = "google/gemma-4-31b-it:free"
+        choices = [
+            {"id": "google/gemma-4-31b-it:free", "label": "Gemma 4 31B (default)"},
+            {"id": "meta-llama/llama-3.3-70b-instruct:free", "label": "Llama 3.3 70B"},
+        ]
+        # Unchanged → no write.
+        new_id, changed = resolve_chatbox_model_id(
+            choices,
+            chosen_label="Gemma 4 31B (default)",
+            current_id=state["model"],
+        )
+        if changed:
+            state["model"] = new_id
+        self.assertEqual(state["model"], "google/gemma-4-31b-it:free")
+        # Changed → write.
+        new_id, changed = resolve_chatbox_model_id(
+            choices,
+            chosen_label="Llama 3.3 70B",
+            current_id=state["model"],
+        )
+        if changed:
+            state["model"] = new_id
+        self.assertEqual(state["model"], "meta-llama/llama-3.3-70b-instruct:free")
+
+
+class StopFlagTests(unittest.TestCase):
+    """Pin the cooperative stop-flag contract.
+
+    The view's two chunk loops check ``session_state['stop_requested']``
+    on every delta and break out (pinned-vision path) or ``return``
+    (streaming shim) when the flag flips ``True``. The flag is set
+    by the Stop button widget when the user clicks it, and reset by
+    :func:`consume_stop_flag` at the start of every new turn. The
+    tests pin the pure read/clear behaviour here.
+    """
+
+    def test_consume_returns_true_when_flag_was_set(self):
+        state = _FakeSessionState()
+        state["stop_requested"] = True
+        self.assertTrue(consume_stop_flag(state))
+
+    def test_consume_clears_the_flag(self):
+        state = _FakeSessionState()
+        state["stop_requested"] = True
+        consume_stop_flag(state)
+        # ``consume_stop_flag`` both pops the flag and re-seeds it
+        # to ``False`` so subsequent reads inside the same session
+        # see the canonical default.
+        self.assertFalse(state.get("stop_requested"))
+
+    def test_consume_returns_false_when_flag_missing(self):
+        state = _FakeSessionState()
+        state.pop("stop_requested", None)
+        self.assertFalse(consume_stop_flag(state))
+        # Re-seeded to ``False`` even when it was absent — the next
+        # turn's chunk loops need a deterministic default to check.
+        self.assertFalse(state.get("stop_requested"))
+
+    def test_consume_is_idempotent(self):
+        # Two consecutive consumes must both report ``False`` so a
+        # double-rerun cannot accidentally re-arm the flag.
+        state = _FakeSessionState()
+        state["stop_requested"] = True
+        self.assertTrue(consume_stop_flag(state))
+        self.assertFalse(consume_stop_flag(state))
+
+    def test_consume_tolerates_a_plain_dict(self):
+        # Production passes ``st.session_state`` (a ``ServerSession``
+        # proxy); tests pass a plain dict. The contract should hold
+        # for both because the helper only relies on ``pop`` /
+        # ``__setitem__``.
+        state = {"stop_requested": True}
+        self.assertTrue(consume_stop_flag(state))
+        self.assertFalse(state.get("stop_requested"))
+
+
+class VisionTimeoutTests(unittest.TestCase):
+    """Pin the per-request timeout for vision calls.
+
+    The vision path on OpenRouter is the only known-working free
+    route, but its first-token latency varies wildly (warm slots
+    come back in ~25s, cold starts can run past 90s). The helper
+    exposes :func:`web.chat_helpers.vision_timeout_seconds` so a
+    future adaptive loop has a single override point. The current
+    value is set to **45s** — long enough to absorb a typical
+    warm-slot first-token, short enough that a stuck call degrades
+    to the text fallback before the user perceives a stall.
+
+    The lower bound here is a guard against an accidental shrink
+    back to the old 30s (which used to abort every warm slot before
+    any text came back); the upper bound guards against a runaway
+    bump that would silently re-introduce the "Thinking… for 90s"
+    UX bug the user reported.
+    """
+
+    def test_vision_timeout_is_within_safe_window(self):
+        from web.chat_helpers import vision_timeout_seconds
+        value = vision_timeout_seconds()
+        self.assertGreaterEqual(value, 30.0)
+        self.assertLessEqual(value, 60.0)
+
+    def test_vision_timeout_is_a_float(self):
+        # Tests and the router both rely on the helper returning a
+        # plain float so the timeout can be forwarded straight to
+        # ``openrouter.stream_chat(..., timeout=...)`` without an
+        # int/float coercion at the call site.
+        from web.chat_helpers import vision_timeout_seconds
+        self.assertIsInstance(vision_timeout_seconds(), float)
 
 
 if __name__ == "__main__":

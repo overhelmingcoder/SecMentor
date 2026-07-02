@@ -779,6 +779,87 @@ def _is_pdf_mime(file: _UploadedFileLike) -> bool:
     return bare.endswith(".pdf")
 
 
+# --- Cooperative-stop pure logic --------------------------------------------
+# The view's stop button and the chatbox model picker write to
+# ``st.session_state`` keys; their *rendering* code (which calls
+# ``st.button`` and ``st.selectbox``) must live in ``streamlit_app.py``
+# because it needs the live Streamlit context. The pure logic — read
+# and reset the stop flag, map a free-model label to its id — does NOT
+# need Streamlit and is the part that is most useful to unit-test.
+# Keeping it here means tests can exercise the contract without
+# importing the full view module (which would itself try to render
+# the page and crash).
+
+
+def consume_stop_flag(state: "Mapping[str, object]") -> bool:
+    """Read and clear the cooperative stop flag on ``state``.
+
+    Mirrors the view-layer :func:`web.streamlit_app._consume_stop_flag`
+    so a brand-new turn starts with a clean slate and a user clicking
+    Stop between turns does not poison the next request. The flag is
+    always re-seeded to ``False`` so subsequent reads inside the same
+    session see the canonical default.
+
+    Parameters
+    ----------
+    state : Mapping[str, object]
+        A duck-typed ``session_state`` (anything that supports
+        ``__getitem__``, ``pop``, and ``__setitem__``). Tests pass a
+        plain ``dict``; production passes ``st.session_state``.
+
+    Returns
+    -------
+    bool
+        ``True`` when the flag was set on entry, ``False`` otherwise.
+    """
+    try:
+        flag = bool(state.pop("stop_requested", False))
+    except AttributeError:
+        # A read-only mapping in tests — fall back to ``get`` so the
+        # contract can still be exercised.
+        flag = bool(state.get("stop_requested", False))  # type: ignore[union-attr]
+    state["stop_requested"] = False
+    return flag
+
+
+def resolve_chatbox_model_id(
+    choices: "Sequence[Mapping[str, str]]",
+    *,
+    chosen_label: str,
+    current_id: str,
+) -> tuple[str, bool]:
+    """Map a chatbox-picker label to its model id and report a change.
+
+    Mirrors :func:`web.streamlit_app._render_chatbox_model_picker`'s
+    ``session_state["model"]`` write logic so the contract is pinned
+    by a unit test without booting Streamlit.
+
+    Parameters
+    ----------
+    choices : sequence of mappings
+        The curated ``FREE_MODEL_CHOICES`` list (or any compatible
+        duck-type in tests). Each row must have at least
+        ``"label"`` and ``"id"`` keys.
+    chosen_label : str
+        The label the user just picked in the chatbox dropdown.
+    current_id : str
+        The model id currently bound to ``session_state["model"]``.
+
+    Returns
+    -------
+    tuple[str, bool]
+        ``(resolved_id, changed)`` — ``resolved_id`` is the id that
+        matches ``chosen_label`` (falling back to ``current_id`` if
+        the label is not in the list), and ``changed`` is ``True`` iff
+        the resolved id differs from ``current_id``.
+    """
+    chosen_id = next(
+        (m["id"] for m in choices if m.get("label") == chosen_label),
+        current_id,
+    )
+    return chosen_id, chosen_id != current_id
+
+
 def build_user_turn_content(
     text: str | None,
     files: Iterable[_UploadedFileLike] | None = None,
@@ -1001,11 +1082,20 @@ _DEFAULT_FREE_VISION_MODEL: str = "nvidia/nemotron-nano-12b-v2-vl:free"
 # Vision calls use a longer per-request timeout because the only free
 # vision model currently confirmed working on OpenRouter is NVIDIA's
 # nemotron-nano-12b-v2-vl, and its first-token latency routinely sits
-# in the 60-90s range. The default 30s in ``app.openrouter.HTTP_TIMEOUT_SECONDS``
-# aborts the call before any progress is made, which then trips every
-# retry on the same model and surfaces ``AllSlotsExhaustedError`` to the
-# user even though the model would have answered if we'd waited.
-_VISION_TIMEOUT_SECONDS: float = 90.0
+# in the 30-60s range when the slot is warm and balloons to 90s+ on a
+# cold start. The default 30s in ``app.openrouter.HTTP_TIMEOUT_SECONDS``
+# is too tight (it aborts the call before any progress is made, which
+# then trips every retry on the same model and surfaces
+# ``AllSlotsExhaustedError`` even though the model would have answered
+# if we'd waited), but waiting a full 90s leaves the user staring at
+# "Thinking…" for almost a minute and a half on a hung slot. The
+# compromise used here is **45s**: long enough to absorb a typical
+# warm-slot first-token (median ~25s in our telemetry) with a
+# generous tail, short enough that a stuck call degrades to the text
+# fallback within roughly the same window the user is willing to wait.
+# The downstream degrade path is responsible for surfacing the
+# fallback reply within an additional ``HTTP_TIMEOUT_SECONDS`` budget.
+_VISION_TIMEOUT_SECONDS: float = 45.0
 
 
 def vision_timeout_seconds() -> float:

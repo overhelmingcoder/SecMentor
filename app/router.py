@@ -313,13 +313,15 @@ class ModelRouter:
         the router never inspects or rewrites the content.
 
         ``timeout`` is forwarded to :func:`openrouter.chat` per slot.
-        The text path uses the module default (30s); the vision path
-        in :mod:`web.chat_helpers` overrides this with a 90s ceiling
-        because NVIDIA's free-tier vision endpoint routinely takes
-        60–90s to produce its first token. Without that override a
-        hung vision call burns all 10 slots before the timeout fires
-        and the user sees ``AllSlotsExhaustedError`` instead of a
-        useful error.
+        The text path uses the module default (60s); the vision path
+        in :mod:`web.chat_helpers` overrides this with a 45s ceiling
+        — long enough to absorb a typical warm-slot first-token from
+        NVIDIA's free-tier vision endpoint (median ~25s) but short
+        enough that a hung call degrades to the text fallback before
+        the user perceives a stall. Without that override a hung vision
+        call burns all 10 slots before the default timeout fires and
+        the user sees ``AllSlotsExhaustedError`` instead of a useful
+        error.
         """
         last_error: BaseException | None = None
         attempts = 0
@@ -481,10 +483,12 @@ class ModelRouter:
         original round-robin behaviour across every healthy slot.
 
         ``timeout`` is forwarded to :func:`openrouter.stream_chat` per
-        slot. The text path uses the module default (30s); the
+        slot. The text path uses the module default (60s); the
         vision path in :mod:`web.chat_helpers` overrides this with a
-        90s ceiling because the only working free vision model is
-        slow to first byte. See :meth:`chat` for the full rationale.
+        45s ceiling because the only working free vision model is
+        slow to first byte and a hung call needs to degrade to the
+        text fallback within a user-perceivable window. See
+        :meth:`chat` for the full rationale.
 
         * If the upstream raises **before** yielding any delta
           (auth error, 4xx, 5xx on the first chunk, or a network
