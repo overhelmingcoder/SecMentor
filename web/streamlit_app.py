@@ -2177,7 +2177,17 @@ def _ask(prompt: str | dict[str, object] | None) -> None:
             # only. We treat both as transient failures and surface
             # the same friendly banner the view already shows for
             # empty-reply 4xx.
-            if not reply or not reply.strip():
+            #
+            # Exception: the user explicitly clicked Stop. In that case
+            # the empty reply is *intentional* (the model may have
+            # produced zero deltas before the user cancelled), and the
+            # ``stop_requested`` flag is still ``True`` here. We must
+            # not raise — the user got what they asked for. The
+            # downstream commit logic (which uses ``had_streaming_failure``
+            # to distinguish success from partial) already handles an
+            # empty ``reply`` cleanly: the turn is silently dropped.
+            _user_stopped = bool(st.session_state.get("stop_requested"))
+            if not _user_stopped and (not reply or not reply.strip()):
                 raise OpenRouterError(
                     "Model returned an empty reply.",
                     status=None,
