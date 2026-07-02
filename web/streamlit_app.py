@@ -1565,11 +1565,23 @@ def _render_sidebar() -> None:
     # =========================================================================
     # Card 5 — CHAT HISTORY (compact: 3 rows visible, no inner New chat)
     # =========================================================================
+    # Storage path note: on Streamlit Cloud (free tier) the SQLite file
+    # lives in a path that is wiped on every redeploy. We surface that
+    # honestly in the subtitle so the user is not surprised when older
+    # chats vanish after a code change ships.
+    _is_cloud = bool(os.getenv("STREAMLIT_SHARING")) or (
+        Path.home().as_posix().startswith("/home/adminuser")
+    )
+    _history_sub = (
+        "Stored locally in this session \u2014 Cloud redeploys wipe history. "
+        "Soft-delete keeps them recoverable."
+        if _is_cloud
+        else "Stored locally \u00b7 soft-delete keeps them recoverable."
+    )
     st.markdown(
         '<div class="sm-card">'
         '<div class="sm-card-title"><span class="dot"></span>Chat history</div>'
-        '<div class="sm-card-sub">Stored locally · soft-delete keeps them '
-        "recoverable.</div>",
+        f'<div class="sm-card-sub">{_history_sub}</div>',
         unsafe_allow_html=True,
     )
     # Surface the one-time DB-init warning if storage init failed earlier
