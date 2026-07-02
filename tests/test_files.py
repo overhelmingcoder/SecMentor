@@ -472,29 +472,38 @@ class BuildUserTurnPdfTests(unittest.TestCase):
     # ---- build_user_turn_text (the display-bubble path) ----------------
 
     def test_pdf_inlined_in_display_bubble_when_processor_supplied(self):
-        """The user bubble must show the extracted PDF text, not the
-        legacy binary stub. This is the exact bug the user reported
-        with ``Final CV.pdf``."""
+        """The user bubble must show a *compact stub* for the PDF
+        (``[Attached PDF: name · size · chars]``), not the full
+        extracted prose. Top agents (Claude.ai, ChatGPT) keep the
+        bubble short; the extracted text is delivered to the model
+        via :func:`build_user_turn_content`, not the display
+        helper. This is the exact behaviour the user requested
+        after the 4 000-char preview wall was reported as visually
+        noisy."""
         from web.chat_helpers import build_user_turn_text
 
-        fake = _FakeUpload("Final CV.pdf", "application/pdf", b"%PDF-1.4\n...")
+        fake = _FakeUpload("Final CV.pdf", "application/pdf", b"%PDF-1.4\n...") 
 
         def fake_pdf_processor(file):
-            return "Jane Doe\nSenior Security Engineer\n10 years experience"
+            return "Jane Doe\nSenior Security Engineer\n10 years experience"    
 
         out = build_user_turn_text(
             "summarize", [fake], pdf_processor=fake_pdf_processor
         )
 
-        # Extracted text is in the bubble
-        self.assertIn("Jane Doe", out)
-        self.assertIn("Senior Security Engineer", out)
+        # The compact stub is in the bubble — file name + size + char count
+        self.assertIn("[Attached PDF: Final CV.pdf", out)
+        # The user sees the *count* of characters, not the prose itself
+        self.assertIn("chars", out)
         # The user's typed question is preserved
         self.assertIn("summarize", out)
         # The legacy binary stub is NOT shown
         self.assertNotIn("binary, not inlined", out)
         self.assertNotIn("Ask the user to paste", out)
-
+        # The extracted prose is NOT in the bubble — that is what the
+        # user explicitly asked for ("simple and short like top agents").
+        self.assertNotIn("Jane Doe", out)
+        self.assertNotIn("Senior Security Engineer", out)
     def test_pdf_falls_back_to_legacy_block_when_no_processor_supplied(self):
         """For backward compatibility, when ``pdf_processor`` is
         ``None`` the helper must keep the old _format_upload_block
@@ -916,6 +925,283 @@ class OpenRouterPayloadRoundTripTests(unittest.TestCase):
         self.assertEqual(
             payload["messages"][-1]["content"], "plain text turn"
         )
+
+
+class _FakeRouter:
+    """Stand-in for ``ModelRouter`` used by the helper tests.
+
+    Records every ``stream_chat`` call (``model=``, ``timeout=`` and the
+    messages list) and replays a script of chunk sequences / exceptions
+    supplied at construction time. Keeps the helper free of network
+    effects so the degrade branch can be exercised deterministically.
+
+    ``scripts`` is a list; each element is either:
+      * an iterable of strings → yielded as chunks
+      * an exception class or instance → raised on the first iteration
+    One script entry per ``stream_chat`` call, in order.
+    """
+
+    def __init__(self, scripts):
+        self._scripts = list(scripts)
+        self.calls = []  # list of dicts: {model, timeout, messages}
+
+    def stream_chat(self, messages, *, model=None, temperature=None,
+                    max_tokens=None, timeout=None):
+        if not self._scripts:
+            raise AssertionError("FakeRouter: no more scripts queued")
+        self.calls.append({
+            "model": model,
+            "timeout": timeout,
+            "messages": messages,
+        })
+        script = self._scripts.pop(0)
+        if isinstance(script, BaseException) or (
+            isinstance(script, type) and issubclass(script, BaseException)
+        ):
+            exc = script() if isinstance(script, type) else script
+            # ``stream_chat`` is a generator: the real client raises
+            # *during* iteration, so we yield nothing and raise on the
+            # first ``next()`` call. Returning a generator that
+            # immediately raises mimics that semantics exactly.
+            if False:  # pragma: no cover - this branch never yields
+                yield ""
+            raise exc
+        for chunk in script:
+            yield chunk
+
+
+class StreamErrorClassifierTests(unittest.TestCase):
+    """``_classify_degrade_trigger`` maps exceptions to machine strings."""
+
+    def test_vision_rate_limit(self):
+        from app.openrouter import OpenRouterRateLimitError
+
+        from web.chat_helpers import _classify_degrade_trigger
+        exc = OpenRouterRateLimitError("rate limited", status=429)
+        self.assertEqual(
+            _classify_degrade_trigger(exc), "vision_rate_limit"
+        )
+
+    def test_vision_server_error(self):
+        from app.openrouter import OpenRouterServerError
+
+        from web.chat_helpers import _classify_degrade_trigger
+        exc = OpenRouterServerError("504", status=504)
+        self.assertEqual(
+            _classify_degrade_trigger(exc), "vision_server_error"
+        )
+
+    def test_vision_no_response_for_base_openrouter_error(self):
+        from app.openrouter import OpenRouterError
+
+        from web.chat_helpers import _classify_degrade_trigger
+        exc = OpenRouterError("no chunks", status=502)
+        self.assertEqual(
+            _classify_degrade_trigger(exc), "vision_no_response"
+        )
+
+    def test_auth_error_is_not_a_degrade_trigger(self):
+        from app.openrouter import OpenRouterAuthError
+
+        from web.chat_helpers import _classify_degrade_trigger
+        exc = OpenRouterAuthError("bad key", status=401)
+        self.assertIsNone(_classify_degrade_trigger(exc))
+
+    def test_unwrap_all_slots_exhausted_cause(self):
+        from app.openrouter import (
+            OpenRouterAuthError,
+            OpenRouterError,
+            OpenRouterRateLimitError,
+            OpenRouterServerError,
+        )
+        from app.router import AllSlotsExhaustedError
+
+        from web.chat_helpers import _classify_degrade_trigger
+        for cause, expected in (
+            (OpenRouterServerError("5xx", status=500), "vision_server_error"),
+            (OpenRouterRateLimitError("429", status=429), "vision_rate_limit"),
+            (OpenRouterError("no deltas", status=502), "vision_no_response"),
+            (OpenRouterAuthError("bad key", status=401), None),
+        ):
+            wrapped = AllSlotsExhaustedError("all slots failed", attempts=1)
+            wrapped.__cause__ = cause
+            self.assertEqual(
+                _classify_degrade_trigger(wrapped), expected,
+                f"cause={cause!r}",
+            )
+
+
+class StreamVisionTurnWithFallbackTests(unittest.TestCase):
+    """``stream_vision_turn_with_fallback`` end-to-end streaming + degrade."""
+
+    def _messages(self, content="describe the image"):
+        return [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": content},
+        ]
+
+    def test_vision_stream_yields_vision_source_unmodified(self):
+        from web.chat_helpers import stream_vision_turn_with_fallback
+
+        router = _FakeRouter([["hello ", "world"]])
+        out = list(stream_vision_turn_with_fallback(
+            router=router,
+            messages=self._messages(),
+            vision_model_id="nvidia/nemotron-nano-12b-v2-vl:free",
+            fallback_model_id="mistralai/mistral-small:free",
+            content="describe the image",
+            files=None,
+            timeout=90.0,
+        ))
+        self.assertEqual(out, [("hello ", "vision"), ("world", "vision")])
+        # The helper must pin the vision model id and forward timeout.
+        self.assertEqual(len(router.calls), 1)
+        self.assertEqual(
+            router.calls[0]["model"],
+            "nvidia/nemotron-nano-12b-v2-vl:free",
+        )
+        self.assertEqual(router.calls[0]["timeout"], 90.0)
+
+    def test_vision_failure_before_any_delta_degrades_to_text(self):
+        from app.openrouter import OpenRouterServerError
+
+        from web.chat_helpers import stream_vision_turn_with_fallback
+
+        vision_exc = OpenRouterServerError("504", status=504)
+        # First script raises on first iteration; second script yields
+        # the text-fallback chunks. ``_FakeRouter.stream_chat`` will
+        # raise the exception the moment the caller starts iterating.
+        router = _FakeRouter([vision_exc, ["text-fallback-A", "text-fallback-B"]])
+        out = list(stream_vision_turn_with_fallback(
+            router=router,
+            messages=self._messages(),
+            vision_model_id="nvidia/nemotron-nano-12b-v2-vl:free",
+            fallback_model_id="mistralai/mistral-small:free",
+            content="describe the image",
+            files=None,
+        ))
+        # First emission: a one-space degraded marker. Then the two
+        # text-fallback chunks, both tagged as ``"text"``.
+        self.assertEqual(out, [
+            (" ", "degraded"),
+            ("text-fallback-A", "text"),
+            ("text-fallback-B", "text"),
+        ])
+        # Two calls were made: vision attempt + text fallback.
+        self.assertEqual(
+            [c["model"] for c in router.calls],
+            [
+                "nvidia/nemotron-nano-12b-v2-vl:free",
+                "mistralai/mistral-small:free",
+            ],
+        )
+        # The text-fallback call must carry the *text-only* content
+        # (a string, not the original ``str`` we passed — degrade
+        # inlines a stub regardless of vision-failure kind because
+        # ``files=None`` means no per-attachment stubs are emitted).
+        second_call_messages = router.calls[1]["messages"]
+        last_msg = second_call_messages[-1]
+        self.assertIsInstance(last_msg["content"], str)
+        self.assertIn("describe the image", last_msg["content"])
+        self.assertNotIsInstance(last_msg["content"], list)
+
+    def test_vision_partial_stream_then_error_is_re_raised(self):
+        """Once the vision model has produced a delta, the helper must
+        NOT degrade. Mixing two model outputs in one bubble would be
+        confusing — the caller should see the partial reply and
+        re-issue."""
+        from app.openrouter import OpenRouterServerError
+
+        from web.chat_helpers import stream_vision_turn_with_fallback
+
+        router = _FakeRouter([
+            ["partial ", "reply"],
+            ["text-fallback-A"],  # must never be consumed
+        ])
+        gen = stream_vision_turn_with_fallback(
+            router=router,
+            messages=self._messages(),
+            vision_model_id="nvidia/nemotron-nano-12b-v2-vl:free",
+            fallback_model_id="mistralai/mistral-small:free",
+            content="describe the image",
+            files=None,
+        )
+        collected = []
+        try:
+            for chunk in gen:
+                collected.append(chunk)
+        except OpenRouterServerError:
+            pass
+        # Vision chunks made it through; no degraded marker, no
+        # text-fallback chunks.
+        self.assertEqual(collected, [
+            ("partial ", "vision"), ("reply", "vision"),
+        ])
+        self.assertEqual(len(router.calls), 1)
+
+    def test_auth_error_propagates_without_degrade(self):
+        from app.openrouter import OpenRouterAuthError
+
+        from web.chat_helpers import stream_vision_turn_with_fallback
+
+        router = _FakeRouter([
+            OpenRouterAuthError("bad key", status=401),
+            ["fallback"],  # must never be consumed
+        ])
+        gen = stream_vision_turn_with_fallback(
+            router=router,
+            messages=self._messages(),
+            vision_model_id="nvidia/nemotron-nano-12b-v2-vl:free",
+            fallback_model_id="mistralai/mistral-small:free",
+            content="describe the image",
+            files=None,
+        )
+        with self.assertRaises(OpenRouterAuthError):
+            list(gen)
+        # Only the vision attempt was made — auth errors must not
+        # silently swap to a text fallback.
+        self.assertEqual(len(router.calls), 1)
+
+    def test_empty_vision_stream_triggers_degrade(self):
+        """The helper's belt-and-braces empty-yield guard must degrade
+        even if the router did not raise. (The production router does
+        raise, but the contract is in the helper, not the router —
+        tests here pin it in isolation.)"""
+        from web.chat_helpers import stream_vision_turn_with_fallback
+
+        # A stubbed router whose ``stream_chat`` returns an iterable
+        # (not a generator) so we can swap behaviour per ``model=``
+        # without yielding from inside the function. The vision call
+        # yields nothing; the text fallback yields one chunk.
+        def _iter_for(model):
+            if model == "nvidia/nemotron-nano-12b-v2-vl:free":
+                return iter(())
+            return iter(["text-from-fallback"])
+
+        class _EmptyRouter:
+            def __init__(self):
+                self.calls = []
+
+            def stream_chat(self, messages, *, model=None, temperature=None,
+                            max_tokens=None, timeout=None):
+                self.calls.append({"model": model, "messages": messages,
+                                   "timeout": timeout})
+                return _iter_for(model)
+
+        router = _EmptyRouter()
+        out = list(stream_vision_turn_with_fallback(
+            router=router,
+            messages=self._messages(),
+            vision_model_id="nvidia/nemotron-nano-12b-v2-vl:free",
+            fallback_model_id="mistralai/mistral-small:free",
+            content="describe the image",
+            files=None,
+        ))
+        self.assertEqual(out, [
+            (" ", "degraded"),
+            ("text-from-fallback", "text"),
+        ])
+        self.assertEqual(len(router.calls), 2)
 
 
 if __name__ == "__main__":

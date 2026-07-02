@@ -1,0 +1,119 @@
+test_dnsresult_ok_property (tests.test_recon.DNSResolveTests.test_dnsresult_ok_property) ... ok
+test_resolve_dedupes_ipv4 (tests.test_recon.DNSResolveTests.test_resolve_dedupes_ipv4) ... ok
+test_resolve_empty_raises (tests.test_recon.DNSResolveTests.test_resolve_empty_raises) ... ok
+test_resolve_only_ipv4 (tests.test_recon.DNSResolveTests.test_resolve_only_ipv4) ... ok
+test_resolve_propagates_gaierror (tests.test_recon.DNSResolveTests.test_resolve_propagates_gaierror) ... ok
+test_resolve_returns_ipv4_and_ipv6 (tests.test_recon.DNSResolveTests.test_resolve_returns_ipv4_and_ipv6) ... ok
+test_resolve_sorts_ipv4 (tests.test_recon.DNSResolveTests.test_resolve_sorts_ipv4) ... ok
+test_lookup_empty_payload (tests.test_recon.CrtShLookupTests.test_lookup_empty_payload) ... ERROR
+test_lookup_extracts_hosts_and_issuers (tests.test_recon.CrtShLookupTests.test_lookup_extracts_hosts_and_issuers) ... ERROR
+test_lookup_hosts_are_lowercased_and_sorted (tests.test_recon.CrtShLookupTests.test_lookup_hosts_are_lowercased_and_sorted) ... ERROR
+test_lookup_invalid_json_raises (tests.test_recon.CrtShLookupTests.test_lookup_invalid_json_raises) ... ok
+test_lookup_network_error_raises (tests.test_recon.CrtShLookupTests.test_lookup_network_error_raises) ... ok
+test_lookup_skips_none_name_value (tests.test_recon.CrtShLookupTests.test_lookup_skips_none_name_value) ... ERROR
+test_blocked_target_does_not_call_transports (tests.test_recon.OrchestratorTests.test_blocked_target_does_not_call_transports) ... ok
+test_blocked_target_raises (tests.test_recon.OrchestratorTests.test_blocked_target_raises) ... ok
+test_empty_scope_token_raises (tests.test_recon.OrchestratorTests.test_empty_scope_token_raises) ... ok
+test_empty_target_raises (tests.test_recon.OrchestratorTests.test_empty_target_raises) ... ok
+test_happy_path_all_tools_ok (tests.test_recon.OrchestratorTests.test_happy_path_all_tools_ok) ... ERROR
+test_invalid_scope_token_raises (tests.test_recon.OrchestratorTests.test_invalid_scope_token_raises) ... ok
+test_partial_failure_recorded (tests.test_recon.OrchestratorTests.test_partial_failure_recorded) ... ERROR
+
+======================================================================
+ERROR: test_lookup_empty_payload (tests.test_recon.CrtShLookupTests.test_lookup_empty_payload)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\puku projects\stage1\tests\test_recon.py", line 1047, in test_lookup_empty_payload
+    result = crt_sh.lookup("nx.invalid")
+  File "D:\puku projects\stage1\app\recon\crt_sh.py", line 328, in lookup
+    return CrtShResult(
+        hosts=sorted(hosts),
+    ...<2 lines>...
+        raw=rows[:_RAW_KEEP],
+    )
+TypeError: CrtShResult.__init__() got an unexpected keyword argument 'raw'
+
+======================================================================
+ERROR: test_lookup_extracts_hosts_and_issuers (tests.test_recon.CrtShLookupTests.test_lookup_extracts_hosts_and_issuers)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\puku projects\stage1\tests\test_recon.py", line 1034, in test_lookup_extracts_hosts_and_issuers
+    result = crt_sh.lookup("example.com")
+  File "D:\puku projects\stage1\app\recon\crt_sh.py", line 328, in lookup
+    return CrtShResult(
+        hosts=sorted(hosts),
+    ...<2 lines>...
+        raw=rows[:_RAW_KEEP],
+    )
+TypeError: CrtShResult.__init__() got an unexpected keyword argument 'raw'
+
+======================================================================
+ERROR: test_lookup_hosts_are_lowercased_and_sorted (tests.test_recon.CrtShLookupTests.test_lookup_hosts_are_lowercased_and_sorted)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\puku projects\stage1\tests\test_recon.py", line 1097, in test_lookup_hosts_are_lowercased_and_sorted
+    result = crt_sh.lookup("example.com")
+  File "D:\puku projects\stage1\app\recon\crt_sh.py", line 328, in lookup
+    return CrtShResult(
+        hosts=sorted(hosts),
+    ...<2 lines>...
+        raw=rows[:_RAW_KEEP],
+    )
+TypeError: CrtShResult.__init__() got an unexpected keyword argument 'raw'
+
+======================================================================
+ERROR: test_lookup_skips_none_name_value (tests.test_recon.CrtShLookupTests.test_lookup_skips_none_name_value)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\puku projects\stage1\tests\test_recon.py", line 1081, in test_lookup_skips_none_name_value
+    result = crt_sh.lookup("example.com")
+  File "D:\puku projects\stage1\app\recon\crt_sh.py", line 328, in lookup
+    return CrtShResult(
+        hosts=sorted(hosts),
+    ...<2 lines>...
+        raw=rows[:_RAW_KEEP],
+    )
+TypeError: CrtShResult.__init__() got an unexpected keyword argument 'raw'
+
+======================================================================
+ERROR: test_happy_path_all_tools_ok (tests.test_recon.OrchestratorTests.test_happy_path_all_tools_ok)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\puku projects\stage1\tests\test_recon.py", line 1460, in test_happy_path_all_tools_ok
+    tool="crt_sh", ok=True, value=_fake_crt_ok(),
+                                  ~~~~~~~~~~~~^^
+  File "D:\puku projects\stage1\tests\test_recon.py", line 173, in _fake_crt_ok
+    return crt_sh.CrtShResult(
+           ~~~~~~~~~~~~~~~~~~^
+        hosts=["example.com", "www.example.com"],
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<2 lines>...
+        raw=[],
+        ^^^^^^^
+    )
+    ^
+TypeError: CrtShResult.__init__() got an unexpected keyword argument 'raw'
+
+======================================================================
+ERROR: test_partial_failure_recorded (tests.test_recon.OrchestratorTests.test_partial_failure_recorded)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\puku projects\stage1\tests\test_recon.py", line 1502, in test_partial_failure_recorded
+    tool="crt_sh", ok=True, value=_fake_crt_ok(),
+                                  ~~~~~~~~~~~~^^
+  File "D:\puku projects\stage1\tests\test_recon.py", line 173, in _fake_crt_ok
+    return crt_sh.CrtShResult(
+           ~~~~~~~~~~~~~~~~~~^
+        hosts=["example.com", "www.example.com"],
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<2 lines>...
+        raw=[],
+        ^^^^^^^
+    )
+    ^
+TypeError: CrtShResult.__init__() got an unexpected keyword argument 'raw'
+
+----------------------------------------------------------------------
+Ran 20 tests in 1.076s
+
+FAILED (errors=6)

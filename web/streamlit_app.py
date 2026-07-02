@@ -44,7 +44,12 @@ from app.config import (
     iter_api_keys,
     iter_models,
 )
-from app.openrouter import OpenRouterError, chat, stream_chat
+from app.openrouter import (
+    OpenRouterError,
+    OpenRouterRateLimitError,
+    chat,
+    stream_chat,
+)
 from app.router import (
     AllSlotsExhaustedError,
     ModelRouter,
@@ -68,16 +73,39 @@ from web.chat_helpers import (
     _copy_button_html,
     _copy_button_html_for_bubble,
     _count_chars,
+    _format_chat_timestamp,
     _friendly_error_message,
     _render_copy_button_for_bubble,
     _serialize_for_download,
     _truncate_history,
     build_user_turn_content,
     build_user_turn_text,
+    parse_recon_command,
     select_model_for_request,
+    stream_vision_turn_with_fallback,
+    vision_timeout_seconds,
 )
 from app import file_processor as _file_processor
+from app import storage as _storage
+from app.storage import (
+    append_message as _append_message,
+    create_chat as _create_chat,
+    get_chat as _get_chat,
+    init_db as _init_db,
+    list_chats as _list_chats,
+    load_messages as _load_messages,
+    soft_delete_chat as _soft_delete_chat,
+)
 from app.config import model_supports_vision
+from app.recon.orchestrator import (
+    TargetBlockedError,
+    run_recon,
+    stream_recon,
+)
+from app.recon.report import (
+    render_report_json,
+    render_report_markdown,
+)
 
 
 # --- Page configuration -------------------------------------------------------
@@ -88,6 +116,80 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+
+# --- Chat-history helpers (PR-C sidebar) -------------------------------------
+# These three top-level callables are the only entry points the sidebar
+# widgets use to mutate the chat-history state. They are intentionally
+# module-level (not nested) so ``st.button(..., on_click=_new_chat)`` can
+# resolve them by name. All three are best-effort: if SQLite is unwritable
+# they surface a one-shot ``st.warning`` rather than raising, so a wedged
+# DB never blocks the user from chatting.
+def _new_chat() -> None:
+    """Start a brand-new chat.
+
+    Clears ``active_chat_id`` (forcing pass 1 to call ``_create_chat``
+    on the next user turn) and invalidates the sidebar cache so the
+    list refreshes on the next render.
+    """
+    st.session_state["active_chat_id"] = None
+    st.session_state["chats"] = _list_chats(limit=20)
+
+
+def _open_chat(chat_id: str) -> None:
+    """Switch the active chat to ``chat_id`` and replay its history.
+
+    Replay happens by re-binding ``st.session_state["messages"]`` from
+    the storage layer — the history-render loop at the top of the
+    script then paints every turn.
+    """
+    st.session_state["active_chat_id"] = chat_id
+    try:
+        _messages = _load_messages(chat_id, limit=200)
+    except Exception as exc:  # noqa: BLE001
+        st.warning(
+            f"Could not load that chat's history: {exc}", icon="⚠️"
+        )
+        return
+    # Reset the in-memory transcript to a single system turn followed
+    # by the persisted turns. The system turn is supplied by the
+    # existing ``_build_messages`` call inside ``_ask`` — here we just
+    # seed the user-visible list with the persisted turns.
+    st.session_state["messages"] = [
+        {"role": "system", "content": "loaded from disk"}
+    ] + [
+        {"role": m["role"], "content": m["content"]}
+        for m in _messages
+    ]
+
+
+def _soft_delete_chat(chat_id: str) -> None:
+    """Soft-delete ``chat_id`` and clear the active pointer if needed.
+
+    Soft-delete preserves the row in the ``chats`` table (sets
+    ``deleted_at``) so an admin tool could undelete. The sidebar's
+    next ``_list_chats`` call already filters out ``deleted_at IS NOT
+    NULL`` rows, so the deleted chat vanishes from the UI without a
+    full page reload.
+
+    Note: the storage function is reached through the ``_storage``
+    module alias (``from app import storage as _storage``) — the
+    ``from app.storage import soft_delete_chat as _soft_delete_chat``
+    binding is intentionally shadowed by this helper, which is the
+    one Streamlit's ``on_click`` resolves by name.
+    """
+    try:
+        _storage.soft_delete_chat(chat_id)
+    except Exception as exc:  # noqa: BLE001
+        st.warning(
+            f"Could not delete that chat: {exc}", icon="⚠️"
+        )
+        return
+    if st.session_state.get("active_chat_id") == chat_id:
+        st.session_state["active_chat_id"] = None
+        st.session_state["messages"] = []
+    # Invalidate the sidebar cache.
+    st.session_state["chats"] = _list_chats(limit=20)
 
 
 # --- Custom CSS for a production-grade cybersecurity platform ----------------
@@ -820,6 +922,37 @@ def _init_state() -> None:
     # -> reply. Re-asking the same question is instant, no network call.
     if "response_cache" not in st.session_state:
         st.session_state["response_cache"] = {}
+
+    # --- Chat history (persistent across reloads via SQLite) -------------
+    # ``active_chat_id`` is the FK into the ``chats`` table for the chat
+    # the user is currently viewing. ``None`` means "no chat yet — create
+    # one on the first user message". ``chats`` is the sidebar's cached
+    # list (refreshed lazily when the user opens the sidebar widget).
+    # ``recon_scope_token`` is an optional override of
+    # ``DEFAULT_RECON_SCOPE_TOKEN``; ``None`` means "use the default".
+    # We intentionally do NOT eagerly create a chat here — the first
+    # user message of a session will create one and store the user turn.
+    if "active_chat_id" not in st.session_state:
+        st.session_state["active_chat_id"] = None
+    if "chats" not in st.session_state:
+        st.session_state["chats"] = []
+    if "recon_scope_token" not in st.session_state:
+        st.session_state["recon_scope_token"] = None
+    # Initialise the SQLite schema once per session. The call is cheap
+    # (``CREATE TABLE IF NOT EXISTS``), idempotent, and swallows errors
+    # so a corrupt DB does not crash the whole page on import. The chat
+    # UI degrades gracefully — the user just loses history — if init
+    # fails; we surface a one-time warning so they know why.
+    if "db_initialised" not in st.session_state:
+        try:
+            _storage.init_db()
+            st.session_state["db_initialised"] = True
+            st.session_state.setdefault("db_init_warning", None)
+        except Exception as exc:  # noqa: BLE001
+            st.session_state["db_initialised"] = False
+            st.session_state["db_init_warning"] = (
+                f"Chat history disabled — storage init failed: {exc}"
+            )
     # Last call's elapsed seconds, shown in the status line.
     if "last_elapsed" not in st.session_state:
         st.session_state["last_elapsed"] = None
@@ -1163,6 +1296,147 @@ DVWA, WebGoat, PicoCTF.
             unsafe_allow_html=True,
         )
 
+# --- Sidebar (continued): recon scope token + chat history widget --------
+# Streamlit lets you open the sidebar more than once; subsequent blocks
+# just append to the same column. Keeping these two widgets in their own
+# block (rather than at the bottom of the original 887-1208 one) keeps
+# the diff focused and makes it easy to move them later.
+
+# (1) Recon scope-token override. The operator can pin a non-default
+#     scope (engagement / ctf / labs / redteam / personal-lab /
+#     bugbounty) for the rest of the session. We render a one-line
+#     warning so a misconfigured value cannot accidentally be used
+#     against a real public-internet target.
+with st.sidebar:
+    st.divider()
+    with st.expander("🔍 Recon scope", expanded=False):
+        st.caption(
+            "Optional override for `/recon` scope. The orchestrator's "
+            "**safety layer** refuses targets outside the chosen scope; "
+            "production targets need `engagement` and explicit written "
+            "authorisation."
+        )
+        _scope_options = [
+            "(use default)",
+            "engagement", "ctf", "labs", "redteam",
+            "personal-lab", "bugbounty",
+        ]
+        _current_scope = st.session_state.get("recon_scope_token")
+        try:
+            _scope_index = (
+                _scope_options.index(_current_scope)
+                if _current_scope in _scope_options
+                else 0
+            )
+        except ValueError:
+            _scope_index = 0
+        _picked = st.selectbox(
+            "Scope token",
+            options=_scope_options,
+            index=_scope_index,
+            key="_recon_scope_picker",
+            help=(
+                "Sets the scope used by every `/recon <target>` turn "
+                "in this session. Defaults to the orchestrator's "
+                "DEFAULT_RECON_SCOPE_TOKEN."
+            ),
+        )
+        # Mirror to session_state so ``_handle_recon_command`` can pick
+        # it up. ``None`` = "let the orchestrator decide".
+        st.session_state["recon_scope_token"] = (
+            None if _picked == "(use default)" else _picked
+        )
+
+# (2) Chat history widget. Lists recent chats (cached in
+#     ``st.session_state["chats"]``), lets the user switch between them,
+#     soft-delete the unwanted ones, or start a new chat. The DB schema
+#     (``chats`` + ``messages``) is the source of truth; the sidebar
+#     cache is rebuilt on demand so multi-tab behaviour stays sane.
+with st.sidebar:
+    st.divider()
+    with st.expander("💬 Chat history", expanded=False):
+        # Surface the one-time DB-init warning if storage init failed
+        # earlier in ``_init_state``. We do not re-attempt init here:
+        # a flaky DB stays flaky, and retrying would mask the cause.
+        _init_warn = st.session_state.get("db_init_warning")
+        if _init_warn:
+            st.warning(_init_warn, icon="⚠️")
+        elif not st.session_state.get("db_initialised", False):
+            st.warning(
+                "Chat history is not initialised this session.",
+                icon="⚠️",
+            )
+
+        # Refresh + New chat — wired through module-level helpers so
+        # Streamlit's ``on_click`` can resolve them by name (PR-C spec).
+        _col_a, _col_b = st.columns([1, 1])
+        with _col_a:
+            if st.button(
+                "↻ Refresh",
+                key="_chats_refresh",
+                use_container_width=True,
+            ):
+                try:
+                    st.session_state["chats"] = _list_chats(limit=20)
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Could not list chats: {exc}")
+                    st.session_state["chats"] = []
+        with _col_b:
+            # ``_new_chat`` is the canonical helper from PR-C: it clears
+            # the active chat id, invalidates the cache, and lets the
+            # next user message create a fresh ``chats`` row.
+            st.button(
+                "➕  New chat",
+                key="_chats_new",
+                use_container_width=True,
+                on_click=_new_chat,
+            )
+
+        # Lazy-load the list on first render so users without DB still
+        # see a usable sidebar (just an empty list).
+        if not st.session_state["chats"] and st.session_state.get(
+            "db_initialised", False
+        ):
+            try:
+                st.session_state["chats"] = _list_chats(limit=20)
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Could not list chats: {exc}")
+                st.session_state["chats"] = []
+
+        for _chat in st.session_state["chats"]:
+            _cid = _chat.get("id")
+            _title = _chat.get("title") or "(untitled)"
+            _updated = _chat.get("updated_at") or ""
+            # Truncate title to keep the row readable.
+            _title_display = (
+                _title if len(_title) <= 48 else _title[:45] + "..."
+            )
+            _is_active = _cid == st.session_state.get("active_chat_id")
+            _label_prefix = "🟢 " if _is_active else "   "
+            _row = st.columns([5, 1])
+            with _row[0]:
+                # ``_open_chat`` re-binds ``messages`` from the DB and
+                # sets ``active_chat_id``. ``st.button`` runs the
+                # callback before the rerun, so no extra rerun call.
+                st.button(
+                    f"{_label_prefix}{_title_display}",
+                    key=f"_open_chat_{_cid}",
+                    use_container_width=True,
+                    help=_format_chat_timestamp(_updated)
+                    if _updated
+                    else "Open this chat",
+                    on_click=_open_chat,
+                    args=(_cid,),
+                )
+            with _row[1]:
+                st.button(
+                    "🗑",
+                    key=f"_del_chat_{_cid}",
+                    help="Soft-delete (moves to trash; recoverable later)",
+                    on_click=_soft_delete_chat,
+                    args=(_cid,),
+                )
+
 # --- Header ------------------------------------------------------------------
 
 # The hero subtitle changes slightly when the mentor mode is active so the
@@ -1259,7 +1533,13 @@ def _render_bubble(message: ChatMessage) -> None:
         st.markdown("</div></div>", unsafe_allow_html=True)
 
 
-def _render_friendly_error(exc: BaseException, model: str) -> None:
+def _render_friendly_error(
+    exc: BaseException,
+    model: str,
+    *,
+    vision_model: str | None = None,
+    text_fallback_attempted: bool = False,
+) -> None:
     """Show a user-readable error banner and the raw exception in a toggle.
 
     The raw ``OpenRouterError`` message contains the full upstream JSON
@@ -1268,9 +1548,34 @@ def _render_friendly_error(exc: BaseException, model: str) -> None:
     short, actionable headline + body, and we keep the raw text
     available behind ``st.exception`` so a developer can still inspect
     it with one click.
+
+    Args:
+        exc: The exception that bubbled out of the engine call.
+        model: The model id that produced the error (or, when the
+            vision path failed and a text fallback was attempted, the
+            *fallback* model id so the user's chosen model is named in
+            the banner).
+        vision_model: When set, the headline additionally names the
+            vision model that was tried first. Used by the pinned
+            image/PDF branch so a "vision failed → retried as text"
+            failure is clear.
+        text_fallback_attempted: ``True`` when the helper already
+            tried a text fallback (and that fallback also failed).
+            Adds a small note so the user knows the work-around was
+            attempted, not merely available.
     """
     headline, body = _friendly_error_message(exc, model)
     st.error(headline)
+    if vision_model and vision_model != model:
+        st.caption(
+            f"Vision call to `{vision_model}` failed first; "
+            f"the text fallback to `{model}` also failed."
+        )
+    elif text_fallback_attempted and vision_model:
+        st.caption(
+            f"Vision call to `{vision_model}` failed; "
+            f"the reply above was produced by `{model}`."
+        )
     st.caption(body)
     with st.expander("Raw error (for debugging)", expanded=False):
         st.exception(exc)
@@ -1385,6 +1690,69 @@ def _ask(prompt: str | dict[str, object] | None) -> None:
         st.session_state["messages"].append(
             {"role": "user", "content": display_text}
         )
+
+        # --- Chat history persistence (pass 1) ---------------------------
+        # If this is the first message of a new session, ensure we have
+        # a row in the ``chats`` table and bind ``active_chat_id`` to it.
+        # The chat's *title* is the first 60 chars of the user's first
+        # message — easier to spot in the sidebar list than ``(untitled)``.
+        if (
+            st.session_state.get("db_initialised", False)
+            and st.session_state.get("active_chat_id") is None
+        ):
+            try:
+                _title_seed = (display_text or "").strip()[:60] or "(new chat)"
+                _new_chat_id = _storage.create_chat(
+                    title=_title_seed
+                )
+                st.session_state["active_chat_id"] = _new_chat_id
+                # Invalidate the sidebar cache so the new chat shows up.
+                st.session_state["chats"] = _storage.list_chats(limit=20)
+            except Exception as exc:  # noqa: BLE001
+                # Storage is optional — never block the user from chatting
+                # just because SQLite had a bad day. The sidebar widget
+                # surfaces the same warning once.
+                st.session_state.setdefault(
+                    "_db_persist_warning_shown", False
+                )
+                if not st.session_state["_db_persist_warning_shown"]:
+                    st.warning(
+                        f"Chat history will not persist this session: {exc}",
+                        icon="⚠️",
+                    )
+                    st.session_state["_db_persist_warning_shown"] = True
+
+        # Persist the user turn. We store the *raw* multimodal content
+        # (the list of parts) when the request carried image attachments,
+        # so retrieval / future RAG can still match against the exact
+        # payload the model saw. For text-only turns, we store the
+        # display string. ``append_message`` JSON-encodes list payloads
+        # for us.
+        if st.session_state.get("db_initialised", False) and st.session_state.get(
+            "active_chat_id"
+        ):
+            try:
+                _user_payload = (
+                    content_obj
+                    if isinstance(content_obj, list)
+                    else display_text
+                )
+                _storage.append_message(
+                    chat_id=st.session_state["active_chat_id"],
+                    role="user",
+                    content=_user_payload,
+                )
+            except Exception as exc:  # noqa: BLE001
+                st.session_state.setdefault(
+                    "_db_persist_warning_shown", False
+                )
+                if not st.session_state["_db_persist_warning_shown"]:
+                    st.warning(
+                        f"Could not persist the user turn: {exc}",
+                        icon="⚠️",
+                    )
+                    st.session_state["_db_persist_warning_shown"] = True
+
         st.session_state["pending_request"] = request
         st.session_state["pending_started_at"] = time.perf_counter()
         st.rerun()
@@ -1409,6 +1777,14 @@ def _ask(prompt: str | dict[str, object] | None) -> None:
         }
     content = request["content"]
     model = request.get("model") or st.session_state["model"]
+    # ``text_model`` is the user's original sidebar selection, preserved
+    # so the streaming helper can degrade to it if the vision path
+    # fails. When the user already picked a vision model there is no
+    # separate text preference; in that case we fall back to ``model``
+    # itself (the degrade will still hit the same upstream, but the
+    # helper re-emits it as a text-only payload so the user still
+    # gets a reply).
+    text_model = request.get("text_model") or model
 
     # Build the messages list the engine will see. If "Concise mode" is
     # on, we prepend a short instruction to the system prompt. This is
@@ -1527,23 +1903,90 @@ def _ask(prompt: str | dict[str, object] | None) -> None:
     # ``return`` from the except blocks without reaching the append).
     reply: str = ""
     had_streaming_failure: BaseException | None = None
+    # ``has_image_attachments`` is the *actual* gate for the vision
+    # helper path. ``had_files`` is true for PDFs too (PDFs are
+    # uploaded via the same file picker), but the vision helper exists
+    # to carry image parts in the wire payload — a PDF turn was
+    # already reduced to plain text by ``build_user_turn_content``
+    # and just needs the regular text-streaming path. Without this
+    # gate, a PDF would be sent through the vision helper with the
+    # 90s vision timeout, the user's text model id as the
+    # ``vision_model_id``, and a "Vision call failed" toast for a
+    # turn that never had a vision payload to begin with.
+    has_image_attachments = isinstance(content, list)
     try:
-        if request.get("had_files"):
+        if request.get("had_files") and has_image_attachments:
             # Pinned-model path: bypass the router so the model id is
-            # guaranteed. The OpenRouter client still picks the API
-            # key from the env (or the first slot's key) so we are
-            # not free-loading the user.
-            reply = chat(
-                messages_for_api,
-                model=model,
+            # guaranteed. The streaming helper drives the call via
+            # ``router.stream_chat(model=vision_model_id, timeout=...)``
+            # so the user sees tokens as they arrive (the old blocking
+            # ``chat()`` call left them staring at "Thinking…" for up to
+            # 60 seconds before any text appeared). When the vision
+            # stream fails before producing any delta — the Nemotron VL
+            # cold-start + 504 pattern the user has been hitting — the
+            # helper degrades to a text-only payload on the user's
+            # preferred model so the reply still arrives.
+            #
+            # We pass ``router`` (not the raw client) so the helper
+            # reuses the same slot health state the text path uses; the
+            # ``model=`` pin keeps it on the vision slot for the first
+            # attempt and on the text slot for the degrade. ``timeout``
+            # comes from ``vision_timeout_seconds()`` (currently 90s,
+            # capped at 120s) because the vision model needs more
+            # head-room than the 60s default.
+            _vision_degraded = False
+            _vision_buffer = ""
+            _chunk_iter = stream_vision_turn_with_fallback(
+                router=router,
+                messages=messages_for_api,
+                vision_model_id=model,
+                fallback_model_id=text_model,
+                content=content,
+                files=None,  # file objects are not persisted across the rerun;
+                             # ``degrade_vision_to_text`` accepts ``None`` and
+                             # falls through to text-only with no per-file stubs.
                 temperature=temperature,
                 max_tokens=max_tokens,
+                timeout=vision_timeout_seconds(),
             )
-            # Replace the Thinking… placeholder with the final answer
-            # inline. We do not use ``st.write_stream`` here because
-            # the response is multimodal and we cannot rotate slots
-            # mid-stream; the user waits for the full text and then
-            # sees it appear in one block.
+            try:
+                for _chunk, _source in _chunk_iter:
+                    if _source == "degraded":
+                        # The vision stream failed before yielding any
+                        # delta; the helper is about to emit text chunks
+                        # from the fallback model. Switch the placeholder
+                        # to a one-line notice so the user knows what is
+                        # happening, then keep accumulating the streamed
+                        # text.
+                        _vision_degraded = True
+                        placeholder.markdown(
+                            f'<div class="row left">{label_html}'
+                            f'<div class="bubble-thinking">'
+                            f'<span class="pulse"></span>Vision call '
+                            f'failed — retrying with {text_model}…'
+                            f'</div></div>',
+                            unsafe_allow_html=True,
+                        )
+                        continue
+                    _vision_buffer += _chunk
+                    placeholder.markdown(
+                        f'<div class="row left">{label_html}'
+                        f'<div class="bubble">'
+                        f'{_vision_buffer}▌'
+                        f'</div></div>',
+                        unsafe_allow_html=True,
+                    )
+            except OpenRouterError:
+                # The helper re-raises after either (a) the vision
+                # stream failed *and* the degrade path was not eligible
+                # (auth error, partial reply that we cannot mix, etc.)
+                # or (b) the *text* fallback also failed. In both cases
+                # the outer ``except OpenRouterError`` block below
+                # renders the friendly banner with the correct
+                # attribution; we just keep whatever partial reply the
+                # helper already emitted in ``_vision_buffer``.
+                pass
+            reply = _vision_buffer
             placeholder.empty()
         else:
             # Streaming path: ``st.write_stream`` consumes the router's
@@ -1626,7 +2069,24 @@ def _ask(prompt: str | dict[str, object] | None) -> None:
         st.session_state["last_elapsed"] = None
         if reply:
             st.markdown("---")
-        _render_friendly_error(exc, model)
+        # When the pinned-vision branch was active, name the vision
+        # model explicitly so the user can tell whether the failure
+        # happened on the *vision* call or the *text* degrade. The
+        # helper leaves ``had_streaming_failure`` un-set on its own
+        # re-raise (we suppress it in the inner ``except`` above), so
+        # any ``OpenRouterError`` reaching here either came from the
+        # empty-reply guard or from a model path that does not
+        # degrade (e.g. a corrupted multipart payload).
+        _vision_label = model if request.get("had_files") else None
+        _fallback_attempted = bool(
+            request.get("had_files") and reply
+        )
+        _render_friendly_error(
+            exc,
+            model,
+            vision_model=_vision_label,
+            text_fallback_attempted=_fallback_attempted,
+        )
         had_streaming_failure = exc
         # We intentionally fall through to the cache + history-append
         # block so a partial reply stays in the conversation. The
@@ -1654,6 +2114,29 @@ def _ask(prompt: str | dict[str, object] | None) -> None:
         st.session_state["messages"].append(
             {"role": "assistant", "content": reply}
         )
+        # --- Chat history persistence (assistant, success) --------------
+        # Best-effort — if SQLite is wedged we still want the user to
+        # see the reply. The same warning pattern as pass 1.
+        if (
+            st.session_state.get("db_initialised", False)
+            and st.session_state.get("active_chat_id")
+        ):
+            try:
+                _storage.append_message(
+                    chat_id=st.session_state["active_chat_id"],
+                    role="assistant",
+                    content=reply,
+                )
+            except Exception as exc:  # noqa: BLE001
+                st.session_state.setdefault(
+                    "_db_persist_warning_shown", False
+                )
+                if not st.session_state["_db_persist_warning_shown"]:
+                    st.warning(
+                        f"Could not persist the assistant reply: {exc}",
+                        icon="⚠️",
+                    )
+                    st.session_state["_db_persist_warning_shown"] = True
         # Rerun now: repaint the history loop with the new assistant
         # turn. See comment above the if/elif for why the partial
         # branch below omits this call.
@@ -1663,15 +2146,259 @@ def _ask(prompt: str | dict[str, object] | None) -> None:
         # transcript so the user can see what the model produced
         # before the connection died. Mark it with a trailing note so
         # the next turn can still be understood in context.
+        _partial_content = (
+            f"{reply}\n\n"
+            f"_⚠️ Reply interrupted: {had_streaming_failure}_"
+        )
         st.session_state["messages"].append(
             {
                 "role": "assistant",
-                "content": (
-                    f"{reply}\n\n"
-                    f"_⚠️ Reply interrupted: {had_streaming_failure}_"
-                ),
+                "content": _partial_content,
             }
         )
+        # --- Chat history persistence (assistant, partial) --------------
+        # We persist the same combined string the user sees, so reload
+        # shows the interrupted-turn marker in the same place.
+        if (
+            st.session_state.get("db_initialised", False)
+            and st.session_state.get("active_chat_id")
+        ):
+            try:
+                _storage.append_message(
+                    chat_id=st.session_state["active_chat_id"],
+                    role="assistant",
+                    content=_partial_content,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # The success path already may have surfaced a warning;
+                # swallow the second one silently rather than spamming
+                # the user. The next pass-1 warning still fires if the
+                # user submits another turn and we lose it again.
+                _ = exc
+
+
+# --- Recon (Phase 15) slash-command handler ----------------------------------
+# ``/recon <target> [scope=<token>]`` is a tool turn, not a conversation
+# turn — we short-circuit the LLM path and dispatch straight to the
+# orchestrator. The orchestrator fans out across DNS / URL / IP / WHOIS /
+# crt.sh in parallel, normalises everything, and returns a ReconReport.
+#
+# Three behaviours to preserve:
+#   1. Live progress — the user sees each tool name appear as it
+#      completes (no blank stare at a spinner for 30 s). We use
+#      ``st.status`` as the container and ``st.write`` inside it.
+#   2. Audit log — every request, blocked or successful, lands in the
+#      ``recon_requests`` table via ``storage.log_recon_request``. The
+#      sidebar's "Recent recon" panel reads from the same table.
+#   3. Refusal safety — ``TargetBlockedError`` is raised by the safety
+#      layer for public-internet targets; we catch it, show a clear
+#      refusal, log ``status="blocked"``, and skip the LLM entirely.
+#
+# Recon turns never enter ``st.session_state["messages"]`` — the chat
+# transcript stays clean (chat = conversation, recon = tool).
+def _handle_recon_command(cmd: "parse_recon_command.__class__ | object") -> bool:
+    """Run a ``/recon`` turn and return ``True`` if it was handled.
+
+    The argument is the :class:`ReconCommand` dataclass returned by
+    ``parse_recon_command``. Returning ``True`` tells the input driver
+    to skip the LLM path; ``False`` means the caller should fall through
+    to normal chat dispatch (currently we never return False here, but
+    keeping the signature makes the call site self-documenting).
+    """
+    import time as _time
+
+    target = cmd.target
+    scope_token = cmd.scope_token or "engagement"
+    started_at = _time.perf_counter()
+    # Bind recon turns to the currently-open chat so the audit log and
+    # the persisted transcript share the same chat row. ``create_chat``
+    # returns a uuid4 hex string, and ``append_message`` / ``log_recon_request``
+    # expect the same shape. We coerce defensively so a buggy upstream
+    # that stored an int cannot crash the audit log.
+    _recon_chat_id = st.session_state.get("active_chat_id") or None
+    if not isinstance(_recon_chat_id, str):
+        _recon_chat_id = None
+
+    # Header chip — surfaces the parsed scope so the user can confirm
+    # the engine saw what they typed before any network call goes out.
+    st.markdown(
+        f"""<div class="recon-header">
+            <span class="recon-icon">🔍</span>
+            <span class="recon-target">{target}</span>
+            <span class="recon-scope">scope: {scope_token}</span>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+    # Status container — collapses to a one-line "✅ Recon complete" once
+    # the orchestrator returns. We update the label as each stage fires.
+    #
+    # ``stream_recon`` yields one tuple per tool *as it finishes*, then a
+    # final ``("report", ReconReport)`` sentinel:
+    #
+    #     ("dns", ToolResult)
+    #     ("whois", ToolResult)
+    #     ...
+    #     ("report", ReconReport)
+    #
+    # The first element is the tool name (or the literal string
+    # ``"report"`` for the sentinel); the second element is the result
+    # object — a :class:`ToolResult` dataclass for intermediate stages
+    # and a :class:`ReconReport` for the final sentinel. We log each
+    # tool name into the status box and capture the report on the final
+    # iteration. The previous implementation assumed a dict-shaped
+    # payload (``{"kind": "report", "report": ...}``) and therefore
+    # missed every report — the UI rendered only an empty status box.
+    with st.status("🔍 Recon in progress…", expanded=True) as status_box:
+        final_report = None
+        blocked_message: str | None = None
+        try:
+            for stage_label, payload in stream_recon(
+                target, scope_token=scope_token
+            ):
+                # Final sentinel: ``stage_label == "report"`` and
+                # ``payload`` is the :class:`ReconReport` itself.
+                if stage_label == "report":
+                    final_report = payload
+                    status_box.write("📋 Report ready")
+                else:
+                    # Per-tool stage: pretty-print duration + ok/err.
+                    _ok = getattr(payload, "ok", None)
+                    _ms = getattr(payload, "duration_ms", 0)
+                    _icon = "✅" if _ok else "⚠️"
+                    status_box.write(f"{_icon} {stage_label} · {_ms} ms")
+        except TargetBlockedError as exc:
+            blocked_message = str(exc)
+            status_box.update(
+                label=f"⛔ Blocked: {blocked_message}", state="error"
+            )
+        except Exception as exc:  # noqa: BLE001 — surface anything
+            status_box.update(label=f"❌ Recon failed: {exc}", state="error")
+            _storage.log_recon_request(
+                target=target,
+                tool="orchestrator",
+                scope_token=scope_token,
+                chat_id=_recon_chat_id,
+                status="error",
+                duration_ms=int((_time.perf_counter() - started_at) * 1000),
+                result_excerpt=str(exc)[:500],
+            )
+            st.error(f"Recon failed: {exc}")
+            return True
+
+        if blocked_message is not None:
+            _storage.log_recon_request(
+                target=target,
+                tool="orchestrator",
+                scope_token=scope_token,
+                chat_id=_recon_chat_id,
+                status="blocked",
+                duration_ms=int((_time.perf_counter() - started_at) * 1000),
+                result_excerpt=blocked_message[:500],
+            )
+            st.error(
+                f"Recon refused for **{target}** "
+                f"(scope `{scope_token}`): {blocked_message}"
+            )
+            st.caption(
+                "Allowed scope tokens are: engagement, ctf, lab, labs, "
+                "redteam, personal-lab, bugbounty. "
+                "Production targets require explicit written authorisation."
+            )
+            return True
+
+    if final_report is None:
+        # Orchestrator finished without a report — defensive.
+        st.warning("Recon finished but no report was produced.")
+        _storage.log_recon_request(
+            target=target,
+            tool="orchestrator",
+            scope_token=scope_token,
+            chat_id=_recon_chat_id,
+            status="empty",
+            duration_ms=int((_time.perf_counter() - started_at) * 1000),
+            result_excerpt="orchestrator returned no report",
+        )
+        return True
+
+    duration_ms = int((_time.perf_counter() - started_at) * 1000)
+    _storage.log_recon_request(
+        target=target,
+        tool="orchestrator",
+        scope_token=scope_token,
+        chat_id=_recon_chat_id,
+        status="ok",
+        duration_ms=duration_ms,
+        result_excerpt=render_report_json(final_report)[:500],
+    )
+
+    # Render: Markdown inline for reading, JSON download for export.
+    _report_md = render_report_markdown(final_report)
+    st.markdown(_report_md)
+    st.download_button(
+        label="⬇️ Download report (JSON)",
+        data=render_report_json(final_report),
+        file_name=f"recon_{_safe_filename(target)}.json",
+        mime="application/json",
+        key=f"recon_dl_{hash(target + scope_token) & 0xFFFFFFFF}",
+    )
+
+    # --- Persist the recon turn in the visible chat transcript -------------
+    # A recon turn is two messages: the operator's slash command
+    # (rendered as a user bubble so the audit trail reads as a
+    # conversation) and the report body (rendered as an assistant
+    # bubble so reload shows the same Markdown the user just saw).
+    # We deliberately use ``st.session_state["messages"]`` here so the
+    # bubble above the input re-renders on the next rerun; storage is
+    # the durability layer for when the user closes the tab.
+    _user_recon_turn = (
+        f"/recon {target} scope:{scope_token}"
+    )
+    st.session_state["messages"].append(
+        {"role": "user", "content": _user_recon_turn}
+    )
+    st.session_state["messages"].append(
+        {"role": "assistant", "content": _report_md}
+    )
+    # Best-effort persistence — DB failures never block the recon flow,
+    # they just mean the report won't survive a page reload.
+    if (
+        st.session_state.get("db_initialised", False)
+        and st.session_state.get("active_chat_id")
+    ):
+        try:
+            _storage.append_message(
+                chat_id=st.session_state["active_chat_id"],
+                role="user",
+                content=_user_recon_turn,
+            )
+            _storage.append_message(
+                chat_id=st.session_state["active_chat_id"],
+                role="assistant",
+                content=_report_md,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Match the pattern used by chat-turn persistence: a one-shot
+            # warning so the user knows recon ran but the transcript is
+            # not being saved this session.
+            st.session_state.setdefault(
+                "_db_persist_warning_shown", False
+            )
+            if not st.session_state["_db_persist_warning_shown"]:
+                st.warning(
+                    f"Could not persist the recon transcript: {exc}",
+                    icon="⚠️",
+                )
+                st.session_state["_db_persist_warning_shown"] = True
+    return True
+
+
+def _safe_filename(s: str) -> str:
+    """Make a string safe to use as a filename: alnum + dot/underscore/dash."""
+    out = "".join(
+        c if c.isalnum() or c in "._-" else "_" for c in s.strip()
+    )
+    return out or "target"
 
 
 # --- Two-pass continuation ---------------------------------------------------
@@ -1737,6 +2464,16 @@ if user_chat:
     # dropped.
     uploaded_text = getattr(user_chat, "text", None) or str(user_chat)
     uploaded_files = getattr(user_chat, "files", None) or []
+
+    # --- /recon slash-command interception ----------------------------
+    # ``/recon <target> [scope=<token>]`` is a tool turn, not a
+    # conversation turn. We parse first; if it's a recon turn, dispatch
+    # to the orchestrator and skip the LLM path entirely. Attached
+    # files are ignored on a recon turn (the target is what matters).
+    _recon_cmd = parse_recon_command(uploaded_text)
+    if _recon_cmd is not None:
+        _handle_recon_command(_recon_cmd)
+        st.rerun()
     content = build_user_turn_content(
         uploaded_text,
         uploaded_files,
@@ -1768,10 +2505,19 @@ if user_chat:
         has_images=has_images,
         vision_model_ids=vision_ids,
     )
+    # IMPORTANT: do NOT overwrite ``st.session_state['model']`` with the
+    # auto-swapped vision id. The vision model is the right choice *for
+    # the current turn*, but the user's sidebar preference is the right
+    # choice for every subsequent text-only turn. Without this guard an
+    # earlier image attachment would pin every later PDF/plain-text turn
+    # to the vision slot, where it would fail the same 504/idle-timeout
+    # cycle the image auto-swap was meant to absorb. The toast below is
+    # the only on-screen signal the swap happened; the sidebar dropdown
+    # stays where the user left it.
     if swapped:
-        st.session_state["model"] = effective_model
         st.toast(
-            f"Image attached — switched to {effective_model} for vision.",
+            f"Image attached — using {effective_model} for this turn "
+            f"(sidebar stays on {requested_model}).",
             icon="🖼️",
         )
     # Persist everything _ask() needs in pass 2. Using a dict (not a
@@ -1786,6 +2532,13 @@ if user_chat:
         "text": prompt_text,
         "content": content,
         "model": effective_model,
+        # ``requested_model`` is what the user *picked* in the sidebar. On
+        # an image turn it is usually a text model (e.g. the default
+        # Mistral), which becomes the natural text-only fallback if the
+        # vision call fails. We persist both so the degrade path can
+        # switch back without overwriting the user's choice for the next
+        # turn.
+        "text_model": requested_model,
         "had_files": bool(uploaded_files),
         "signature": hash(signature_src) & 0xFFFFFFFF,
     }

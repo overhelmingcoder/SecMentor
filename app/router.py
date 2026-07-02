@@ -109,8 +109,8 @@ class KeySlot:
     """One (api_key, model_id) pair plus its in-memory health state.
 
     The router owns the health state — ``chat()`` is the only thing
-    that mutates ``disabled`` and ``last_error``. Callers should
-    treat the slot as opaque; they receive the public
+    that mutates ``disabled``, ``cooldown_until``, and ``last_error``.
+    Callers should treat the slot as opaque; they receive the public
     ``api_key_prefix`` and ``model_id`` for logging only.
     """
 
@@ -120,10 +120,32 @@ class KeySlot:
     # for the rest of the session. The router skips disabled slots
     # without burning a round-trip.
     disabled: bool = False
+    # A 429 (or upstream "daily cap reached") sets ``cooldown_until``
+    # to ``monotonic() + cooldown_seconds``; the router treats the
+    # slot as unhealthy until that time. Without this, the same slot
+    # is retried every call and the daily per-account cap stays
+    # exhausted forever from the demo's perspective. The cooldown is
+    # a wall-clock-free monotonic so it survives daylight-saving
+    # changes and clock skew. ``None`` means "no cooldown active".
+    cooldown_until: float | None = None
     # The most recent error from this slot, kept for diagnostics
     # only. Never used to make routing decisions — those decisions
-    # are based on the *class* of the error and the disabled flag.
+    # are based on the *class* of the error, the disabled flag, and
+    # the cooldown timestamp.
     last_error: BaseException | None = field(default=None)
+
+    def is_in_cooldown(self, now: float | None = None) -> bool:
+        """Return True if the slot is currently in a rate-limit cooldown.
+
+        ``cooldown_until`` is a ``time.monotonic()`` value. ``now`` is
+        injectable so tests can pin the wall clock without monkey-
+        patching ``time``. ``False`` when no cooldown is active.
+        """
+        if self.cooldown_until is None:
+            return False
+        import time as _time
+        current = now if now is not None else _time.monotonic()
+        return current < self.cooldown_until
 
     def redacted_key(self) -> str:
         """Return a key string safe to put in logs / error messages.
@@ -182,6 +204,7 @@ class ModelRouter:
         *,
         backoff_seconds: float = 1.0,
         max_attempts: int | None = None,
+        rate_limit_cooldown_seconds: float = 60.0,
         sleep: "callable" = time.sleep,
     ) -> None:
         if not slots:
@@ -210,14 +233,39 @@ class ModelRouter:
         ]
         self._start_index: int = 0
         self._backoff_seconds: float = backoff_seconds
-        self._max_attempts: int = (
-            max_attempts if max_attempts is not None else len(self._slots) * 2
+        # Default 60s cooldown on a 429. OpenRouter's free-tier daily
+        # caps are usually much longer than that, but a short
+        # cooldown gives the *upstream provider* time to release the
+        # per-minute bucket, and it stops the demo from re-hitting
+        # the same exhausted slot on every consecutive user turn.
+        # If the upstream actually sends a longer ``Retry-After`` we
+        # take the max of the two (see ``_backoff_for``).
+        self._rate_limit_cooldown_seconds: float = (
+            rate_limit_cooldown_seconds
         )
+        # Pool-walk cap. With 5 keys x 10 models = 50 slots, a
+        # single bad minute burns the entire pool before the user
+        # sees a useful error. We cap the *per-call* walk to
+        # ``min(max_attempts, 6)`` so a transient outage fails fast
+        # and the remaining healthy slots stay available for the
+        # next call. ``6`` was chosen as "two keys worth" — the
+        # typical fix is to add a new API key, not to wait out a
+        # 6-deep walk.
+        if max_attempts is not None:
+            self._max_attempts: int = max_attempts
+        else:
+            # Cap at 6 so a single chat call can't burn the whole
+            # pool. The full ``len(slots) * 2`` is still respected
+            # when there are few slots.
+            self._max_attempts = min(len(self._slots) * 2, 6)
         self._sleep = sleep
 
         logger.info(
-            "ModelRouter initialised with %d slot(s): %s",
+            "ModelRouter initialised with %d slot(s) (max_attempts=%d, "
+            "rate_limit_cooldown=%.1fs): %s",
             len(self._slots),
+            self._max_attempts,
+            self._rate_limit_cooldown_seconds,
             ", ".join(s.short_label() for s in self._slots),
         )
 
@@ -243,6 +291,7 @@ class ModelRouter:
         *,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        timeout: float | None = None,
     ) -> str:
         """Send ``messages`` to a healthy slot and return the
         assistant's text.
@@ -262,6 +311,15 @@ class ModelRouter:
 
         The caller's ``messages`` list is passed through unchanged;
         the router never inspects or rewrites the content.
+
+        ``timeout`` is forwarded to :func:`openrouter.chat` per slot.
+        The text path uses the module default (30s); the vision path
+        in :mod:`web.chat_helpers` overrides this with a 90s ceiling
+        because NVIDIA's free-tier vision endpoint routinely takes
+        60–90s to produce its first token. Without that override a
+        hung vision call burns all 10 slots before the timeout fires
+        and the user sees ``AllSlotsExhaustedError`` instead of a
+        useful error.
         """
         last_error: BaseException | None = None
         attempts = 0
@@ -298,6 +356,7 @@ class ModelRouter:
                         model=slot.model_id,
                         temperature=temperature,
                         max_tokens=max_tokens,
+                        timeout=timeout,
                         api_key=slot.api_key,
                     )
                 except openrouter.OpenRouterAuthError as exc:
@@ -316,10 +375,13 @@ class ModelRouter:
                     break  # out of the inner retry loop
                 except openrouter.OpenRouterRateLimitError as exc:
                     # 429: transient. Sleep, retry the same slot
-                    # once, then move on if it 429s again.
+                    # once, then move on if it 429s again. Also push
+                    # the slot's cooldown timestamp forward so the
+                    # *next* chat call (not just this one) skips it.
                     slot.last_error = exc
                     last_error = exc
                     sleep_for = self._backoff_for(exc)
+                    self._set_rate_limit_cooldown(slot, exc)
                     logger.info(
                         "Slot %s rate-limited (status=%s); sleeping "
                         "%.2fs before retry",
@@ -400,6 +462,8 @@ class ModelRouter:
         *,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        model: str | None = None,
+        timeout: float | None = None,
     ) -> Iterator[str]:
         """Stream the assistant's reply, rotating across the pool on failure.
 
@@ -408,6 +472,19 @@ class ModelRouter:
         because the response is an open-ended iterator we cannot
         retry "mid-stream" — once we start receiving deltas from a
         slot we commit to it. The rotation policy is therefore:
+
+        ``model`` is an optional pin: when set, only slots whose
+        ``model_id`` matches are considered. This is what the view
+        layer uses for file-bearing turns (vision models, PDF
+        models), where rotating to a different capability mid-stream
+        would corrupt the reply. ``None`` (the default) preserves the
+        original round-robin behaviour across every healthy slot.
+
+        ``timeout`` is forwarded to :func:`openrouter.stream_chat` per
+        slot. The text path uses the module default (30s); the
+        vision path in :mod:`web.chat_helpers` overrides this with a
+        90s ceiling because the only working free vision model is
+        slow to first byte. See :meth:`chat` for the full rationale.
 
         * If the upstream raises **before** yielding any delta
           (auth error, 4xx, 5xx on the first chunk, or a network
@@ -435,7 +512,9 @@ class ModelRouter:
         attempts = 0
         tried_slots: list[str] = []
         start = self._start_index
-        for offset, slot in enumerate(self._iter_healthy_slots_starting_at(start)):
+        for offset, slot in enumerate(
+            self._iter_healthy_slots_starting_at(start, model=model)
+        ):
             attempts += 1
             tried_slots.append(slot.short_label())
             try:
@@ -444,6 +523,7 @@ class ModelRouter:
                     model=slot.model_id,
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    timeout=timeout,
                     api_key=slot.api_key,
                     base_url=None,
                 )
@@ -494,6 +574,12 @@ class ModelRouter:
                 # above is the only thing still holding a
                 # reference.
                 self._start_index = (start + offset + 1) % max(len(self._slots), 1)
+                # When ``model`` pinned us to a single slot, len(self._slots)
+                # is still > 1 but the filtered walk only saw one slot. The
+                # modulo on the full pool still gives a valid cursor; it
+                # simply has no effect when there is exactly one
+                # model-matching slot, which is the entire point of the
+                # pin.
                 self._record_slot_success(slot)
                 return
             except openrouter.OpenRouterError as exc:
@@ -536,10 +622,13 @@ class ModelRouter:
         streaming and non-streaming paths converge on the same slot
         health state. Kept as a small helper because both paths
         need the same three lines and the streaming path is
-        already long.
+        already long. A successful call also clears any active
+        rate-limit cooldown — the upstream accepted the request, so
+        the slot is healthy again.
         """
         slot.last_error = None
         slot.disabled = False
+        slot.cooldown_until = None
 
     def _record_slot_failure(
         self, slot: KeySlot, exc: BaseException
@@ -550,10 +639,44 @@ class ModelRouter:
         it out keeps the streaming and non-streaming call sites in
         sync and gives a single place to extend (e.g. disabling a
         slot after N consecutive 429s) later.
+
+        A ``OpenRouterRateLimitError`` also flips the slot's
+        ``cooldown_until`` timestamp forward by the configured
+        cooldown (or the upstream ``Retry-After`` value, whichever
+        is larger), so the pool walk skips it on the next call
+        instead of burning another 429 round-trip.
         """
         slot.last_error = exc
         if isinstance(exc, openrouter.OpenRouterAuthError):
             slot.disabled = True
+            return
+        if isinstance(exc, openrouter.OpenRouterRateLimitError):
+            self._set_rate_limit_cooldown(slot, exc)
+
+    def _set_rate_limit_cooldown(
+        self,
+        slot: KeySlot,
+        exc: openrouter.OpenRouterRateLimitError,
+    ) -> None:
+        """Push ``slot.cooldown_until`` forward by the cooldown window.
+
+        We use ``time.monotonic()`` rather than wall-clock so the
+        cooldown is immune to DST changes and clock skew. The window
+        is ``max(rate_limit_cooldown_seconds, upstream_retry_after)``,
+        honouring the upstream's hint when it sends one.
+        """
+        window = self._rate_limit_cooldown_seconds
+        upstream_hint = self._backoff_for(exc)
+        if upstream_hint > window:
+            window = upstream_hint
+        slot.cooldown_until = time.monotonic() + window
+        logger.info(
+            "Slot %s rate-limited; cooldown until now+%.1fs "
+            "(upstream hint was %.1fs)",
+            slot.short_label(),
+            window,
+            upstream_hint,
+        )
 
     def _retries_remaining(self, slot: KeySlot, offset: int) -> int:
         """Best-effort estimate of retries left in this slot.
@@ -570,20 +693,39 @@ class ModelRouter:
         return max(0, max_attempts - 1 - (offset * 2))
     # --- Internal helpers ----------------------------------------------
 
-    def _iter_healthy_slots_starting_at(self, start: int) -> Iterator[KeySlot]:
+    def _iter_healthy_slots_starting_at(
+        self, start: int, *, model: str | None = None
+    ) -> Iterator[KeySlot]:
         """Yield each non-disabled slot exactly once, starting at
         ``start`` and wrapping around.
 
-        A fully-disabled pool yields nothing and the call site
-        raises ``AllSlotsExhaustedError`` with the last error it
-        saw (or, if every slot is disabled before any call was
-        made, with no cause at all).
+        When ``model`` is given, only slots whose ``model_id``
+        matches are emitted. This is the pin path used for turns
+        that attached files (vision / PDF models), where rotating
+        to a different capability mid-stream would corrupt the
+        reply. When ``model`` is ``None`` every healthy slot is
+        yielded in round-robin order — the original behaviour.
+
+        Slots currently in a rate-limit cooldown (``is_in_cooldown``
+        returns ``True``) are skipped without burning a round-trip,
+        so the router does not re-hit a slot we already know is
+        exhausted for the next minute.
+
+        A fully-disabled or fully-cooled-down pool yields nothing and
+        the call site raises ``AllSlotsExhaustedError`` with the
+        last error it saw (or, if every slot was already excluded
+        before any call was made, with no cause at all).
         """
         n = len(self._slots)
         for offset in range(n):
             slot = self._slots[(start + offset) % n]
-            if not slot.disabled:
-                yield slot
+            if slot.disabled:
+                continue
+            if slot.is_in_cooldown():
+                continue
+            if model is not None and slot.model_id != model:
+                continue
+            yield slot
 
     def _backoff_for(self, exc: openrouter.OpenRouterRateLimitError) -> float:
         """Pick a sleep duration for a 429.

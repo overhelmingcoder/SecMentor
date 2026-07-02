@@ -6,3 +6,17 @@ streamlit>=1.39.0,<1.50
 # imported lazily inside `app/file_processor.py` so the rest of the
 # engine still starts on systems where pymupdf is not installed.
 pymupdf>=1.24.0
+
+# Phase 12 PR-B (RAG pipeline). All three are lazy-loaded so the rest
+# of the engine still starts when the optional packages are missing:
+#   - numpy is imported at the top of `app/rag_embedder.py` and
+#     `app/rag_store.py` (always available — no graceful-degrade).
+#   - sentence-transformers is wrapped in try/except inside
+#     `app/rag_embedder.py::get_embedder()`; the app falls back to
+#     `MissingEmbedder` when the package is missing or
+#     PUKU_RAG_OFFLINE=1 is set.
+#   - faiss-cpu is wrapped in try/except inside `app/rag_store.py`;
+#     `RagStore.search()` returns [] when the package is missing.
+numpy>=1.26.0
+sentence-transformers>=2.7.0
+faiss-cpu>=1.8.0

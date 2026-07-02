@@ -1,0 +1,29 @@
+[33mcommit cde82c175b2d253fecb0199f4c5af58d1996f12e[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m)[m
+Author: Mahathir <mahathir01925@gmail.com>
+Date:   Sat Jun 20 20:58:06 2026 +0600
+
+    Update changes:added Streaming LLM responses,Copy-to-clipboard on assistant bubble modify router,Conversation export,  openrouter tests, and web components; add test streaming; remove probe files
+
+[33mcommit b549574fa7ade804273fc5d491f1f013fd6a6dd6[m
+Author: Mahathir <mahathir01925@gmail.com>
+Date:   Sat Jun 20 00:02:45 2026 +0600
+
+    docs: add feature_backlog.md with 25 candidates, effort/impact, phase map
+
+[33mcommit dd6b4a95c89ad210528b1cbbcf45695c72507eef[m
+Author: Mahathir <mahathir01925@gmail.com>
+Date:   Tue Jun 16 17:17:49 2026 +0600
+
+    Fix: remove tracked database files and update .gitignore
+
+[33mcommit 7355c15ccd96f2677790fe151afd6d08ac059e73[m
+Author: Mahathir <mahathir01925@gmail.com>
+Date:   Tue Jun 16 17:12:11 2026 +0600
+
+    Add Stage 1 project files
+
+[33mcommit 97d33775e3590fb71f441ce3f9bcc69e0fbe368e[m
+Author: Mahathir <mahathir01925@gmail.com>
+Date:   Tue Jun 16 17:04:37 2026 +0600
+
+    first commit

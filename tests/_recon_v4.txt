@@ -1,0 +1,33 @@
+.................E.E
+======================================================================
+ERROR: test_happy_path_all_tools_ok (tests.test_recon.OrchestratorTests.test_happy_path_all_tools_ok)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\puku projects\stage1\tests\test_recon.py", line 1465, in test_happy_path_all_tools_ok
+    report = run_recon("example.com", scope_token="lab")
+  File "D:\puku projects\stage1\app\recon\orchestrator.py", line 516, in run_recon
+    executor.submit(_resolve_tool(name), safe_host): name
+                    ~~~~~~~~~~~~~^^^^^^
+  File "D:\puku projects\stage1\app\recon\orchestrator.py", line 436, in _resolve_tool
+    return globals()[name]
+           ~~~~~~~~~^^^^^^
+KeyError: 'dns'
+
+======================================================================
+ERROR: test_partial_failure_recorded (tests.test_recon.OrchestratorTests.test_partial_failure_recorded)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\puku projects\stage1\tests\test_recon.py", line 1507, in test_partial_failure_recorded
+    report = run_recon("example.com", scope_token="lab")
+  File "D:\puku projects\stage1\app\recon\orchestrator.py", line 516, in run_recon
+    executor.submit(_resolve_tool(name), safe_host): name
+                    ~~~~~~~~~~~~~^^^^^^
+  File "D:\puku projects\stage1\app\recon\orchestrator.py", line 436, in _resolve_tool
+    return globals()[name]
+           ~~~~~~~~~^^^^^^
+KeyError: 'dns'
+
+----------------------------------------------------------------------
+Ran 20 tests in 1.030s
+
+FAILED (errors=2)

@@ -1,0 +1,74 @@
+test_blocked_target_does_not_call_transports (tests.test_recon.OrchestratorTests.test_blocked_target_does_not_call_transports) ... ERROR
+test_blocked_target_raises (tests.test_recon.OrchestratorTests.test_blocked_target_raises) ... ERROR
+test_empty_scope_token_raises (tests.test_recon.OrchestratorTests.test_empty_scope_token_raises) ... ok
+test_empty_target_raises (tests.test_recon.OrchestratorTests.test_empty_target_raises) ... ok
+test_happy_path_all_tools_ok (tests.test_recon.OrchestratorTests.test_happy_path_all_tools_ok) ... ERROR
+test_invalid_scope_token_raises (tests.test_recon.OrchestratorTests.test_invalid_scope_token_raises) ... ok
+test_partial_failure_recorded (tests.test_recon.OrchestratorTests.test_partial_failure_recorded) ... ERROR
+
+======================================================================
+ERROR: test_blocked_target_does_not_call_transports (tests.test_recon.OrchestratorTests.test_blocked_target_does_not_call_transports)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\puku projects\stage1\tests\test_recon.py", line 1537, in test_blocked_target_does_not_call_transports
+    run_recon("10.0.0.1", scope_token="lab")
+    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\puku projects\stage1\app\recon\orchestrator.py", line 462, in run_recon
+    _assert_scope_token(scope_token)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "D:\puku projects\stage1\app\recon\orchestrator.py", line 171, in _assert_scope_token
+    raise ValueError(
+    ...<2 lines>...
+    )
+ValueError: recon scope_token 'lab' is not in the allow-list (['bugbounty', 'ctf', 'engagement', 'labs', 'personal-lab', 'redteam'])
+
+======================================================================
+ERROR: test_blocked_target_raises (tests.test_recon.OrchestratorTests.test_blocked_target_raises)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\puku projects\stage1\tests\test_recon.py", line 1525, in test_blocked_target_raises
+    run_recon("127.0.0.1", scope_token="lab")
+    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\puku projects\stage1\app\recon\orchestrator.py", line 462, in run_recon
+    _assert_scope_token(scope_token)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "D:\puku projects\stage1\app\recon\orchestrator.py", line 171, in _assert_scope_token
+    raise ValueError(
+    ...<2 lines>...
+    )
+ValueError: recon scope_token 'lab' is not in the allow-list (['bugbounty', 'ctf', 'engagement', 'labs', 'personal-lab', 'redteam'])
+
+======================================================================
+ERROR: test_happy_path_all_tools_ok (tests.test_recon.OrchestratorTests.test_happy_path_all_tools_ok)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\puku projects\stage1\tests\test_recon.py", line 1465, in test_happy_path_all_tools_ok
+    report = run_recon("example.com", scope_token="lab")
+  File "D:\puku projects\stage1\app\recon\orchestrator.py", line 462, in run_recon
+    _assert_scope_token(scope_token)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "D:\puku projects\stage1\app\recon\orchestrator.py", line 171, in _assert_scope_token
+    raise ValueError(
+    ...<2 lines>...
+    )
+ValueError: recon scope_token 'lab' is not in the allow-list (['bugbounty', 'ctf', 'engagement', 'labs', 'personal-lab', 'redteam'])
+
+======================================================================
+ERROR: test_partial_failure_recorded (tests.test_recon.OrchestratorTests.test_partial_failure_recorded)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\puku projects\stage1\tests\test_recon.py", line 1507, in test_partial_failure_recorded
+    report = run_recon("example.com", scope_token="lab")
+  File "D:\puku projects\stage1\app\recon\orchestrator.py", line 462, in run_recon
+    _assert_scope_token(scope_token)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "D:\puku projects\stage1\app\recon\orchestrator.py", line 171, in _assert_scope_token
+    raise ValueError(
+    ...<2 lines>...
+    )
+ValueError: recon scope_token 'lab' is not in the allow-list (['bugbounty', 'ctf', 'engagement', 'labs', 'personal-lab', 'redteam'])
+
+----------------------------------------------------------------------
+Ran 7 tests in 0.011s
+
+FAILED (errors=4)

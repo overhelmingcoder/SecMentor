@@ -1,0 +1,66 @@
+test_dnsresult_ok_property (tests.test_recon.DNSResolveTests.test_dnsresult_ok_property) ... ok
+test_resolve_dedupes_ipv4 (tests.test_recon.DNSResolveTests.test_resolve_dedupes_ipv4) ... FAIL
+test_resolve_empty_raises (tests.test_recon.DNSResolveTests.test_resolve_empty_raises) ... FAIL
+test_resolve_only_ipv4 (tests.test_recon.DNSResolveTests.test_resolve_only_ipv4) ... FAIL
+test_resolve_propagates_gaierror (tests.test_recon.DNSResolveTests.test_resolve_propagates_gaierror) ... FAIL
+test_resolve_returns_ipv4_and_ipv6 (tests.test_recon.DNSResolveTests.test_resolve_returns_ipv4_and_ipv6) ... FAIL
+test_resolve_sorts_ipv4 (tests.test_recon.DNSResolveTests.test_resolve_sorts_ipv4) ... FAIL
+
+======================================================================
+FAIL: test_resolve_dedupes_ipv4 (tests.test_recon.DNSResolveTests.test_resolve_dedupes_ipv4)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\puku projects\stage1\tests\test_recon.py", line 542, in test_resolve_dedupes_ipv4
+    self.assertEqual(result.ipv4, ["1.1.1.1"])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: ('1.1.1.1',) != ['1.1.1.1']
+
+======================================================================
+FAIL: test_resolve_empty_raises (tests.test_recon.DNSResolveTests.test_resolve_empty_raises)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\puku projects\stage1\tests\test_recon.py", line 529, in test_resolve_empty_raises
+    with self.assertRaises(dns_lookup.DNSError):
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+AssertionError: DNSError not raised
+
+======================================================================
+FAIL: test_resolve_only_ipv4 (tests.test_recon.DNSResolveTests.test_resolve_only_ipv4)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\puku projects\stage1\tests\test_recon.py", line 522, in test_resolve_only_ipv4
+    self.assertEqual(result.ipv4, ["8.8.8.8"])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: ('8.8.8.8',) != ['8.8.8.8']
+
+======================================================================
+FAIL: test_resolve_propagates_gaierror (tests.test_recon.DNSResolveTests.test_resolve_propagates_gaierror)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\puku projects\stage1\tests\test_recon.py", line 562, in test_resolve_propagates_gaierror
+    with self.assertRaises(dns_lookup.DNSError):
+         ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+AssertionError: DNSError not raised
+
+======================================================================
+FAIL: test_resolve_returns_ipv4_and_ipv6 (tests.test_recon.DNSResolveTests.test_resolve_returns_ipv4_and_ipv6)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\puku projects\stage1\tests\test_recon.py", line 506, in test_resolve_returns_ipv4_and_ipv6
+    self.assertEqual(result.ipv4, ["93.184.216.34"])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: ('93.184.216.34',) != ['93.184.216.34']
+
+======================================================================
+FAIL: test_resolve_sorts_ipv4 (tests.test_recon.DNSResolveTests.test_resolve_sorts_ipv4)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\puku projects\stage1\tests\test_recon.py", line 554, in test_resolve_sorts_ipv4
+    self.assertEqual(result.ipv4, ["1.1.1.1", "8.8.8.8", "9.9.9.9"])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: ('1.1.1.1', '8.8.8.8', '9.9.9.9') != ['1.1.1.1', '8.8.8.8', '9.9.9.9']
+
+----------------------------------------------------------------------
+Ran 7 tests in 0.011s
+
+FAILED (failures=6)

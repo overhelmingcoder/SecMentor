@@ -24,6 +24,26 @@ positional argument is swallowed silently. Future subcommands (e.g. `cli`,
 
 The script never echoes secret values. It will refuse to start if `.env`
 does not contain a real `OPENROUTER_API_KEY=sk-or-v1-...` value.
+
+What the boot brings online (Phase 12 + PR-E, 2026-06-15, see
+`docs/technical_write_up.md` rows 19-20 and `docs/phase_12_rag_and_history.md`):
+
+- Persistent chat history sidebar (`app/storage.py` six-table SQLite schema,
+  `+ New chat` / rename / two-step soft-delete, sidebar ordering
+  `updated_at DESC`).
+- Per-chat FAISS RAG (`app/rag_store.py:RagStore` — lazy `IndexFlatIP`,
+  `_index_version` invalidation on the `chats` table, score-threshold 0.30,
+  embedder-degraded mode via `PUKU_RAG_OFFLINE=1`, cross-chat isolation
+  pinned by `tests/test_rag.py:CrossChatIsolationTests`).
+- Global security corpus (`app/rag_global.py:GlobalCorpusStore` — second
+  parallel FAISS index, 5 source kinds: OWASP, MITRE ATT&CK, CWE, GTFOBins,
+  Sigma, SHA-256 dedup, scored-then-merge with the per-chat index in
+  `web/chat_helpers.py:build_messages_with_rag`, one-shot CLI at
+  `scripts/ingest_security_corpus.py`).
+- Cumulative test suite: 365 tests (9 pre-existing failures + 1 error + 19
+  environmental skips — all 68 Phase 12 tests are green, see
+  `docs/technical_write_up.md` row 19-20 footers and Decision 12 for the
+  durable design choices).
 """
 
 from __future__ import annotations

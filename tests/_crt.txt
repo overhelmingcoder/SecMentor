@@ -1,0 +1,53 @@
+test_lookup_empty_payload (tests.test_recon.CrtShLookupTests.test_lookup_empty_payload) ... FAIL
+test_lookup_extracts_hosts_and_issuers (tests.test_recon.CrtShLookupTests.test_lookup_extracts_hosts_and_issuers) ... FAIL
+test_lookup_hosts_are_lowercased_and_sorted (tests.test_recon.CrtShLookupTests.test_lookup_hosts_are_lowercased_and_sorted) ... FAIL
+test_lookup_invalid_json_raises (tests.test_recon.CrtShLookupTests.test_lookup_invalid_json_raises) ... ok
+test_lookup_network_error_raises (tests.test_recon.CrtShLookupTests.test_lookup_network_error_raises) ... ok
+test_lookup_skips_none_name_value (tests.test_recon.CrtShLookupTests.test_lookup_skips_none_name_value) ... FAIL
+
+======================================================================
+FAIL: test_lookup_empty_payload (tests.test_recon.CrtShLookupTests.test_lookup_empty_payload)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\puku projects\stage1\tests\test_recon.py", line 1049, in test_lookup_empty_payload
+    self.assertEqual(result.hosts, [])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+AssertionError: () != []
+
+======================================================================
+FAIL: test_lookup_extracts_hosts_and_issuers (tests.test_recon.CrtShLookupTests.test_lookup_extracts_hosts_and_issuers)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\puku projects\stage1\tests\test_recon.py", line 1038, in test_lookup_extracts_hosts_and_issuers
+    self.assertIn("*.example.com", result.hosts)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: '*.example.com' not found in ('example.com', 'www.example.com')
+
+======================================================================
+FAIL: test_lookup_hosts_are_lowercased_and_sorted (tests.test_recon.CrtShLookupTests.test_lookup_hosts_are_lowercased_and_sorted)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\puku projects\stage1\tests\test_recon.py", line 1098, in test_lookup_hosts_are_lowercased_and_sorted
+    self.assertEqual(
+    ~~~~~~~~~~~~~~~~^
+        result.hosts,
+        ^^^^^^^^^^^^^
+        ["a.example.com", "b.example.com", "www.example.com"],
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+AssertionError: ('a.example.com', 'b.example.com', 'www.example.com') != ['a.example.com', 'b.example.com', 'www.example.com']
+
+======================================================================
+FAIL: test_lookup_skips_none_name_value (tests.test_recon.CrtShLookupTests.test_lookup_skips_none_name_value)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\puku projects\stage1\tests\test_recon.py", line 1083, in test_lookup_skips_none_name_value
+    self.assertEqual(result.issuers, ["DigiCert"])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: ('DigiCert',) != ['DigiCert']
+
+----------------------------------------------------------------------
+Ran 6 tests in 1.017s
+
+FAILED (failures=4)

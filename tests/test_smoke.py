@@ -1102,8 +1102,12 @@ class TwoPassPatternTests(unittest.TestCase):
         idx = src.find(anchor)
         self.assertGreater(idx, 0, "success path append not found in source")
         # Look at the next ~200 chars after the append — the rerun
-        # must be there.
-        window = src[idx : idx + 300]
+        # must be there. Window is generous so it can sit after the
+        # persist helper call (which appends the assistant message and
+        # touches the chat for activity sorting). Contract: rerun must
+        # be on the same code path as the append, in the same
+        # indentation block — not 2000 lines later in another function.
+        window = src[idx : idx + 1500]
         self.assertIn(
             "st.rerun()", window,
             "pass-2 success path must call st.rerun() after appending "
@@ -1120,7 +1124,12 @@ class TwoPassPatternTests(unittest.TestCase):
         # block (the one that appends a `cached` value).
         cache_idx = src.find("append(\n            {\"role\": \"assistant\", \"content\": cached}", idx)
         self.assertGreater(cache_idx, 0, "cache-hit append not found in source")
-        window = src[cache_idx : cache_idx + 400]
+        # Window is generous so the rerun can sit after the persist
+        # helper call (which appends a message, touches the chat, and
+        # updates the title if applicable). Contract: rerun must be on
+        # the same code path as the append, in the same indentation
+        # block — not 2000 lines later in another function.
+        window = src[cache_idx : cache_idx + 1500]
         self.assertIn(
             "st.rerun()", window,
             "cache-hit branch must call st.rerun() after appending "
@@ -1612,23 +1621,28 @@ class BuildUserTurnTextTests(unittest.TestCase):
     def test_binary_file_is_summarized_not_inlined(self):
         """A binary attachment (PNG) must NOT have its raw bytes
         inlined — the LLM would see garbage and the prompt would
-        balloon. Instead the header must contain a 'binary, not
-        inlined' marker."""
+        balloon. Instead the header must contain a compact
+        ``[Attached image: …]`` stub. Images are *not* text paths
+        here; they go through the multimodal ``image_url`` channel
+        via :func:`build_user_turn_content`, so the display bubble
+        is allowed to show nothing more than the stub."""
         from web.chat_helpers import build_user_turn_text
 
         png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 200
         fake = self._fake_upload("screenshot.png", "image/png", png_bytes)
         out = build_user_turn_text(None, [fake])
 
-        self.assertIn("[Attached file: screenshot.png (image/png", out)
-        self.assertIn("binary", out.lower())
+        self.assertIn("[Attached image: screenshot.png", out)
         # Raw PNG magic bytes must NOT appear in the prompt
         self.assertNotIn(b"\x89PNG\r\n\x1a\n".decode("latin-1"), out)
 
     def test_multiple_files_are_listed_in_order(self):
         """When the user attaches 3 files, the prompt must list
         them in the order they were attached and prefix with a
-        header that mentions the count."""
+        header that mentions the count. Images are split out
+        before the textual count, so the header reads ``2 files``
+        (a.py + b.log) with the PNG appearing as its own
+        ``[Attached image: …]`` stub."""
         from web.chat_helpers import build_user_turn_text
 
         files = [
@@ -1638,7 +1652,7 @@ class BuildUserTurnTextTests(unittest.TestCase):
         ]
         out = build_user_turn_text("triaging", files)
 
-        self.assertIn("3 files", out)
+        self.assertIn("2 files", out)
         # Order must be preserved (a appears before b before c).
         idx_a = out.index("a.py")
         idx_b = out.index("b.log")
@@ -2575,6 +2589,642 @@ class CopyButtonIframeRendererTests(unittest.TestCase):
         # string, but it should not crash and must produce one iframe.
         self.assertEqual(len(captured), 1)
         self.assertIn("<pre", captured[0]["html"])
+
+
+class SidebarChatsViewTests(unittest.TestCase):
+    """Structural tests for the Phase 12 PR-C chat-history sidebar.
+
+    These tests pin the *shape* of the Streamlit view's chat-history
+    surface so the PR-C contract does not silently drift. The tests
+    follow the same source-parse pattern as
+    :class:`StreamlitViewImportSurfaceTests` (above) so the
+    maintenance burden stays uniform across the suite.
+
+    Concretely, PR-C requires that ``web/streamlit_app.py``:
+
+    * Imports the chat-history functions from ``app.storage`` with
+      the canonical aliases (``_create_chat``, ``_get_chat``,
+      ``_init_db``, ``_list_chats``, ``_load_messages``,
+      ``_soft_delete_chat``). The aliasing exists to keep the storage
+      function names out of the view's top-level namespace *except*
+      where the view explicitly wraps them in helpers like
+      ``_new_chat``.
+    * Defines three top-level helpers — ``_new_chat``,
+      ``_open_chat``, ``_soft_delete_chat`` — that wrap the storage
+      functions and manage the ``active_chat_id`` /
+      ``chats_refresh_key`` session-state slots.
+    * Imports ``_format_chat_timestamp`` from ``web.chat_helpers``
+      (which provides the "just now / 5 min ago / Mon DD" formatting)
+      and uses it in the sidebar list to render the per-row caption.
+    * Wires the sidebar so a "➕  New chat" button calls
+      ``_new_chat``; each row's title button calls ``_open_chat``
+      with the row's chat id; each row's "🗑" button calls
+      ``_soft_delete_chat`` with the row's chat id; and the list
+      itself is fed by ``_list_chats(limit=...)`` (20 per the spec).
+    """
+
+    # ---- Static helpers ------------------------------------------------
+
+    @staticmethod
+    def _view_source() -> str:
+        """Read the Streamlit view source as text.
+
+        Centralised so a future rename / reorganisation only needs
+        one update. Mirrors the convention used by
+        :class:`StreamlitViewImportSurfaceTests`.
+        """
+        with open(_STREAMLIT_VIEW, encoding="utf-8") as fh:
+            return fh.read()
+
+    @staticmethod
+    def _storage_import_block(view_src: str) -> str:
+        """Return the body of the ``from app.storage import (...)`` block.
+
+        Returns an empty string if the block is missing, which the
+        tests treat as a hard failure (an empty body cannot import
+        any names).
+        """
+        match = re.search(
+            r"from\s+app\.storage\s+import\s+\((.*?)\)",
+            view_src,
+            re.DOTALL,
+        )
+        return match.group(1) if match else ""
+
+    @staticmethod
+    def _chat_helpers_import_block(view_src: str) -> str:
+        """Return the body of the ``from web.chat_helpers import (...)`` block.
+
+        Empty string if missing. Used to confirm
+        ``_format_chat_timestamp`` is in the explicit allow-list of
+        names the view is allowed to call directly.
+        """
+        match = re.search(
+            r"from\s+web\.chat_helpers\s+import\s+\((.*?)\)",
+            view_src,
+            re.DOTALL,
+        )
+        return match.group(1) if match else ""
+
+    @staticmethod
+    def _top_level_defs(view_src: str) -> set:
+        """Return the set of top-level ``def`` names in the view.
+
+        Top-level = anchored at start-of-line. This is intentionally
+        strict: PR-C's helpers must be module-level callables (so
+        ``st.button(..., on_click=_new_chat)`` resolves them by name)
+        and not nested inside another function.
+        """
+        return set(re.findall(r"^def\s+(_[a-z][a-z0-9_]*)\s*\(", view_src, re.MULTILINE))
+
+    # ---- Storage-import contract ---------------------------------------
+
+    def test_storage_functions_are_imported_with_canonical_aliases(self) -> None:
+        """The view must import every chat-history storage function.
+
+        The aliases match the names the view uses throughout (and the
+        spec's "convention over configuration" rule that the view
+        only exposes storage functions through its own helpers).
+        """
+        body = self._storage_import_block(self._view_source())
+        self.assertTrue(
+            body,
+            "view is missing the `from app.storage import (...)` block "
+            "required by PR-C",
+        )
+        for alias in (
+            "create_chat as _create_chat",
+            "get_chat as _get_chat",
+            "init_db as _init_db",
+            "list_chats as _list_chats",
+            "load_messages as _load_messages",
+            "soft_delete_chat as _soft_delete_chat",
+        ):
+            self.assertIn(
+                alias,
+                body,
+                f"storage import block must alias `{alias}` — PR-C needs "
+                "all six chat-history functions reachable from the view",
+            )
+
+    # ---- Top-level helper contract -------------------------------------
+
+    def test_three_chat_helpers_are_top_level_defs(self) -> None:
+        """``_new_chat``, ``_open_chat``, ``_soft_delete_chat`` must be top-level.
+
+        They are passed as ``on_click`` callbacks to ``st.button``,
+        which Streamlit resolves by name from the script's module
+        namespace. If any of them is nested inside another function,
+        the button silently no-ops at runtime.
+        """
+        defs = self._top_level_defs(self._view_source())
+        for name in ("_new_chat", "_open_chat", "_soft_delete_chat"):
+            self.assertIn(
+                name,
+                defs,
+                f"`{name}` must be a top-level def in the view so "
+                "`st.button(..., on_click=...)` can resolve it",
+            )
+
+    # ---- chat_helpers import contract ----------------------------------
+
+    def test_format_chat_timestamp_is_imported_from_chat_helpers(self) -> None:
+        """``_format_chat_timestamp`` must be in the chat_helpers import block.
+
+        The view uses it to render the per-row timestamp caption
+        (e.g. "5 min ago"). If the name is missing from the
+        import block, calling it would raise ``NameError`` at the
+        first sidebar render.
+        """
+        body = self._chat_helpers_import_block(self._view_source())
+        self.assertTrue(
+            body,
+            "view is missing the `from web.chat_helpers import (...)` block",
+        )
+        self.assertIn(
+            "_format_chat_timestamp",
+            body,
+            "view must import `_format_chat_timestamp` from "
+            "web.chat_helpers (PR-C sidebar uses it for the per-row "
+            "timestamp caption)",
+        )
+
+    def test_view_references_format_chat_timestamp_in_body(self) -> None:
+        """The view body must actually call ``_format_chat_timestamp``.
+
+        An import without a call site is a dead import — the
+        regression we want to catch is "the import survived but
+        someone refactored the row to a plain ``str(chat)``".
+        """
+        self.assertRegex(
+            self._view_source(),
+            r"_format_chat_timestamp\s*\(",
+            "view body must call `_format_chat_timestamp(...)` somewhere "
+            "(the per-row caption in the sidebar list)",
+        )
+
+    # ---- Sidebar wiring contract ---------------------------------------
+
+    def test_sidebar_has_new_chat_button_wired_to_helper(self) -> None:
+        """The sidebar must contain a "➕  New chat" button calling ``_new_chat``.
+
+        The label and the ``on_click`` callback must both appear in
+        the view. We do not assert they are on the *same* line
+        (Streamlit widgets commonly span lines), only that the
+        literal label and the callback name are both present in the
+        file.
+        """
+        src = self._view_source()
+        self.assertIn(
+            "➕",
+            src,
+            "view must contain a sidebar button labeled with the plus emoji "
+            "(spec: '➕  New chat')",
+        )
+        self.assertIn(
+            "New chat",
+            src,
+            "view must contain a sidebar button labeled 'New chat'",
+        )
+        self.assertIn(
+            "on_click=_new_chat",
+            src,
+            "view must wire the 'New chat' button to `_new_chat` via "
+            "`on_click=_new_chat` (Streamlit requires the callback to be "
+            "passed as a kwarg)",
+        )
+
+    def test_sidebar_recent_list_uses_list_chats_with_limit(self) -> None:
+        """The sidebar must feed the list from ``_list_chats(limit=...)``.
+
+        Per the spec the limit is 20 (a UX choice — anything more
+        makes the scrollable container slow). We assert the *call
+        shape* rather than the literal number so a future
+        refactor that hoists the limit into a named constant
+        still passes.
+        """
+        self.assertRegex(
+            self._view_source(),
+            r"_list_chats\s*\(\s*limit\s*=",
+            "view must call `_list_chats(limit=...)` to populate the "
+            "sidebar recent-chats list (PR-C spec §4)",
+        )
+
+    def test_sidebar_row_delete_button_calls_soft_delete_helper(self) -> None:
+        """Each row's 🗑 button must call ``_soft_delete_chat`` with the row's id.
+
+        The 🗑 emoji is the spec's chosen affordance; the
+        ``on_click=_soft_delete_chat`` wiring is what makes the
+        click actually delete the row.
+        """
+        src = self._view_source()
+        self.assertIn(
+            "🗑",
+            src,
+            "view must contain a row-delete button labeled with the "
+            "trash emoji (spec: '🗑')",
+        )
+        self.assertIn(
+            "on_click=_soft_delete_chat",
+            src,
+            "view must wire the delete button to `_soft_delete_chat` "
+            "via `on_click=_soft_delete_chat`",
+        )
+
+    def test_sidebar_row_title_button_calls_open_chat(self) -> None:
+        """Each row's title button must call ``_open_chat`` with the row's id.
+
+        The title is the clickable surface that loads a past chat
+        into the main pane. Without ``on_click=_open_chat`` the
+        button would do nothing — which is the most likely
+        regression for a refactor that touches the row layout.
+        """
+        self.assertIn(
+            "on_click=_open_chat",
+            self._view_source(),
+            "view must wire the row title button to `_open_chat` via "
+            "`on_click=_open_chat`",
+        )
+
+
+class PersistOnAskTests(unittest.TestCase):
+    """Structural tests for the Phase 12 PR-C turn-persistence wiring.
+
+    The user reported that the chat-history sidebar showed the row
+    ("New chat · 2 hr ago · 🗑") but clicking it never revealed any
+    past messages — and the title never changed from the
+    placeholder. The root cause was that the view's ``_ask``
+    function appended every turn to ``st.session_state["messages"]``
+    but never called the storage layer's ``append_message`` /
+    ``touch_chat`` / ``update_chat_title`` functions, so the DB row
+    stayed empty and the title stayed as the placeholder.
+
+    These tests pin the *structural* fix so the regression cannot
+    silently come back: the view must import the three storage
+    aliases, define the three small persistence helpers, and call
+    them from the right branches of ``_ask``. We deliberately do not
+    spin up a real Streamlit session — the source-parse approach
+    matches the rest of the suite (``SidebarChatsViewTests``,
+    ``StreamlitViewImportSurfaceTests``) and avoids pulling in
+    ``streamlit.testing.v1.AppTest`` just to check that a one-liner
+    call exists.
+
+    Concretely, the PR-C follow-up requires that ``web/streamlit_app.py``:
+
+    * Imports ``append_message as _append_message``,
+      ``touch_chat as _touch_chat`` and
+      ``update_chat_title as _update_chat_title`` from
+      ``app.storage``. The aliases match the names the helpers use.
+    * Defines three top-level helpers — ``_persist_user_turn``,
+      ``_persist_assistant_turn``,
+      ``_persist_assistant_turn_partial`` — that wrap the storage
+      functions and never let a storage exception escape into the
+      ``_ask`` rendering loop.
+    * Calls ``_persist_user_turn`` exactly once inside ``_ask``,
+      after the user message is appended to
+      ``st.session_state["messages"]`` and before the
+      ``st.rerun()`` that triggers pass 2.
+    * Calls ``_persist_assistant_turn`` in both the cache-hit
+      branch (after the cached reply is appended to the
+      transcript) and the streaming success branch (after
+      ``st.write_stream`` returns).
+    * Calls ``_persist_assistant_turn_partial`` in the
+      partial-failure branch (where the trailing
+      "_⚠️ Reply interrupted: …" marker is appended).
+    """
+
+    # ---- Static helpers ------------------------------------------------
+
+    @staticmethod
+    def _view_source() -> str:
+        """Read the Streamlit view source as text.
+
+        Mirrors the convention used by
+        :class:`SidebarChatsViewTests` so the maintenance burden
+        stays uniform across the suite.
+        """
+        with open(_STREAMLIT_VIEW, encoding="utf-8") as fh:
+            return fh.read()
+
+    @staticmethod
+    def _storage_import_block(view_src: str) -> str:
+        """Return the body of the ``from app.storage import (...)`` block.
+
+        Empty string if missing. The tests treat an empty body as
+        a hard failure because no aliases can be imported through
+        an empty parenthesised group.
+        """
+        match = re.search(
+            r"from\s+app\.storage\s+import\s+\((.*?)\)",
+            view_src,
+            re.DOTALL,
+        )
+        return match.group(1) if match else ""
+
+    @staticmethod
+    def _top_level_defs(view_src: str) -> set:
+        """Return the set of top-level ``def`` names in the view.
+
+        Top-level = anchored at start-of-line. Streamlit's
+        ``st.button(..., on_click=...)`` resolves callbacks by
+        name from the module namespace; a nested helper would
+        silently no-op at runtime.
+        """
+        return set(
+            re.findall(r"^def\s+(_[a-z][a-z0-9_]*)\s*\(", view_src, re.MULTILINE)
+        )
+
+    @staticmethod
+    def _call_sites(view_src: str, callee: str) -> list:
+        """Return the line numbers where ``callee(`` appears in the view.
+
+        Filters out the ``def <callee>(...)`` definition line so the
+        list is true *call sites* only. Used to assert the
+        expected number of invocations for each helper.
+        """
+        out = []
+        for i, line in enumerate(view_src.splitlines(), start=1):
+            if callee in line and not line.lstrip().startswith("def "):
+                out.append(i)
+        return out
+
+    @staticmethod
+    def _function_body(view_src: str, name: str) -> str:
+        """Return the body of the top-level ``def <name>(...) -> ...:``.
+
+        Anchors on the *return-type annotation* (``) -> SomeType:``)
+        rather than the bare ``):`` so the lazy match cannot run
+        past the end of the signature when the function has
+        typed parameters and a return annotation. The body is
+        everything between the signature line and the next
+        top-level ``def`` (or end of file).
+
+        Raises ``AssertionError`` if the function is not found —
+        every test using this helper has a clear story for why
+        the function must exist.
+        """
+        # The signature regex requires a return-type annotation,
+        # which every helper in this file has. Anchoring on it
+        # prevents the previous regex (`\(.*?\):`) from
+        # backtracking across the entire file when the function
+        # has no return annotation (then no match is found and
+        # the assert below fires — which is the correct outcome
+        # for a missing helper).
+        pattern = (
+            r"^def\s+" + re.escape(name) + r"\s*\(.*?\)\s*->\s*[^:]+:\s*\n"
+            r"(?P<body>.*?)(?=^def\s+|\Z)"
+        )
+        match = re.search(
+            pattern,
+            view_src,
+            re.MULTILINE | re.DOTALL,
+        )
+        assert match is not None, (
+            f"could not locate top-level `def {name}(...) -> ...:` in the view"
+        )
+        return match.group("body")
+
+    # ---- Storage-import contract ---------------------------------------
+
+    def test_three_persistence_aliases_are_imported(self) -> None:
+        """The view must import the three persistence storage aliases.
+
+        Without these aliases the helpers would raise
+        ``NameError`` on the first user turn, and the chat
+        history would stay empty in the DB even after the user
+        sent a dozen messages.
+        """
+        body = self._storage_import_block(self._view_source())
+        self.assertTrue(
+            body,
+            "view is missing the `from app.storage import (...)` block "
+            "required for persistence",
+        )
+        for alias in (
+            "append_message as _append_message",
+            "touch_chat as _touch_chat",
+            "update_chat_title as _update_chat_title",
+        ):
+            self.assertIn(
+                alias,
+                body,
+                f"storage import block must alias `{alias}` — the "
+                f"persistence helpers in `_ask` call it by this name",
+            )
+
+    # ---- Top-level helper contract -------------------------------------
+
+    def test_three_persist_helpers_are_top_level_defs(self) -> None:
+        """``_persist_user_turn`` / ``_persist_assistant_turn`` /
+        ``_persist_assistant_turn_partial`` must be top-level.
+
+        The user-turn helper is the only one a unit test is
+        likely to monkey-patch; the two assistant-turn helpers
+        are top-level for symmetry and so a future refactor can
+        unit-test the partial-failure branch the same way.
+        """
+        defs = self._top_level_defs(self._view_source())
+        for name in (
+            "_persist_user_turn",
+            "_persist_assistant_turn",
+            "_persist_assistant_turn_partial",
+        ):
+            self.assertIn(
+                name,
+                defs,
+                f"`{name}` must be a top-level def in the view so "
+                "tests can monkey-patch it and so its call sites "
+                "in `_ask` resolve at runtime",
+            )
+
+    # ---- _ask call-site contract ---------------------------------------
+
+    def test_ask_persists_user_turn_exactly_once(self) -> None:
+        """``_ask`` must call ``_persist_user_turn`` exactly once.
+
+        The single call site lives in pass 1 (after the user
+        message is appended to the in-memory list, before
+        ``st.rerun()``). Multiple call sites would mean the
+        user message is appended to the DB twice per turn —
+        visible as a duplicate in the conversation after a
+        reload.
+        """
+        sites = self._call_sites(self._view_source(), "_persist_user_turn(")
+        self.assertEqual(
+            len(sites),
+            1,
+            f"view must call `_persist_user_turn(...)` exactly once "
+            f"(found {len(sites)} call sites at lines {sites})",
+        )
+
+    def test_ask_persists_assistant_turn_in_both_success_branches(self) -> None:
+        """``_ask`` must call ``_persist_assistant_turn`` in the cache-hit
+        branch and the streaming success branch.
+
+        Two call sites total: one after the cached reply is
+        appended (so cache hits also land in the DB), and one
+        after ``st.write_stream`` returns. Missing either one
+        means a turn's assistant reply vanishes after a reload
+        even though it is visible in the current session.
+        """
+        sites = self._call_sites(self._view_source(), "_persist_assistant_turn(")
+        # 2 is the contract: cache-hit + streaming success.
+        self.assertEqual(
+            len(sites),
+            2,
+            f"view must call `_persist_assistant_turn(...)` exactly twice "
+            f"(cache-hit branch + streaming success branch); found {len(sites)} "
+            f"call sites at lines {sites}",
+        )
+
+    def test_ask_persists_partial_assistant_turn(self) -> None:
+        """The partial-failure branch must call the dedicated partial helper.
+
+        Using ``_persist_assistant_turn_partial`` rather than
+        the success helper is what makes the call site
+        self-documenting — the partial helper is allowed to
+        persist the "Reply interrupted" suffix verbatim,
+        whereas the success helper would still work but the
+        call would read as a copy-paste of the success branch.
+        """
+        sites = self._call_sites(
+            self._view_source(), "_persist_assistant_turn_partial("
+        )
+        self.assertEqual(
+            len(sites),
+            1,
+            f"view must call `_persist_assistant_turn_partial(...)` "
+            f"exactly once (partial-failure branch); found {len(sites)} "
+            f"call sites at lines {sites}",
+        )
+
+    # ---- First-turn rename contract ------------------------------------
+
+    def test_first_turn_rename_logic_is_in_helper(self) -> None:
+        """The first-turn auto-rename must live in ``_persist_user_turn``.
+
+        The rename rule ("if the chat's current title is the
+        placeholder ``New chat`` or empty, overwrite it with
+        the truncated user text") is the single piece of
+        business logic that distinguishes a real chat history
+        from a placeholder-only list. Pinning it inside
+        ``_persist_user_turn`` keeps the call sites in
+        ``_ask`` one-liners and ensures the rename fires
+        exactly once per chat.
+        """
+        view_src = self._view_source()
+        # Find the body of `_persist_user_turn` using the helper
+        # that anchors on the return-type annotation, so the
+        # body extraction cannot accidentally span across
+        # subsequent top-level `def`s.
+        body = self._function_body(view_src, "_persist_user_turn")
+        # The body must call _update_chat_title (the rename) and
+        # _touch_chat (the activity bump) and _append_message
+        # (the user-turn persist). The placeholder check
+        # (`"New chat"`) is also pinned to make sure the rule
+        # does not silently broaden to e.g. "any non-empty
+        # title" which would clobber legitimate titles.
+        self.assertIn(
+            "_update_chat_title(",
+            body,
+            "`_persist_user_turn` must call `_update_chat_title(...)` "
+            "to apply the first-turn auto-rename",
+        )
+        self.assertIn(
+            "_touch_chat(",
+            body,
+            "`_persist_user_turn` must call `_touch_chat(...)` to bump "
+            "`updated_at` so the sidebar's 'x min ago' sort reflects "
+            "activity",
+        )
+        self.assertIn(
+            "_append_message(",
+            body,
+            "`_persist_user_turn` must call `_append_message(...)` to "
+            "write the user turn to the DB",
+        )
+        self.assertIn(
+            '"New chat"',
+            body,
+            "`_persist_user_turn` must gate the rename on the current "
+            "title being the placeholder `\"New chat\"` (or empty) so "
+            "later turns do not clobber a user-set title",
+        )
+
+    def test_title_truncation_helper_uses_60_char_cap(self) -> None:
+        """The truncation helper must apply a 60-char cap with an ellipsis.
+
+        The spec says the title is "the first 60 chars of the
+        first user turn". Without the cap a long prompt
+        produces an unreadable sidebar row; without the
+        ellipsis suffix the user has no visual signal that
+        the title was truncated. Both are pinned.
+        """
+        view_src = self._view_source()
+        body = self._function_body(view_src, "_truncate_title")
+        # Pin the cap constant.
+        self.assertIn(
+            "_TITLE_CHAR_CAP",
+            body,
+            "`_truncate_title` must reference `_TITLE_CHAR_CAP` so the "
+            "60-char limit is enforced consistently",
+        )
+        # Pin the cap's value at its definition site.
+        self.assertRegex(
+            view_src,
+            r"_TITLE_CHAR_CAP\s*=\s*60",
+            "the title cap must be exactly 60 chars (spec: 'first 60 "
+            "chars of the first user turn')",
+        )
+        # Pin the ellipsis suffix so the user sees the truncation.
+        self.assertIn(
+            "…",
+            body,
+            "`_truncate_title` must append a horizontal-ellipsis "
+            "(`…`) so truncated titles are visually distinct from "
+            "the full-text titles",
+        )
+
+    # ---- UI-safety contract --------------------------------------------
+
+    def test_persist_helpers_swallow_storage_exceptions(self) -> None:
+        """Each helper must catch storage exceptions so the UI does not
+        crash on a transient DB error.
+
+        Without the try/except, a locked-DB or disk-full error
+        from ``_append_message`` would surface as an
+        unhandled exception inside ``_ask``'s render path,
+        blanking the page on every user turn until the user
+        reloads. The contract is: the in-memory transcript
+        still works, and a ``st.caption`` warning is shown
+        so the regression is visible.
+        """
+        view_src = self._view_source()
+        for name in (
+            "_persist_user_turn",
+            "_persist_assistant_turn",
+            "_persist_assistant_turn_partial",
+        ):
+            body = self._function_body(view_src, name)
+            self.assertIn(
+                "try:",
+                body,
+                f"`{name}` must wrap storage calls in a `try:` block "
+                "so a transient DB error does not break the UI",
+            )
+            self.assertIn(
+                "except",
+                body,
+                f"`{name}` must have an `except` arm that catches the "
+                "storage exception and surfaces a non-blocking warning",
+            )
+            self.assertIn(
+                "st.caption(",
+                body,
+                f"`{name}` must surface the swallowed exception via "
+                "`st.caption(...)` so the user knows the transcript is "
+                "session-state-only this turn",
+            )
 
 
 if __name__ == "__main__":

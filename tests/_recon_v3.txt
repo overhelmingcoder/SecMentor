@@ -1,0 +1,23 @@
+.................F.F
+======================================================================
+FAIL: test_happy_path_all_tools_ok (tests.test_recon.OrchestratorTests.test_happy_path_all_tools_ok)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\puku projects\stage1\tests\test_recon.py", line 1469, in test_happy_path_all_tools_ok
+    self.assertTrue(report.all_ok())
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+AssertionError: False is not true
+
+======================================================================
+FAIL: test_partial_failure_recorded (tests.test_recon.OrchestratorTests.test_partial_failure_recorded)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\puku projects\stage1\tests\test_recon.py", line 1509, in test_partial_failure_recorded
+    self.assertTrue(report.dns.ok)
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^
+AssertionError: False is not true
+
+----------------------------------------------------------------------
+Ran 20 tests in 1.046s
+
+FAILED (failures=2)

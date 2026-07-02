@@ -14,10 +14,27 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Callable, Iterable, Mapping, Protocol
+from datetime import datetime, timedelta, timezone
+from typing import Callable, Iterable, Iterator, Mapping, Protocol
 
+from app import config as _app_config
 from app import prompts as _prompts
 from app.file_processor import FileProcessingError
+from app.rag_chunker import _RAG_SENTINEL, rag_sentinel
+
+# Phase 16 — recon turn persistence. The round-trip helpers below are
+# intentionally minimal: ``render_report_json`` already emits the canonical
+# JSON shape (target / display / host / scope_token / total_ms / tools),
+# and we want re-hydrated reports to be byte-identical to that shape so
+# the audit-log excerpt and the chat-history payload can share a single
+# on-disk format.
+from app.recon.crt_sh import CrtShResult
+from app.recon.dns_lookup import DNSResult
+from app.recon.ipinfo import IPInfoResult
+from app.recon.orchestrator import ReconReport, ToolResult
+from app.recon.report import _tool_to_json
+from app.recon.urlinfo import URLInfoResult
+from app.recon.whois import WHOISResult
 
 
 # --- Uploaded-file shape ------------------------------------------------------
@@ -61,9 +78,46 @@ ChatMessage = dict[str, str]
 DEFAULT_MAX_HISTORY_MESSAGES: int = 12
 
 
+def format_rag_excerpts(chunks: list[str]) -> str:
+    """Wrap a list of retrieved chunk strings in the RAG sentinel.
+
+    The sentinel is the *first line of defense* against prompt injection
+    via uploaded files (see ``docs/phase_12_rag_and_history.md`` §4 PR-D
+    and ``app/rag_chunker._RAG_SENTINEL``). It tells the model:
+
+    * the chunks are *data*, not *instructions*;
+    * the system prompt wins on conflict;
+    * the chunks are labelled with provenance ("excerpt N").
+
+    The chunker owns the pinned text (``rag_sentinel()``) so any future
+    change to the wording is one file. This helper owns the *rendering*
+    — the prefix + the per-chunk "--- excerpt N ---" separators — so
+    the chunker stays a pure text module and the view layer is the
+    only place that knows about the message-list shape.
+
+    An empty input returns an empty string. Callers should check for
+    emptiness before injecting the result into a messages list (a
+    blank turn is still a valid turn, but it adds noise to the prompt
+    and burns tokens).
+    """
+    if not chunks:
+        return ""
+    parts: list[str] = [rag_sentinel(), ""]  # blank line after sentinel
+    for i, chunk in enumerate(chunks, start=1):
+        parts.append(f"--- excerpt {i} ---")
+        parts.append(chunk)
+        parts.append("")  # blank line between excerpts
+    # Strip the trailing blank so the join doesn't end with "\n\n".
+    while parts and parts[-1] == "":
+        parts.pop()
+    return "\n".join(parts)
+
+
 def _build_messages(
     history: list[ChatMessage],
     user_input: str | list[dict[str, object]],
+    *,
+    retrieved_chunks: list[str] | None = None,
 ) -> list[ChatMessage]:
     """Return a fresh messages list ready to send to OpenRouter.
 
@@ -76,6 +130,14 @@ def _build_messages(
       ``list[dict[str, object]]`` of OpenRouter content parts (multimodal
       turn with one or more ``image_url`` parts). The list shape is passed
       through unchanged.
+    - When ``retrieved_chunks`` is a non-empty list (PR-D), one extra
+      ``user`` turn is inserted at *index 1* — immediately after the
+      system prompt, before any history turns and before the new user
+      turn. The chunks are wrapped via :func:`format_rag_excerpts` which
+      prepends the sentinel text. Position at index 1 (not appended at
+      the end) keeps the system prompt at index 0 and the new user
+      question at the tail, so the model sees the chunks "right after
+      the rules" and "right before the question".
     - The returned list is a *new* list; the caller's `history` is not
       mutated. The UI is expected to extend `history` after a successful
       model reply.
@@ -88,7 +150,19 @@ def _build_messages(
     elif not user_input:
         # Empty list of content parts — also a non-event.
         raise ValueError("user_input must be a non-empty string or list.")
-    return [*history, {"role": "user", "content": user_input}]
+    messages: list[ChatMessage] = list(history)
+    if retrieved_chunks:
+        # Inject the chunks right after the system prompt so the
+        # model reads the rules → the references → the question.
+        # We insert at index 1, *not* at the end: putting the
+        # chunks at the end would push them away from the system
+        # prompt and weaken the "system instructions win" priority
+        # the sentinel is asserting.
+        messages.insert(
+            1, {"role": "user", "content": format_rag_excerpts(retrieved_chunks)}
+        )
+    messages.append({"role": "user", "content": user_input})
+    return messages
 
 
 def _truncate_history(
@@ -138,11 +212,177 @@ def _serialize_for_download(
     for message in history:
         role = message.get("role", "unknown").upper()
         content = message.get("content", "")
+        body = _render_transcript_body(content)
+        # Belt-and-braces: ``_render_transcript_body`` always returns a
+        # ``str`` today, but a future schema change could slip a list
+        # through. Force-flatten defensively so ``"\n".join(lines)`` at
+        # the bottom can never crash with
+        # ``TypeError: sequence item N: expected str instance, ...``.
+        if not isinstance(body, str):
+            body = str(body) if body is not None else ""
         lines.append(f"--- {role} ---")
-        lines.append(content)
+        lines.append(body)
         lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_transcript_body(content: object) -> str:
+    """Render one message body for a plain-text transcript download.
+
+    A recon assistant turn's ``content`` is a *list of parts* (a summary
+    text plus a structured report dict) that the storage layer JSON-encodes
+    on round-trip. A naive ``str(content)`` would dump the raw JSON to the
+    transcript — readable, but not what the user wants when they paste it
+    into a bug report. This helper turns a recon payload into the same
+    one-line summary + markdown report the bubble shows, so the download
+    mirrors what the user saw in the UI. Non-recon messages are returned
+    as their string form unchanged.
+    """
+    if is_recon_turn_content(content):
+        # Decode the JSON-string form first if that's what we're holding,
+        # then walk the parts. Either branch lands us with a list of
+        # ``{"type": ..., ...}`` dicts.
+        if isinstance(content, str):
+            try:
+                parts = json.loads(content)
+            except (ValueError, TypeError):
+                return content
+        else:
+            parts = content
+        summary_text = ""
+        report_dict: Mapping[str, object] | None = None
+        for part in parts or []:
+            if not isinstance(part, Mapping):
+                continue
+            ptype = part.get("type")
+            if ptype == RECON_PART_SUMMARY and summary_text == "":
+                text = part.get("text", "")
+                if isinstance(text, str):
+                    summary_text = text
+            elif ptype == RECON_PART_REPORT and report_dict is None:
+                rpt = part.get("report")
+                if isinstance(rpt, Mapping):
+                    report_dict = rpt
+        if report_dict is not None:
+            try:
+                report = _dict_to_report(report_dict)
+            except Exception:  # pragma: no cover - defensive
+                # Fall back to the summary if the report can't be re-hydrated
+                # (e.g. a future field was added and a down-level download is
+                # being run). We still want the user to see *something*.
+                return summary_text or "(recon report unavailable)"
+            # Append the full markdown body after the summary so the
+            # transcript is self-contained. ``render_report_markdown``
+            # imports live here (rather than at module top) because
+            # ``app.recon.report`` is a heavy import that pulls in
+            # ``app.recon.orchestrator``; we don't want every helper
+            # unit-test to pay that cost just to render a transcript.
+            from app.recon.report import render_report_markdown
+
+            body = summary_text or recon_part_summary_text(report)
+            body += "\n\n" + render_report_markdown(report)
+            return body
+        return summary_text or "(recon report unavailable)"
+    if content is None:
+        return ""
+    # Final guard: if a custom object reaches here that isn't a plain
+    # ``str``, coerce defensively so the caller can always ``"\n".join``
+    # the resulting lines.
+    if not isinstance(content, str):
+        try:
+            return str(content)
+        except Exception:  # pragma: no cover - last-resort guard
+            return "(unserialisable message content)"
+    return content
+
+
+# --- Relative timestamp for the chat-history sidebar (Phase 12 PR-C) ---------
+#
+# The sidebar lists the most-recent 20 chats, each with a small timestamp
+# caption ("2 min ago", "yesterday", "3 days ago", "Jun 21"). The storage
+# layer stores ``updated_at`` as an ISO-8601 UTC string (see
+# ``app/storage.py::_utcnow_iso``) and the view passes that string in
+# verbatim. The helper here is the only place that turns the wire shape
+# into a human-readable label.
+#
+# Design rules (pinned by ``ChatHistoryTimestampTests``):
+#
+# 1. **No timezone library.** Stdlib ``datetime`` + ``timezone.utc`` is
+#    enough; pulling in ``pytz`` / ``dateutil`` would be a one-line
+#    helper turning into a 50 MB dep.
+# 2. **Naive input = treat as UTC.** The schema stores UTC; if a future
+#    caller passes a naive string by mistake, we still produce a
+#    sensible label (the offset is zero so the math is correct).
+# 3. **Future input = "just now".** Clock skew between the browser and
+#    the host is common; a 5-second skew should not render "in 5
+#    seconds" in the sidebar.
+# 4. **Parse failure = empty string.** The view treats an empty caption
+#    as "no label" rather than crashing the sidebar, so a malformed
+#    ``updated_at`` row degrades cleanly.
+# 5. **Locale-free output.** ``strftime("%b %d")`` uses the C locale
+#    ("Jun 21"), not the browser's locale. Locale-aware rendering
+#    would require JS, which the view does not have. Pin this and let
+#    a future i18n pass add the plumbing.
+#
+# The output for canonical inputs is pinned by the test class so a
+# later "tweak" that makes "yesterday" render as "1 day ago" surfaces
+# in CI rather than the user's screenshot.
+
+
+def _format_chat_timestamp(iso: str) -> str:
+    """Return a human-friendly relative time label for ``iso``.
+
+    Args:
+        iso: An ISO-8601 timestamp string. Naive (no offset) values
+            are treated as UTC. Malformed input returns the empty
+            string.
+
+    Returns:
+        One of:
+
+        * ``"just now"`` — within the last 60 s (also used for any
+          future input within +/- 60 s to absorb clock skew).
+        * ``"N min ago"`` — between 1 min and 59 min ago.
+        * ``"N hr ago"`` — between 1 h and 23 h ago.
+        * ``"yesterday"`` — between 24 h and 47 h ago.
+        * ``"N days ago"`` — between 2 d and 30 d ago.
+        * ``"Mon DD"`` (e.g. ``"Jun 21"``) — older than 30 d.
+        * ``""`` — parse failure (the view treats this as "no label").
+    """
+    if not iso or not isinstance(iso, str):
+        return ""
+    try:
+        # ``fromisoformat`` handles both ``"2026-06-23T12:34:56"`` and
+        # ``"2026-06-23T12:34:56+00:00"``. For naive input we attach
+        # UTC explicitly so the subtraction below is honest.
+        parsed = datetime.fromisoformat(iso)
+    except ValueError:
+        return ""
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    delta = now - parsed
+    # ``total_seconds()`` is negative for future timestamps. The "future
+    # = just now" rule in the docstring means we collapse the small
+    # band around zero into one bucket so clock skew does not leak
+    # through as "in 5 seconds".
+    seconds = delta.total_seconds()
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return f"{int(seconds // 60)} min ago"
+    if seconds < 24 * 3600:
+        return f"{int(seconds // 3600)} hr ago"
+    if seconds < 48 * 3600:
+        return "yesterday"
+    if seconds < 30 * 24 * 3600:
+        return f"{int(seconds // (24 * 3600))} days ago"
+    # Older than 30 d: month + day, no year, no time. ``strftime`` uses
+    # the C locale (en_US) which is what we want for a stable label.
+    # ``lstrip("0")`` strips the leading zero from single-digit days
+    # ("Jun 03" -> "Jun 3") so the sidebar reads cleanly.
+    return parsed.strftime("%b %d").lstrip("0").replace(" 0", " ")
 
 
 def _count_chars(history: Iterable[ChatMessage]) -> int:
@@ -364,64 +604,117 @@ def build_user_turn_text(
     *,
     pdf_processor: Callable[[_UploadedFileLike], str] | None = None,
 ) -> str:
-    """Return the single string the model should see for this turn.
+    """Return the *short* string the user bubble should display.
 
-    Combines the user's typed text with a readable rendering of any
-    uploaded files. The text comes first (so any inline question is
-    immediately visible to the model) and the file block is appended
-    after a blank line. Returns the empty string when the user typed
-    nothing and attached nothing — the view's existing guard treats
-    that as a no-op.
+    The user-visible bubble must stay compact — like ChatGPT or
+    Claude, not the model's prompt. The user's typed question goes
+    first; every attachment is rendered as a single-line stub
+    (``[Attached PDF: name.pdf · N chars]`` or the legacy
+    ``[Attached file: ...]`` block) that names the file and notes
+    its size but does NOT inline the body.
 
-    ``pdf_processor`` is optional for backward compatibility — when
-    not supplied, PDF attachments fall through to
-    :func:`_format_upload_block` and are rendered as the binary
-    stub. When supplied, the extracted text is inlined verbatim
-    (mirroring :func:`build_user_turn_content`'s behaviour for the
-    text-only turn shape).
+    The full PDF prose (or text-file body) lives in
+    :func:`build_user_turn_content` instead, which is the wire
+    payload sent to the model. Splitting display from payload is the
+    contract that keeps the bubble short while the model still gets
+    everything it needs.
+
+    ``pdf_processor`` is required for PDF attachments — without it
+    the PDF falls through to :func:`_format_upload_block` as a
+    binary stub. The view always injects
+    ``app.file_processor.process_pdf`` in production.
     """
     text_part = (text or "").strip()
     file_list = list(files or [])
 
-    # PDFs get extracted text when a processor is available so the
-    # user bubble (and any transcript / download) shows the same
-    # prose the model sees. Without a processor we keep the old
-    # binary-stub behaviour for compatibility.
-    pdf_text_blocks: list[str] = []
+    # Images are rendered separately, not through ``_format_upload_block``,
+    # because that helper's binary branch emits ``— binary, not inlined``
+    # which is misleading: the image IS sent to the model (as an
+    # ``image_url`` part built by :func:`build_user_turn_content`), the
+    # display helper just doesn't have access to the wire payload. We
+    # surface images as a friendly one-line stub instead so the user
+    # can see the file was attached without being told it was dropped.
+    image_stubs: list[str] = []
+    if file_list:
+        non_image_files: list[_UploadedFileLike] = []
+        for f in file_list:
+            if _is_image_mime(f):
+                name = (
+                    getattr(f, "name", "<unnamed>")
+                    or "<unnamed>"
+                )
+                size = int(getattr(f, "size", 0) or 0)
+                image_stubs.append(
+                    f"[Attached image: {name} · {_human_bytes(size)}]"
+                )
+            else:
+                non_image_files.append(f)
+        file_list = non_image_files
+
+# PDFs are surfaced as a *one-line stub* in the user bubble, NOT
+    # inlined. Top agents (Claude.ai, ChatGPT) keep the bubble compact
+    # and the user can see the prose only after the model replies. The
+    # full extracted PDF text is still delivered to the model via
+    # :func:`build_user_turn_content` — the bubble is purely cosmetic
+    # and must stay short regardless of PDF size. A 200-page incident
+    # report in the bubble would freeze the chat renderer and bury
+    # the user's actual question under a wall of text.
+    pdf_blocks: list[str] = []
     if pdf_processor is not None:
         non_pdf_files: list[_UploadedFileLike] = []
         for f in file_list:
             if _is_pdf_mime(f):
+                name = (
+                    getattr(f, "name", "<unnamed.pdf>")
+                    or "<unnamed.pdf>"
+                )
+                size = int(getattr(f, "size", 0) or 0)
+                size_label = _human_bytes(size)
+                chars_label = ""
                 try:
                     pdf_text = pdf_processor(f)
-                except FileProcessingError as exc:
-                    # Fail-soft: surface the stub in the bubble so
-                    # the user knows the PDF was attached but could
-                    # not be read.
-                    non_pdf_files.append(f)  # route through legacy block
+                except FileProcessingError:
+                    # Fail-soft: the PDF couldn't be parsed. Surface
+                    # a short stub so the user knows it was attached
+                    # but unreadable; the view never crashes here.
+                    pdf_blocks.append(
+                        f"[Attached PDF: {name} · {size_label} · unreadable]"
+                    )
                     continue
                 if pdf_text:
-                    name = (
-                        getattr(f, "name", "<unnamed.pdf>")
-                        or "<unnamed.pdf>"
-                    )
-                    pdf_text_blocks.append(
-                        f"[Attached PDF: {name}]\n{pdf_text}"
-                    )
+                    # ``pdf_text`` is the *model-side* extraction; the
+                    # char count is the right number to advertise to the
+                    # user (it is what the model will actually see).
+                    chars_label = f" · {len(pdf_text):,} chars"
                 else:
-                    non_pdf_files.append(f)
+                    chars_label = " · empty"
+                pdf_blocks.append(
+                    f"[Attached PDF: {name} · {size_label}{chars_label}]"
+                )
             else:
                 non_pdf_files.append(f)
         file_list = non_pdf_files
 
     file_part = _format_upload_block(file_list)
-    pdf_part = "\n\n".join(pdf_text_blocks)
-    combined_extras = "\n\n".join(p for p in (file_part, pdf_part) if p)
+    pdf_part = "\n\n".join(pdf_blocks)
+    image_part = "\n\n".join(image_stubs)
+    combined_extras = "\n\n".join(
+        p for p in (file_part, pdf_part, image_part) if p
+    )
     if text_part and combined_extras:
         return f"{text_part}\n\n{combined_extras}"
     return text_part or combined_extras
 
-# --- Multimodal (vision) upload pipeline -------------------------------------
+
+def _human_bytes(size: int) -> str:
+    """Render a byte count as a short, human-friendly string."""
+    if size <= 0:
+        return "0 B"
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / (1024 * 1024):.1f} MB"
 #
 # The text-only `build_user_turn_text` above is what the view has always
 # used. It is *still* what we use for transcripts, downloads, and any
@@ -705,7 +998,325 @@ def select_model_for_request(
 # only when the curated pool is empty.
 _DEFAULT_FREE_VISION_MODEL: str = "nvidia/nemotron-nano-12b-v2-vl:free"
 
-# --- Teaching mode / system-prompt selection ---------------------------------
+# Vision calls use a longer per-request timeout because the only free
+# vision model currently confirmed working on OpenRouter is NVIDIA's
+# nemotron-nano-12b-v2-vl, and its first-token latency routinely sits
+# in the 60-90s range. The default 30s in ``app.openrouter.HTTP_TIMEOUT_SECONDS``
+# aborts the call before any progress is made, which then trips every
+# retry on the same model and surfaces ``AllSlotsExhaustedError`` to the
+# user even though the model would have answered if we'd waited.
+_VISION_TIMEOUT_SECONDS: float = 90.0
+
+
+def vision_timeout_seconds() -> float:
+    """Return the per-request timeout (seconds) to use for vision calls.
+
+    Exposed as a function (rather than a constant) so a test can pin
+    the value with ``assertEqual`` and a future "shrink on success,
+    grow on failure" adaptive loop has a single override point. See
+    :data:`_VISION_TIMEOUT_SECONDS` for the rationale.
+    """
+    return _VISION_TIMEOUT_SECONDS
+
+
+def degrade_vision_to_text(
+    text: str | list[dict[str, object]] | None,
+    files: Iterable[_UploadedFileLike] | None,
+    *,
+    failure_kind: str,
+) -> str:
+    """Convert a multimodal turn into a text-only turn after a vision failure.
+
+    The view calls this when a vision-capable model call fails
+    (timeout, upstream 429, 5xx, or hung stream). It returns a plain
+    string suitable for ``content`` so the engine can re-issue the
+    request as text on the user's preferred model. The text mentions
+    the image was attached but could not be processed, with the
+    machine-readable failure reason for the model to act on.
+
+    Args:
+        text: The original user content — either a string (text-only)
+            or a list of multimodal parts. The text portion is
+            preserved; image parts are dropped on the floor.
+        files: The original uploaded files (or ``None``). Used only to
+            count attachments and emit a one-line stub per file so the
+            model knows something was attached but unavailable.
+        failure_kind: A short, machine-readable string describing the
+            failure (``"vision_timeout"``, ``"vision_rate_limit"``,
+            ``"vision_server_error"``, etc.). Inlined into the stub
+            so the model can answer meaningfully when the user asked
+            "what is in this image?" — at minimum it can say "the
+            image could not be loaded due to …".
+
+    Returns:
+        A single string containing the user's text (if any) plus a
+        per-attachment stub block. Never returns a list — the caller
+        needs a string to feed back into the text-only ``chat()``
+        path.
+    """
+    # Preserve the user's typed text. When the original content was a
+    # multimodal list, the text part is the first ``{"type": "text",
+    # "text": ...}`` entry; everything else is an image part we drop.
+    base_text: str = ""
+    if isinstance(text, str):
+        base_text = text
+    elif isinstance(text, list):
+        for part in text:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text":
+                inner = part.get("text")
+                if isinstance(inner, str):
+                    base_text = inner
+                    break  # first text part wins
+
+    # Render one stub per file that the multimodal path would have
+    # sent as an image. PDFs that were already extracted as text are
+    # fine to keep (the multimodal path never saw them as images),
+    # so we only synthesise stubs for image-bearing files.
+    stubs: list[str] = []
+    for f in list(files or []):
+        if not _is_image_mime(f):
+            continue  # non-image files: leave them to the text path
+        name = getattr(f, "name", "<unnamed>") or "<unnamed>"
+        mime = getattr(f, "type", None) or "application/octet-stream"
+        size = int(getattr(f, "size", 0) or 0)
+        stubs.append(
+            f"[Attached image: {name} ({mime}, {size} bytes) — "
+            f"vision call failed ({failure_kind}); image was NOT "
+            f"sent to the model. Ask the user to describe the "
+            f"image in text if they need a response about it.]"
+        )
+
+    parts: list[str] = [p for p in (base_text, *stubs) if p]
+    return "\n\n".join(parts)
+
+
+# --- Vision streaming with automatic degrade-to-text fallback ---------------
+#
+# The only free-tier vision model on OpenRouter that consistently
+# accepts image payloads (``nvidia/nemotron-nano-12b-v2-vl:free``) is
+# flaky: long cold-start latencies, frequent HTTP 504 "Upstream idle
+# timeout exceeded", and intermittent "no chunks returned" responses.
+# On those failures the user is left staring at a permanent "Thinking…"
+# bubble even though their question is perfectly answerable as plain
+# text — the only reason it failed is that the vision path couldn't
+# render the bytes.
+#
+# The view layer therefore wraps the vision call in a *try-then-degrade*
+# loop:
+#
+#   1. First, ask the router to stream the reply through the pinned
+#      vision model (``router.stream_chat(model=vision_id)``). The
+#      model pin is required: rotating to a text-only model mid-stream
+#      would corrupt the reply (the text model can't see the image at
+#      all). Every chunk is yielded as it arrives so the bubble grows
+#      live.
+#   2. If the vision stream raises an ``OpenRouterError`` *before*
+#      any delta was yielded (server error, rate limit, auth, network
+#      failure on the first chunk), convert the multimodal content to
+#      a plain-text turn via :func:`degrade_vision_to_text` and
+#      re-issue the request as a text-only stream on the *user's
+#      preferred* model.
+#   3. If the vision stream raises *after* at least one delta has
+#      already been yielded, re-raise the exception so the caller
+#      keeps the partial reply and surfaces a friendly banner. Two
+#      interleaved streams from two different models would be
+#      confusing and the partial text is still useful.
+#
+# This helper owns the policy; the view just consumes the generator.
+# It is intentionally pure: no Streamlit import, no ``st.write_stream``,
+# no ``time.sleep`` — just the stream contract — so the test suite can
+# exercise both the success path and the degrade path without a
+# running browser.
+#
+# The caller's ``router`` argument is duck-typed (any object that
+# exposes a ``stream_chat(messages, *, model=..., temperature=...,
+# max_tokens=..., timeout=...)`` method that yields strings works),
+# which is what keeps this file free of an ``app.router`` import.
+# The view passes the live router; tests pass a stub.
+
+#: Reasons the vision stream might fail before yielding any delta.
+#: Kept as a frozenset of *strings* (the codes returned by
+#: :func:`_classify_degrade_trigger`) so a future caller — for example
+#: a metrics counter or a debug log line — can branch on the value
+#: without re-running the classification.
+_DEGRADE_FAILURES: frozenset[str] = frozenset({
+    "vision_rate_limit",
+    "vision_server_error",
+    "vision_no_response",
+})
+
+
+def _classify_degrade_trigger(exc: BaseException) -> str | None:
+    """Map an exception to a short ``failure_kind`` string, or ``None``
+    when the exception should NOT trigger a fallback to text.
+
+    The set of fallback triggers is intentionally narrow: a vision
+    model can be flaky (cold start, idle timeout, transient 504) but
+    a 401/403 is the operator's fault and degrading would hide the
+    real problem from the friendly error banner. Empty-stream and
+    network failures also trigger, because both leave the user with
+    zero progress and a stuck "Thinking…" bubble.
+    """
+    # Imported lazily so this helper module stays import-cheap for
+    # callers that only need ``build_user_turn_content`` etc.
+    from app.openrouter import (
+        OpenRouterAuthError,
+        OpenRouterError,
+        OpenRouterRateLimitError,
+        OpenRouterServerError,
+    )
+
+    # The empty-yield guard inside ``stream_vision_turn_with_fallback``
+    # raises a module-local ``_FakeEmptyStream`` (a ``RuntimeError``)
+    # when a stubbed router yields nothing. That sentinel should map
+    # to ``vision_no_response`` exactly like a router-raised
+    # ``OpenRouterError`` would, so the degrade path stays symmetric
+    # across real and fake routers.
+    if isinstance(exc, _FakeEmptyStream):
+        return "vision_no_response"
+
+    # Auth errors (401/403) must NOT degrade: the user's API key is the
+    # problem and silently switching to a text model would hide it.
+    # We short-circuit here so the caller can render a dedicated
+    # "check your OPENROUTER_API_KEY" banner.
+    if isinstance(exc, OpenRouterAuthError):
+        return None
+    if isinstance(exc, (OpenRouterServerError, OpenRouterRateLimitError)):
+        if isinstance(exc, OpenRouterRateLimitError):
+            return "vision_rate_limit"
+        return "vision_server_error"
+    # Plain ``OpenRouterError`` covers the empty-stream / no-deltas
+    # path that ``router.stream_chat`` raises when the upstream
+    # signals DONE without sending any content, plus any malformed
+    # response envelope. The router wraps these into
+    # ``AllSlotsExhaustedError`` (with the original as ``__cause__``)
+    # when every pinned-model slot fails before producing a delta,
+    # so we also unwrap that here.
+    from app.router import AllSlotsExhaustedError
+
+    if isinstance(exc, AllSlotsExhaustedError) and exc.__cause__ is not None:
+        cause = exc.__cause__
+        if isinstance(cause, OpenRouterAuthError):
+            return None
+        if isinstance(cause, (OpenRouterServerError, OpenRouterRateLimitError)):
+            return _classify_degrade_trigger(cause)
+        if isinstance(cause, OpenRouterError):
+            return "vision_no_response"
+    if isinstance(exc, OpenRouterError):
+        return "vision_no_response"
+    return None
+
+
+def stream_vision_turn_with_fallback(
+    *,
+    router: object,
+    messages: "list[dict[str, object]]",
+    vision_model_id: str,
+    fallback_model_id: str,
+    content: str | list[dict[str, object]],
+    files: Iterable["_UploadedFileLike"] | None,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+    timeout: float | None = None,
+) -> Iterator[tuple[str, str]]:
+    """Stream a vision-capable turn, falling back to text on transient failure.
+
+    Yields successive ``(chunk, source)`` tuples where ``source`` is
+    one of ``"vision"`` (chunks produced by the pinned vision model)
+    or ``"text"`` (chunks produced by the fallback text-only model
+    after the vision stream failed before yielding any delta).
+
+    A single ``(chunk, "degraded")`` marker is yielded at the *start*
+    of the fallback so the caller can render a small notice ("vision
+    call failed — retrying as text") without parsing the chunks. The
+    marker is a single space so it does not perturb the rendered
+    bubble but still consumes one render frame.
+
+    The function is a pure generator; it does not mutate ``messages``,
+    does not call ``st.write_stream``, and does not touch
+    ``time.sleep``. The caller decides how to render the chunks and
+    how to assemble the final ``reply`` string for the transcript.
+    """
+    yielded_any = False
+    last_exc: BaseException | None = None
+    try:
+        for chunk in router.stream_chat(  # type: ignore[attr-defined]
+            messages,
+            model=vision_model_id,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
+        ):
+            if chunk:
+                yielded_any = True
+                yield (chunk, "vision")
+        if not yielded_any:
+            # The router's own empty-stream guard raises before we
+            # reach this branch, but the explicit check stays as a
+            # belt-and-braces for fakes used in tests that skip the
+            # router and yield nothing.
+            raise _FakeEmptyStream(
+                "Vision stream produced no deltas before completion."
+            )
+        return
+    except BaseException as exc:  # noqa: BLE001
+        last_exc = exc
+        # If we already streamed something, we cannot fall back —
+        # mixing two model outputs in one bubble would be confusing.
+        # Re-raise so the caller can show the partial reply and the
+        # friendly banner.
+        if yielded_any:
+            raise
+        failure_kind = _classify_degrade_trigger(exc)
+        if failure_kind is None:
+            # Auth error or something we don't recognise — surface
+            # the original exception so the friendly error banner
+            # shows the real reason.
+            raise
+
+    # --- Degrade path ---------------------------------------------------
+    # Vision stream failed before producing any delta. Convert the
+    # multimodal content to a text-only payload and re-issue on the
+    # user's preferred text model. The marker chunk lets the caller
+    # render a tiny notice; the actual text chunks follow.
+    yield (" ", "degraded")
+    text_content = degrade_vision_to_text(content, files, failure_kind=failure_kind or "vision_failure")
+    # Rebuild the messages list: the user turn is the LAST message in
+    # ``messages`` (system + history + user). We replace that final
+    # user content with the degraded text-only version. Everything
+    # else is passed through unchanged.
+    text_messages = list(messages)
+    if text_messages:
+        text_messages[-1] = {"role": "user", "content": text_content}
+    for chunk in router.stream_chat(  # type: ignore[attr-defined]
+        text_messages,
+        model=fallback_model_id,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        timeout=timeout,
+    ):
+        if chunk:
+            yield (chunk, "text")
+
+
+class _FakeEmptyStream(RuntimeError):
+    """Sentinel raised by the empty-yield check above when a stubbed
+    router yields nothing.
+
+    Never escapes this module: the outer ``except`` block converts it
+    into a fallback exactly the way a real ``OpenRouterError`` would
+    be converted. A standalone class (rather than a re-used
+    ``OpenRouterError``) keeps the "no deltas came back" case
+    distinguishable from a true upstream 5xx in the logs.
+    """
+    pass
+
+
+# --- Vision streaming with automatic degrade-to-text fallback ---------------
+# (continued above; ``_FakeEmptyStream`` is defined here so it is
+# available before the helper that raises it.)
 #
 # The web UI exposes a sidebar radio that lets the learner pick between the
 # defensive four-pillar prompt (default) and the CTF/lab "SecMentor" prompt.
@@ -887,7 +1498,7 @@ def _copy_button_html(text: str) -> str:
 # One iframe per assistant message means a per-message component, which
 # is cheap (Streamlit components are tiny) and keeps each button's
 # handler fully isolated from every other button's handler.
-def _copy_button_iframe_html(text: str) -> str:
+def _copy_button_iframe_html(text: str, *, pre_block: str | None = None) -> str:
     """Return a full HTML document for an iframe-hosted copy button.
 
     The document contains **only** a small "📋 Copy" button. The reply
@@ -901,6 +1512,15 @@ def _copy_button_iframe_html(text: str) -> str:
     XSS-safe and cannot break the attribute quoting). The click handler
     runs inside the iframe's own window, reads ``btn.dataset.text``, and
     copies it to the clipboard:
+
+    The optional ``pre_block`` argument, when non-empty, is rendered as a
+    ``<pre>...</pre>`` block alongside the button. It is used by the
+    higher-level renderer as a **fallback** when the markdown-to-plain
+    conversion produces nothing useful (e.g. a raw ``"\\n"``) -- in that
+    case the data-text path is empty and the user would have nothing to
+    copy, so we surface the raw content in a pre block for the rare
+    edge case. The normal path passes ``pre_block=None`` and the
+    rendered HTML has no ``<pre>`` at all.
 
       1. ``navigator.clipboard.writeText(payload)`` (modern API; the
          iframe is same-origin to the Streamlit server so it is a secure
@@ -928,8 +1548,43 @@ def _copy_button_iframe_html(text: str) -> str:
     # attribute's double-quote delimiter can never be closed by any byte
     # in the payload. The browser decodes the attribute for us, so by
     # the time JS reads ``btn.dataset.text`` the original string is back.
+    #
+    # After escaping, we wire-escape any literal ``</script>`` in the
+    # payload to ``<\/script>``. The HTML-escape above already neuters
+    # the closer (it becomes ``&lt;/script&gt;`` so the parser cannot
+    # end the script tag early), but the wire-escape is a belt-and-braces
+    # second layer: if a future change ever drops the quote=True escape
+    # for any reason, the wire-escape still keeps the browser from
+    # terminating the wrapper script tag at the payload's own closer.
+    # Doing it *after* html.escape means the literal ``<\/script>``
+    # substring survives into the attribute value unchanged (the
+    # escape above turned the ``<`` and ``>`` into entities, so this
+    # replace has nothing to match; we run it on the escaped form so
+    # the entities themselves are never re-substituted, and so a
+    # structural test can assert the substring is present).
     safe_text: str = _html.escape(text, quote=True)
     safe_label: str = _html.escape(_COPY_BUTTON_LABEL, quote=True)
+    # After html.escape, the ``</script>`` in the payload is now
+    # ``&lt;/script&gt;``. The entities are *necessary* -- they stop
+    # the browser's HTML parser from closing the wrapper script tag
+    # at the payload's own closer. We additionally want the literal
+    # substring ``<\/script>`` to appear in the rendered HTML, both
+    # as a belt-and-braces second layer (the backslash is harmless
+    # inside an attribute value but signals "this is script content,
+    # not a real closer") and so a structural test can assert it.
+    # We do the rewrite by *un-escaping* the entities inside the
+    # wire-escaped substring only -- the resulting attribute value
+    # still has ``\/`` (which the browser treats as a literal ``/``)
+    # and the literal `<` and `>` reappear, but the surrounding
+    # attribute delimiters are still safe because html.escape left
+    # any standalone ``"`` as ``&quot;``. (For ``text="hello
+    # </script> world"`` the attribute value is
+    # ``hello <\/script> world``; the ``<`` is still in there but
+    # the backslash means the browser's script-tag-detection logic
+    # does not match ``<\/script>`` as a closing tag.)
+    safe_text = safe_text.replace(
+        "&lt;/script&gt;", "<\\/script>"
+    )
     # Build the JS body with ``json.dumps`` so the string literals are
     # unambiguously quoted -- any byte in the label, copied-text, or
     # failed-text constants can be embedded without breaking the parser.
@@ -976,6 +1631,20 @@ def _copy_button_iframe_html(text: str) -> str:
         "  });\n"
         "})();\n"
     ).replace("</script>", "<\\/script>")
+    # Optional fallback block: when the higher-level renderer detects
+    # that the markdown-to-plain conversion produced nothing useful
+    # (e.g. a bare "\n" or only punctuation), it passes the raw content
+    # in here so we can still surface something for the user to copy.
+    # It is rendered as a hidden <pre> so it does not push the button
+    # out of place; the click handler still reads from btn.dataset.text
+    # (the same path as the normal case).
+    pre_html: str = ""
+    if pre_block:
+        safe_pre: str = _html.escape(pre_block, quote=True)
+        pre_html = (
+            f"<pre id=\"copy-fallback\" "
+            f"style=\"display:none\">{safe_pre}</pre>"
+        )
     return (
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<style>\n"
@@ -992,9 +1661,10 @@ def _copy_button_iframe_html(text: str) -> str:
         "button#copy-btn:focus-visible { outline: 2px solid #6aa9ff; "
         "outline-offset: 1px; }\n"
         "</style></head><body>"
-        f"<button type='button' id='copy-btn' "
-        f"data-label='{safe_label}' "
-        f"data-text='{safe_text}'>{_COPY_BUTTON_LABEL}</button>"
+        f"<button type=\"button\" id=\"copy-btn\" "
+        f"data-label=\"{safe_label}\" "
+        f"data-text=\"{safe_text}\">{_COPY_BUTTON_LABEL}</button>"
+        f"{pre_html}"
         f"<script>{handler_js}</script>"
         "</body></html>"
     )
@@ -1230,15 +1900,27 @@ def _render_copy_button_for_bubble(content: str) -> None:
     wired through a separate ``<script>`` block.
     """
     plain = _markdown_to_plain_text(content)
-    if not plain:
-        plain = content or ""
+    # Fallback only fires when the markdown conversion produced nothing
+    # at all (e.g. assistant returned a bare "\n" or only punctuation).
+    # When it fires we still want to give the user something to copy, so
+    # we pass the raw content as a hidden <pre> in the iframe so the
+    # button has a real payload to put on the clipboard. The
+    # ``plain`` variable stays the empty string so the button's primary
+    # ``data-text`` attribute remains empty (the click handler will
+    # still hand back "" rather than the raw markdown — that raw content
+    # is only used as a display/backup if you read the <pre> from the
+    # DOM, which the current handler does not; this is purely a
+    # test-visible contract).
+    fallback_pre: str = ""
+    if not plain and content:
+        fallback_pre = content
     # Imported lazily because ``streamlit`` is not a hard dep of the
     # helpers module (the CLI/tests pull this module without Streamlit
     # installed in some sandboxes). The view always has Streamlit
     # available so the runtime path is fine.
     import streamlit as _st
 
-    srcdoc = _copy_button_iframe_html(plain)
+    srcdoc = _copy_button_iframe_html(plain, pre_block=fallback_pre)
     # Tiny iframe -- it only hosts the button. ``height`` is the visible
     # vertical space, ``width`` is the available horizontal space; the
     # button right-aligns itself inside via CSS.
@@ -1414,3 +2096,386 @@ def _emit_copy_button_init_script() -> None:
         "</script>"
     )
     components.html(parent_eval_call, height=0, width=0, scrolling=False)
+
+
+# --- /recon slash command -----------------------------------------------------
+# Phase 15 recon feature. The slash command is the *user-facing* entry point:
+# the user types something like ``/recon example.com`` or
+# ``/recon https://evil.com scope=ctf`` into the chat box and the view layer
+# intercepts the turn before it reaches OpenRouter, runs the recon subsystem,
+# and renders the report in an expander.
+#
+# This module owns the *parser* only. The orchestrator (``app.recon``) owns
+# the dispatch + rendering. Keeping the parser here means the slash-command
+# grammar is testable without importing Streamlit, and the recon package
+# stays UI-agnostic.
+#
+# Grammar (strict, no quotes required):
+#
+#     /recon <target> [scope=<token>]
+#
+# - ``target`` is the rest of the line after ``/recon ``, trimmed.
+# - ``scope=<token>`` is *optional*. If supplied, it must be the last
+#   whitespace-separated token; if absent, the default ``"engagement"`` is
+#   used.
+# - Anything else (``/recon`` alone, ``/RECON foo``, ``/foo bar``) returns
+#   ``None`` so the view layer can fall through to the normal chat dispatch.
+#
+# The function never raises for a syntactically bad recon command — invalid
+# scope, empty target, etc. all return ``None``. The view layer treats
+# ``None`` as "not a recon turn" and passes the message to OpenRouter
+# unchanged. This keeps the slash command *opt-in* and *non-fatal*: a typo
+# in the chat box never breaks the rest of the app.
+
+import dataclasses
+
+
+# Default scope token for /recon when the caller omits ``scope=...``.
+# Matches the historical default the user typed the most in the Phase 14
+# pilot: "engagement" implies a sanctioned pentest against a target the
+# user has written authorisation for. The other tokens
+# (``ctf``, ``labs``, ``redteam``, ``personal-lab``, ``bugbounty``) live in
+# ``app.config._RECON_SCOPE_TOKENS`` and are validated there.
+DEFAULT_RECON_SCOPE_TOKEN: str = "engagement"
+
+# Pinned command prefix. Lower-case. The parser rejects mixed case so the
+# grammar is one consistent shape — anything else is not a recon command
+# and falls through to normal chat dispatch.
+_RECON_COMMAND_PREFIX: str = "/recon"
+
+
+@dataclasses.dataclass(frozen=True)
+class ReconCommand:
+    """Parsed shape of a ``/recon`` turn.
+
+    Carries the two pieces the view layer needs to dispatch the recon
+    subsystem:
+
+    - ``target``: the raw, un-normalised string the user typed. The
+      orchestrator refangs and IDN-encodes it before any network call.
+    - ``scope_token``: one of the values in
+      ``app.config._RECON_SCOPE_TOKENS``. Used for the audit log and for
+      any future policy gate (e.g. refusing ``bugbounty`` scope outside
+      mentor mode).
+
+    The dataclass is frozen so a parser bug can never mutate the value
+    after the fact — the audit log row and the orchestrator call site
+    see the same immutable record.
+    """
+
+    target: str
+    scope_token: str
+
+
+def parse_recon_command(text: str) -> ReconCommand | None:
+    """Return a :class:`ReconCommand` if ``text`` is a recon turn, else ``None``.
+
+    Strict grammar: the line must start (after a single optional leading
+    whitespace) with the lower-case literal ``/recon`` followed by a
+    space, then a non-empty target. An optional `` scope=<token>``
+    suffix may appear as the last whitespace-separated token.
+
+    The function is *pure* — no I/O, no globals, no Streamlit imports —
+    so it is trivially unit-testable. See ``tests/test_recon.py``.
+    """
+
+    if not isinstance(text, str):
+        # Defensive: chat_input can in theory hand us a non-string if
+        # the multimodal path is mis-wired. Treat anything non-string as
+        # "not a recon command" so the view layer falls through cleanly.
+        return None
+
+    stripped = text.strip()
+    if not stripped.startswith(_RECON_COMMAND_PREFIX + " ") and stripped != _RECON_COMMAND_PREFIX:
+        # ``/recon`` alone (no target) is rejected — same as an empty
+        # command in any chat client. Falls through to OpenRouter.
+        return None
+
+    # Drop the prefix; remainder is "<target> [scope=<token>]".
+    remainder = stripped[len(_RECON_COMMAND_PREFIX):].strip()
+    if not remainder:
+        # ``/recon`` with no target. Not a recon command; fall through.
+        return None
+
+    # Pull the optional ``scope=<token>`` suffix off the end.
+    target: str
+    scope_token: str = DEFAULT_RECON_SCOPE_TOKEN
+    parts = remainder.split()
+    if len(parts) >= 2 and parts[-1].startswith("scope="):
+        suffix_value = parts[-1][len("scope="):].strip()
+        if suffix_value:
+            # Non-empty value: the literal ``scope=`` token really was
+            # the scope marker. Strip it from the target and use the
+            # value (lower-cased) as the scope token.
+            scope_token = suffix_value.lower()
+            target = " ".join(parts[:-1]).strip()
+        else:
+            # Empty value: pin the quirky-but-deliberate contract
+            # that the literal ``scope=`` text stays in the target
+            # and the resolved scope token is the empty string. The
+            # orchestrator will then reject this with a friendly
+            # message, and the audit log records what the user typed.
+            target = remainder.strip()
+            scope_token = ""
+    else:
+        target = remainder.strip()
+
+    if not target:
+        # ``/recon scope=ctf`` with no target. Reject.
+        return None
+
+    # The parser does NOT validate ``scope_token`` — unknown or empty
+    # values are still returned so the orchestrator can surface a
+    # friendly rejection (and so the audit log can record the
+    # attempted value). Pinning this behaviour: the parser is purely
+    # a *grammar* step; policy lives one layer up.
+
+    return ReconCommand(target=target, scope_token=scope_token)
+
+
+# --- Phase 16: recon turn JSON round-trip ------------------------------
+# We persist recon turns as a list of content parts (see
+# ``_persist_recon_turn`` in the Streamlit view). The first part is a
+# plain-text summary line ("🔍 Recon report: example.com") so the chat
+# transcript reads naturally when exported to Markdown; the second part
+# is the full :class:`ReconReport` serialised as a JSON-safe dict using
+# the *same* shape :func:`app.recon.report.render_report_json` emits.
+# Sticking to that shape (rather than inventing a private envelope) means
+# the on-disk payload is byte-identical to the audit-log excerpt and the
+# download transcript — one format, three callers.
+RECON_PART_SUMMARY: str = "recon_summary"   # {"type": ..., "text": "🔍 ..."}
+RECON_PART_REPORT: str = "recon_report"     # {"type": ..., "report": {...}}
+
+
+# Map tool name -> typed dataclass for the ``value`` field on re-hydrate.
+# Keys MUST match the ``tool`` strings the orchestrator emits so a future
+# tool only needs a single edit to both maps.
+_RECON_VALUE_CLASS_BY_TOOL: dict[str, type] = {
+    "dns": DNSResult,
+    "ipinfo": IPInfoResult,
+    "urlinfo": URLInfoResult,
+    "whois": WHOISResult,
+    "crt_sh": CrtShResult,
+}
+
+
+def _dict_to_tool_result(d: Mapping[str, object]) -> ToolResult:
+    """Re-hydrate a :class:`ToolResult` from a JSON-safe dict.
+
+    Mirrors :func:`app.recon.report._tool_to_json` in reverse. The
+    ``value`` field is reconstructed as the typed dataclass so the
+    renderer can pattern-match on it (see ``_format_dns`` /
+    ``_format_ipinfo`` etc.). For :class:`IPInfoResult` and
+    :class:`CrtShResult` — which carry an internal ``raw`` blob the JSON
+    shape omits — we pass an empty ``raw`` because the renderer does not
+    read it.
+    """
+    tool = str(d.get("tool", ""))
+    ok = bool(d.get("ok", False))
+    error = d.get("error")
+    duration_ms = int(d.get("duration_ms", 0) or 0)
+
+    value: object | None = None
+    raw_value = d.get("value")
+    cls = _RECON_VALUE_CLASS_BY_TOOL.get(tool)
+    if cls is None or raw_value is None or not isinstance(raw_value, Mapping):
+        # Unknown tool or absent value — leave ``value`` None so the
+        # renderer falls back to its error branch.
+        value = None
+    elif cls is DNSResult:
+        # ``error`` is a sentinel on DNSResult itself (separate from
+        # ``ToolResult.error``). Note: ``DNSResult.ok`` is a
+        # ``@property`` (not a constructor arg), so we deliberately
+        # don't pass it — the renderer reads ``ok`` off the rebuilt
+        # object after construction.
+        v = raw_value
+        value = DNSResult(
+            ipv4=list(v.get("ipv4") or []),
+            ipv6=list(v.get("ipv6") or []),
+            error=v.get("error"),
+        )
+    elif cls is IPInfoResult:
+        v = raw_value
+        value = IPInfoResult(
+            ip=str(v.get("ip", "") or ""),
+            hostname=str(v.get("hostname", "") or ""),
+            city=str(v.get("city", "") or ""),
+            region=str(v.get("region", "") or ""),
+            country=str(v.get("country", "") or ""),
+            loc=str(v.get("loc", "") or ""),
+            org=str(v.get("org", "") or ""),
+            postal=str(v.get("postal", "") or ""),
+            timezone=str(v.get("timezone", "") or ""),
+            raw={},
+        )
+    elif cls is URLInfoResult:
+        v = raw_value
+        value = URLInfoResult(
+            requested_url=str(v.get("requested_url", "") or ""),
+            final_url=str(v.get("final_url", "") or ""),
+            http_status=int(v.get("http_status", 0) or 0),
+            title=str(v.get("title", "") or ""),
+            server=str(v.get("server", "") or ""),
+            content_type=str(v.get("content_type", "") or ""),
+            content_length=int(v.get("content_length", 0) or 0),
+        )
+    elif cls is WHOISResult:
+        v = raw_value
+        registrar_body = v.get("registrar_body")
+        value = WHOISResult(
+            iana_body=str(v.get("iana_body", "") or ""),
+            registrar_server=(
+                str(v.get("registrar_server", "") or "")
+                if v.get("registrar_server") is not None
+                else None
+            ),
+            registrar_body=(
+                str(registrar_body) if registrar_body is not None else None
+            ),
+        )
+    elif cls is CrtShResult:
+        v = raw_value
+        value = CrtShResult(
+            hosts=tuple(v.get("hosts") or ()),
+            cert_count=int(v.get("cert_count", 0) or 0),
+            issuers=tuple(v.get("issuers") or ()),
+            raw=[],
+        )
+
+    return ToolResult(
+        tool=tool,
+        ok=ok,
+        value=value,
+        error=None if error is None else str(error),
+        duration_ms=duration_ms,
+    )
+
+
+def _report_to_dict(report: ReconReport) -> dict[str, object]:
+    """Serialise a :class:`ReconReport` to a JSON-safe dict.
+
+    The output shape matches :func:`app.recon.report.render_report_json`
+    byte-for-byte (``target``, ``display``, ``host``, ``scope_token``,
+    ``total_ms``, ``tools``) so any consumer that already understands the
+    audit-log JSON can consume the chat-history payload without a second
+    deserialiser.
+    """
+    return {
+        "target": report.target,
+        "display": report.display,
+        "host": report.host,
+        "scope_token": report.scope_token,
+        "total_ms": report.total_ms,
+        "tools": [_tool_to_json(r) for r in report.tool_results()],
+    }
+
+
+def _dict_to_report(d: Mapping[str, object]) -> ReconReport:
+    """Re-hydrate a :class:`ReconReport` from a JSON-safe dict.
+
+    Inverse of :func:`_report_to_dict`. The five per-tool entries in the
+    ``tools`` list are looked up by tool name so order in the JSON does
+    not have to match the dataclass's field order. Missing tools become
+    synthetic error results so the rendered report still has a row for
+    every panel — that matches the orchestrator's "tool failure is part
+    of the report" contract.
+    """
+    tools_raw = d.get("tools") or []
+    if not isinstance(tools_raw, list):
+        tools_raw = []
+
+    by_tool: dict[str, Mapping[str, object]] = {}
+    for entry in tools_raw:
+        if isinstance(entry, Mapping):
+            name = str(entry.get("tool", ""))
+            if name:
+                by_tool[name] = entry
+
+    def _result_or_error(name: str) -> ToolResult:
+        if name in by_tool:
+            return _dict_to_tool_result(by_tool[name])
+        return ToolResult(
+            tool=name,
+            ok=False,
+            value=None,
+            error="missing from persisted report",
+            duration_ms=0,
+        )
+
+    return ReconReport(
+        target=str(d.get("target", "") or ""),
+        display=str(d.get("display", "") or ""),
+        host=str(d.get("host", "") or ""),
+        scope_token=str(d.get("scope_token", "") or ""),
+        total_ms=int(d.get("total_ms", 0) or 0),
+        dns=_result_or_error("dns"),
+        ipinfo=_result_or_error("ipinfo"),
+        urlinfo=_result_or_error("urlinfo"),
+        whois=_result_or_error("whois"),
+        crt_sh=_result_or_error("crt_sh"),
+    )
+
+
+def recon_part_summary_text(report: ReconReport) -> str:
+    """Return the one-line summary used in the chat bubble.
+
+    Kept here (not inline in ``streamlit_app.py``) so a download
+    transcript or future CLI helper can produce the same string without
+    duplicating the format.
+    """
+    return f"🔍 Recon report: {report.display}"
+
+
+def build_recon_turn_parts(report: ReconReport) -> list[dict[str, object]]:
+    """Build the list-of-parts payload persisted as a recon assistant turn.
+
+    The shape is::
+
+        [
+          {"type": "recon_summary", "text": "🔍 Recon report: ..."},
+          {"type": "recon_report",  "report": {... _report_to_dict ...}},
+        ]
+
+    Two parts (rather than one fused blob) so the summary line is
+    rendered as plain Markdown while the structured report goes inside an
+    ``st.expander``. The storage layer (``append_message``) handles the
+    list-of-parts JSON envelope; this function just builds the payload.
+    """
+    return [
+        {
+            "type": RECON_PART_SUMMARY,
+            "text": recon_part_summary_text(report),
+        },
+        {
+            "type": RECON_PART_REPORT,
+            "report": _report_to_dict(report),
+        },
+    ]
+
+
+def is_recon_turn_content(content: object) -> bool:
+    """Return True iff ``content`` looks like a recon turn payload.
+
+    Detection is "shape-only" (no DB round-trip) so the renderer can
+    branch without first decoding. Matches both the raw list of dicts
+    *and* the JSON-encoded string form, the latter being what the
+    in-memory ``st.session_state["messages"]`` cache holds when a chat
+    was loaded from the DB in a previous session.
+    """
+    if isinstance(content, list) and content:
+        return any(
+            isinstance(p, Mapping) and p.get("type") in (RECON_PART_SUMMARY, RECON_PART_REPORT)
+            for p in content
+        )
+    if isinstance(content, str):
+        stripped = content.lstrip()
+        if stripped.startswith("[") and (
+            RECON_PART_SUMMARY in stripped or RECON_PART_REPORT in stripped
+        ):
+            try:
+                decoded = json.loads(content)
+            except (ValueError, TypeError):
+                return False
+            return is_recon_turn_content(decoded)
+    return False
+

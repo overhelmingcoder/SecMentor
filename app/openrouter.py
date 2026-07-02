@@ -44,6 +44,7 @@ with ``status=None`` — the router treats them as transient.
 from __future__ import annotations
 
 import json
+from itertools import chain
 from typing import Any, Iterator
 
 import requests
@@ -268,6 +269,7 @@ def chat(
     model: str | None = None,
     temperature: float | None = None,
     max_tokens: int | None = None,
+    timeout: float | None = None,
     api_key: str | None = None,
     base_url: str | None = None,
 ) -> str:
@@ -293,6 +295,15 @@ def chat(
     max_tokens
         Cap on the assistant reply length. Defaults to
         ``DEFAULT_MAX_TOKENS`` from ``app.config``.
+    timeout
+        Per-request timeout in seconds. ``None`` uses the module-level
+        :data:`HTTP_TIMEOUT_SECONDS` (30s by default). Callers should
+        pass a longer value for vision calls — some free-tier vision
+        endpoints (notably NVIDIA's nemotron-nano-12b-v2-vl) take
+        60–90 s to produce a first token and a 30s timeout aborts the
+        call before any progress is made. The router forwards this
+        argument to :func:`chat` per slot so the vision path can opt
+        into a longer ceiling without slowing the text path.
     api_key
         Bearer token. Defaults to ``OPENROUTER_API_KEY`` from
         ``app.config``. The router passes a per-slot key from the
@@ -338,6 +349,7 @@ def chat(
 
     chosen_temperature = DEFAULT_TEMPERATURE if temperature is None else temperature
     chosen_max_tokens = DEFAULT_MAX_TOKENS if max_tokens is None else max_tokens
+    chosen_timeout = HTTP_TIMEOUT_SECONDS if timeout is None else timeout
 
     payload = _build_payload(
         messages,
@@ -352,7 +364,7 @@ def chat(
             chosen_url,
             headers=headers,
             json=payload,
-            timeout=HTTP_TIMEOUT_SECONDS,
+            timeout=chosen_timeout,
         )
     except requests.RequestException as exc:
         # Network-level failure: connection refused, DNS error, TLS
@@ -364,6 +376,21 @@ def chat(
             status=None,
             model=chosen_model,
         ) from exc
+
+    # Force UTF-8 decoding for every downstream accessor on this
+    # response (``response.text``, ``response.json``,
+    # ``response.content`` via ``iter_lines(decode_unicode=True)``).
+    # ``requests`` picks the encoding from the ``Content-Type`` charset
+    # header and, when that is absent, falls back to **ISO-8859-1** —
+    # the documented HTTP/1.0 default. OpenRouter's chat-completions
+    # endpoint sends ``Content-Type: application/json`` (or
+    # ``text/event-stream`` for streaming) *without* a ``charset=``
+    # parameter, so every multi-byte UTF-8 character (em-dash, bullet,
+    # emoji) round-trips as ``\xNN\xNN\xNN`` then decodes into mojibake
+    # (``â€"``, ``â€¢``, ``ðŸ›¡`` …). Pinning ``response.encoding`` to
+    # ``utf-8`` here is the documented escape hatch and prevents the
+    # bytes-on-the-wire from ever being touched by anything except UTF-8.
+    response.encoding = "utf-8"
 
     if response.status_code >= 400:
         # Pull the upstream body in the best representation we can get.
@@ -401,6 +428,40 @@ def chat(
             status=response.status_code,
             model=chosen_model,
         ) from exc
+
+    # Some upstream providers relay their own failures inside a 2xx
+    # response (e.g. OpenRouter returns HTTP 200 with a body shaped as
+    # ``{"error": {"message": "Provider returned error", "code": 504}}``
+    # and no ``choices`` field). Without this guard the caller sees the
+    # misleading "missing choices[0].message.content" error and the
+    # router's retry/rotate path is never triggered. Detect the embedded
+    # error blob, classify it the same way as the HTTP-status branch so
+    # the router treats 5xx-shaped payloads as transient and rotates.
+    embedded_error = data.get("error") if isinstance(data, dict) else None
+    if embedded_error:
+        provider_header = response.headers.get("x-provider") or None
+        # Best-effort extraction of an upstream HTTP code (often absent);
+        # fall back to 502 because "provider returned error" without a
+        # code is almost always a gateway-style failure.
+        raw_code: Any = (
+            embedded_error.get("code") if isinstance(embedded_error, dict) else None
+        )
+        try:
+            status_code = int(raw_code) if raw_code is not None else 502
+        except (TypeError, ValueError):
+            status_code = 502
+        message = (
+            f"OpenRouter returned an embedded error in a 2xx response "
+            f"(upstream status {status_code}): {embedded_error}"
+        )
+        exc_class = _classify(status_code)
+        raise exc_class(
+            message,
+            status=status_code,
+            provider=provider_header,
+            model=chosen_model,
+            body=_truncate(str(data)),
+        )
 
     return _extract_assistant_text(data)
 
@@ -505,6 +566,14 @@ def stream_chat(
             model=chosen_model,
         ) from exc
 
+    # Same UTF-8 pin as in ``chat()``. SSE responses carry
+    # ``Content-Type: text/event-stream`` with no ``charset=`` parameter,
+    # which sends ``requests`` to its ISO-8859-1 fallback and turns every
+    # multi-byte UTF-8 character (em-dash, bullet, emoji) into
+    # ``â€"``-style mojibake inside the assistant bubble. Force UTF-8
+    # so ``iter_lines(decode_unicode=True)`` decodes correctly.
+    response.encoding = "utf-8"
+
     try:
         if response.status_code >= 400:
             # Same error-classification contract as chat(). We pull
@@ -529,7 +598,80 @@ def stream_chat(
                 body=body_text,
             )
 
-        for raw_line in response.iter_lines(decode_unicode=True):
+        # Mirror chat(): some upstream providers relay their failures
+        # inside a 2xx streaming response as a single JSON blob with an
+        # ``error`` key and no ``data:`` SSE frames. Detect that here
+        # before iterating lines so the router still sees the error.
+        #
+        # NOTE: ``requests.Response.iter_lines`` is single-pass on real
+        # responses — calling it twice does NOT replay lines. We
+        # therefore peek the first line for the embedded-error check
+        # and then *re-attach* it to the live iterator so the SSE
+        # loop below consumes every byte the upstream sends. This
+        # matters for two reasons:
+        #
+        #   1. Token-by-token streaming: the previous implementation
+        #      materialised the entire SSE feed via
+        #      ``list(response.iter_lines(...))`` *before* yielding a
+        #      single delta. That blocked the consumer (Streamlit's
+        #      ``st.write_stream``) until the upstream closed the
+        #      connection, which meant the user stared at "Thinking…"
+        #      for the full generation time and then saw the whole
+        #      reply appear at once. By yielding directly off the
+        #      live iterator each delta lands in the browser the
+        #      moment OpenRouter sends it.
+        #
+        #   2. Mid-stream network failures: the live iterator still
+        #      raises ``ConnectionError`` on EOF / TLS reset, which
+        #      propagates to the outer ``try`` below where it is
+        #      re-raised as ``OpenRouterServerError``. Silently
+        #      swallowing it here would turn a network failure into
+        #      an empty response — exactly what
+        #      ``test_wraps_mid_stream_network_failure`` guards
+        #      against.
+        line_iter = response.iter_lines(decode_unicode=True)
+        try:
+            preview = next(line_iter)
+        except StopIteration:
+            preview = ""
+        if preview and not preview.lstrip().startswith("data:"):
+            # Not SSE — try parsing it as a one-shot JSON error blob.
+            try:
+                preview_data = json.loads(preview)
+            except ValueError:
+                preview_data = None
+            if isinstance(preview_data, dict) and preview_data.get("error"):
+                embedded_error = preview_data["error"]
+                raw_code: Any = (
+                    embedded_error.get("code")
+                    if isinstance(embedded_error, dict)
+                    else None
+                )
+                try:
+                    status_code = int(raw_code) if raw_code is not None else 502
+                except (TypeError, ValueError):
+                    status_code = 502
+                provider_header = response.headers.get("x-provider") or None
+                message = (
+                    f"OpenRouter stream returned an embedded error in a "
+                    f"2xx response (upstream status {status_code}): "
+                    f"{embedded_error}"
+                )
+                exc_class = _classify(status_code)
+                raise exc_class(
+                    message,
+                    status=status_code,
+                    provider=provider_header,
+                    model=chosen_model,
+                    body=_truncate(str(preview_data)),
+                )
+
+        # Re-attach the line we already peeked so the SSE loop
+        # processes every frame the upstream sends. ``line_iter``
+        # has been advanced past line 1 by ``next()`` above; chain
+        # ``[preview]`` back onto it so the iterator starts from
+        # the same place ``list(iter_lines(...))`` used to start.
+        for raw_line in chain([preview], line_iter):
             if not raw_line:
                 continue
             # SSE lines are either ``data: {...}`` or the sentinel

@@ -218,6 +218,20 @@ def process_pdf(file: _UploadedFileLike) -> str:
     ``web/chat_helpers._MAX_INLINE_BYTES`` for the textual snippet
     path.
     """
+    # Defensive ``seek(0)``: a single chat turn may consume the
+    # UploadedFile stream twice — once in ``persist_upload_for_rag``
+    # (which embeds chunks for retrieval) and again here (which
+    # builds the in-prompt prose). Streamlit's UploadedFile is a
+    # file-like object that advances on read; without a rewind the
+    # second reader sees ``b""`` and we surface a misleading
+    # "Uploaded PDF is empty" stub. ``process_image`` already does
+    # the same dance; we mirror it here so the two processors stay
+    # symmetric and the helper layer never has to know who reads first.
+    if hasattr(file, "seek"):
+        try:
+            file.seek(0)  # type: ignore[attr-defined]
+        except (OSError, ValueError):
+            pass
     raw = file.read() if hasattr(file, "read") else b""
     if not raw:
         raise FileProcessingError(
@@ -326,6 +340,167 @@ def _safe_size(file: _UploadedFileLike, fallback: int) -> int:
     return fallback
 
 
+# --- RAG persistence (Phase 12 PR-D) -----------------------------------------
+# ``persist_upload_for_rag`` is the bridge between the view's chat input and
+# the Phase 12 RAG store. Each uploaded file becomes:
+#
+#   1. An ``artifacts`` row (so the chat knows which files were attached).
+#   2. A list of plain-text chunks (so the retriever has something to embed).
+#   3. A list of float32 embeddings (so the retriever has something to
+#      search by cosine similarity).
+#
+# All three writes are wrapped in a single try/except: a failed RAG ingest
+# is **never** fatal to the chat. The user already sees the file in the
+# prompt bubble; failing to index it should not break the model call.
+# That is why the function returns ``None`` and never re-raises.
+#
+# The two collaborators (the embedder and the store) are injected as
+# keyword args so the helper is unit-testable without spinning up a real
+# sentence-transformers model or touching the real SQLite file. The view
+# passes the cached singletons from ``web/streamlit_app.py``; tests pass
+# a ``FakeEmbedder`` and a fresh ``RagStore`` against a ``tmp_path``.
+#
+# Why this lives in ``app/file_processor.py`` and not the view:
+# it is the *only* place that already knows how to turn an uploaded
+# file into a list of strings (via ``process_pdf``), and the only
+# place that already lazy-imports ``pymupdf`` behind a typed error.
+# Co-locating keeps the failure-mode stories consistent.
+import logging as _logging
+
+_log = _logging.getLogger(__name__)
+
+
+def persist_upload_for_rag(
+    file: _UploadedFileLike,
+    chat_id: str,
+    *,
+    embedder: Any | None = None,
+    rag_store: Any | None = None,
+) -> str | None:
+    """Persist an uploaded file to the RAG store for ``chat_id``.
+
+    Returns the new artifact id on success, or ``None`` on any failure
+    (logged at WARNING). Never raises — the chat call site is allowed
+    to proceed even if RAG ingestion failed.
+
+    Behaviour by file kind:
+
+    * **PDF** — extracted text is chunked with
+      :func:`app.rag_chunker.chunk_text` (defaults: 512 chars / 64 overlap).
+      Each chunk is then embedded with ``embedder.encode(chunks)`` and
+      added to the store under the new artifact id.
+    * **Image** — the embedder has no real semantics for pixels, so
+      we insert a single *stub* chunk that records the file's identity
+      (``[image: <filename>, <size> bytes, <mime>]``). The stub is
+      enough to make the artifact retrievable by exact name (e.g. a
+      user asking "what did I upload?") and keeps the indexing
+      path uniform. Future phases can swap in a vision embedder
+      without changing the call site.
+    * **Anything else** — same stub path as images, with mime
+      ``application/octet-stream`` so the artifact row is still
+      well-formed.
+
+    The two collaborators are *optional*; when omitted, the helper
+    falls back to ``app.rag_embedder.get_embedder()`` and a fresh
+    ``app.rag_store.RagStore(embedder)`` so callers in the view
+    don't have to wire anything by hand.
+    """
+    # Lazy imports keep this module importable in test environments
+    # that may not have the full RAG stack on ``sys.path``. The two
+    # collaborators are also cheap to import (no model download), but
+    # deferring them here makes the failure mode symmetric with
+    # ``process_pdf``'s pymupdf gate.
+    try:
+        from app import storage as _storage
+        from app.rag_chunker import chunk_text
+        from app.rag_embedder import get_embedder
+        from app.rag_store import RagStore
+    except Exception as exc:  # pragma: no cover - defensive
+        _log.warning("RAG persistence: imports unavailable (%s)", exc)
+        return None
+
+    # Resolve collaborators. The view always passes them in (cached
+    # singletons); tests pass a FakeEmbedder / fresh RagStore.
+    if embedder is None:
+        try:
+            embedder = get_embedder()
+        except Exception as exc:  # pragma: no cover - defensive
+            _log.warning("RAG persistence: get_embedder failed (%s)", exc)
+            return None
+    if rag_store is None:
+        try:
+            rag_store = RagStore(embedder)
+        except Exception as exc:  # pragma: no cover - defensive
+            _log.warning("RAG persistence: RagStore ctor failed (%s)", exc)
+            return None
+
+    # Best-effort metadata extraction. None of the fields are
+    # critical — a missing attribute just becomes ``"unknown"``.
+    name = getattr(file, "name", "upload") or "upload"
+    mime = (getattr(file, "type", None) or "application/octet-stream").lower()
+    size = _safe_size(file, fallback=0)
+    is_pdf = mime == "application/pdf" or name.lower().endswith(".pdf")
+    is_image = mime.startswith("image/")
+
+    try:
+        artifact_id = _storage.add_artifact(
+            chat_id=chat_id,
+            filename=name,
+            mime=mime,
+            size_bytes=size,
+        )
+    except Exception as exc:
+        _log.warning(
+            "RAG persistence: add_artifact failed for %s (%s)", name, exc,
+        )
+        return None
+
+    # Build chunks. PDFs go through the real text path; everything
+    # else gets a single descriptive stub.
+    if is_pdf:
+        try:
+            text = process_pdf(file)
+        except FileProcessingError as exc:
+            _log.warning(
+                "RAG persistence: PDF text extraction failed for %s (%s)",
+                name, exc,
+            )
+            return artifact_id  # artifact is recorded; no chunks
+        except Exception as exc:  # pragma: no cover - defensive
+            _log.warning(
+                "RAG persistence: process_pdf raised for %s (%s)", name, exc,
+            )
+            return artifact_id
+        chunks = chunk_text(text)
+    else:
+        # Image or unknown — record identity only. ``rag_sentinel``
+        # is not needed here because this text never reaches the
+        # model directly; it is only the corpus for retrieval.
+        chunks = [f"[image: {name}, {size} bytes, {mime}]"]
+
+    if not chunks:
+        return artifact_id  # nothing to index (e.g. empty PDF)
+
+    # Embed + write. Both can fail; we don't want either to crash
+    # the chat. A degraded embedder (``is_available() == False``)
+    # short-circuits via ``RagStore.add`` returning ``[]``.
+    try:
+        if not getattr(embedder, "is_available", lambda: True)():
+            _log.info(
+                "RAG persistence: embedder unavailable; skipping %s", name,
+            )
+            return artifact_id
+        embs = embedder.encode(chunks)
+        rag_store.add(artifact_id, chunks, embs)
+    except Exception as exc:
+        _log.warning(
+            "RAG persistence: index failed for %s (%s)", name, exc,
+        )
+        return artifact_id
+
+    return artifact_id
+
+
 # Exposed so the test file can assert the size normalisation
 # behaviour without us forcing a particular Streamlit version.
 __all__ = [
@@ -335,6 +510,7 @@ __all__ = [
     "_MAX_PDF_TEXT_CHARS",
     "_SUPPORTED_IMAGE_MIMES",
     "image_url_part",
+    "persist_upload_for_rag",
     "process_image",
     "process_pdf",
     "_safe_size",

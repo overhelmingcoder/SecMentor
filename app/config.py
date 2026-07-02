@@ -28,6 +28,7 @@ exhaust.
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Iterator
@@ -40,6 +41,8 @@ from dotenv import load_dotenv
 # overwriting values that are already set in the real environment.
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(dotenv_path=_PROJECT_ROOT / ".env", override=False)
+
+logger = logging.getLogger(__name__)
 
 
 # --- Required values ----------------------------------------------------------
@@ -78,13 +81,45 @@ OPENROUTER_APP_NAME: str = os.getenv(
 # lazily via iter_api_keys() so tests can monkeypatch the env at runtime.
 _MAX_KEY_SLOTS: int = 5
 
+#: Minimum acceptable length for an OpenRouter API key. As of mid-2026
+#: real keys are 67-73 characters long (the ``sk-or-v1-`` prefix plus a
+#: ~61-69 char random body). Anything shorter is almost certainly
+#: truncated -- which is exactly what happens when an editor hard-wraps
+#: a long line at 80 columns and the user saves without noticing. A
+#: truncated key looks valid to ``python-dotenv`` (it has the right
+#: shape, just the wrong length) but every upstream call returns 401,
+#: which disables the slot and leaves the router with zero working
+#: keys. Validating here turns that silent failure into a loud skip.
+_OPENROUTER_KEY_MIN_LEN: int = 60
+
+
+def _is_usable_openrouter_key(value: str | None) -> bool:
+    """Return True only for keys that *look* complete enough to try.
+
+    The check is intentionally cheap: prefix + length. We do not
+    regex-validate the body because OpenRouter occasionally rotates the
+    internal encoding and a regex would need to be kept in sync.
+    Anything that fails this gate is almost certainly truncation, a
+    placeholder, or a typo, and the right behaviour is to skip the
+    slot rather than burn an upstream round-trip on a 401.
+    """
+    if not value:
+        return False
+    value = value.strip()
+    return (
+        value.startswith("sk-or-v1-")
+        and len(value) >= _OPENROUTER_KEY_MIN_LEN
+    )
+
 
 def iter_api_keys() -> Iterator[str]:
     """Yield every non-empty ``OPENROUTER_API_KEY[_N]`` in slot order.
 
     Slot 1 (``OPENROUTER_API_KEY``) is required and is the only one
     that triggers a startup error if missing. Slots 2..5 are optional
-    and are silently skipped if not set or set to the empty string.
+    and are silently skipped if not set, set to the empty string, or
+    fail :func:`_is_usable_openrouter_key` (truncated, missing the
+    ``sk-or-v1-`` prefix, or suspiciously short).
 
     Order is stable: slot 1 first, then 2, 3, 4, 5. The router uses
     this order to pick the *primary* key (slot 1) for the first call.
@@ -95,8 +130,24 @@ def iter_api_keys() -> Iterator[str]:
     yield OPENROUTER_API_KEY
     for n in range(2, _MAX_KEY_SLOTS + 1):
         value = os.getenv(f"OPENROUTER_API_KEY_{n}")
-        if value:
-            yield value
+        if not _is_usable_openrouter_key(value):
+            # A non-empty but malformed value is the "editor hard-wrapped
+            # my .env" case. We log a single warning at module-import
+            # time so the operator notices in the console without
+            # flooding every chat turn. The test suite patches
+            # ``logging.getLogger(__name__)`` so this stays silent in
+            # CI.
+            if value:
+                logger.warning(
+                    "OPENROUTER_API_KEY_%d looks truncated or malformed "
+                    "(prefix=%r, length=%d); skipping. Re-paste the full "
+                    "key from your OpenRouter dashboard to fix.",
+                    n,
+                    (value.strip()[:10] + "...") if len(value.strip()) > 10 else value.strip(),
+                    len(value.strip()),
+                )
+            continue
+        yield value
 
 
 def iter_models() -> Iterator[str]:
@@ -114,15 +165,50 @@ def iter_models() -> Iterator[str]:
 
     Order is preserved within (1) so a deliberate primary/secondary
     ordering in the .env survives into the router pool.
+
+    Each yielded id is validated to look like ``vendor/model:free``:
+    the router will refuse it again at construction time, but checking
+    here turns a "value silently truncated to ``gemma-4-31b-it:fre``"
+    into a single clear warning at startup.
     """
     raw = os.getenv("OPENROUTER_MODELS")
     if raw:
         for entry in raw.split(","):
             cleaned = entry.strip()
-            if cleaned:
+            if _is_usable_model_id(cleaned):
                 yield cleaned
+            elif cleaned:
+                logger.warning(
+                    "OPENROUTER_MODELS entry %r looks malformed "
+                    "(must contain '/' and end with ':free'); skipping.",
+                    cleaned,
+                )
         return
-    yield OPENROUTER_MODEL
+    if _is_usable_model_id(OPENROUTER_MODEL):
+        yield OPENROUTER_MODEL
+    else:
+        # The single-model path. The router would catch this at
+        # construction time, but the message here is friendlier and
+        # points operators at the actual fix.
+        raise RuntimeError(
+            f"OPENROUTER_MODEL={OPENROUTER_MODEL!r} is not a valid "
+            "free-tier model id. It must contain a '/' (vendor/model) "
+            "and end with ':free'. Update your .env."
+        )
+
+
+def _is_usable_model_id(value: str | None) -> bool:
+    """Return True for ids that look like ``vendor/model:free``.
+
+    Cheap shape check used by :func:`iter_models`. We do not validate
+    against the OpenRouter catalogue here — a typo'd vendor will be
+    caught by the upstream 404 on the first call, which the router
+    already rotates past.
+    """
+    if not value:
+        return False
+    value = value.strip()
+    return "/" in value and value.endswith(":free")
 
 
 # --- Vision-capable model allow-list ------------------------------------------
@@ -188,3 +274,153 @@ DEFAULT_MAX_TOKENS: int = 5000
 # longer usually means a queued/silently-rejected call that the user would
 # rather see as a clean error than wait through.
 HTTP_TIMEOUT_SECONDS: int = 60
+
+
+# --- Recon / OSINT tunables (Phase 15) ---------------------------------------
+# These are the *only* knobs the recon subsystem reads from the environment.
+# Every other recon constant is derived (e.g. the hard-coded RFC1918 ranges
+# in :mod:`app.recon.safety`). Keep new knobs here so the operator has one
+# place to look in ``.env`` and so the test suite can patch them via
+# ``monkeypatch.setenv`` without touching the recon modules directly.
+
+#: Optional ipinfo.io token. Without a token the API returns a limited
+#: "lite" payload (no org/company, no abuse contact, rate-limited to
+#: ~1k/day per IP). With a token you get the full record. Stored as a
+#: plain string — never logged. The default of ``""`` is intentional:
+#: it means "no token, run in lite mode" rather than raising at import.
+IPINFO_TOKEN: str = os.getenv("IPINFO_TOKEN", "")
+
+#: HTTP timeout, in seconds, for every outbound recon call (ipinfo.io,
+#: urlinfo.io, crt.sh, the WHOIS TCP probe). 15s is generous for the
+#: typical 1-3s response and gives crt.sh — which can be slow on a cold
+#: query — enough headroom. The orchestrator passes this to every
+#: transport so a stalled crt.sh query cannot hang the whole report.
+RECON_HTTP_TIMEOUT_SECONDS: float = float(
+    os.getenv("RECON_HTTP_TIMEOUT_SECONDS", "15")
+)
+
+#: Per-tool override for the crt.sh HTTP timeout. crt.sh is a hobby
+#: project with cold-start latencies well above the shared 15s default
+#: (sometimes 30s+ on first hit) and we don't want a slow crt.sh query
+#: to spill into the rest of the report. Defaults to ``20`` (a tight
+#: cap; crt.sh typically answers in 2-5s once warm, and the orchestrator
+#: already runs crt.sh in parallel with the other four tools so a
+#: timeout here only delays the crt.sh row, not the rest of the
+#: report). Operators with frequent crt.sh timeouts can set
+#: ``RECON_CRT_SH_TIMEOUT_SECONDS=45`` (or similar) in their
+#: ``.env`` to give crt.sh more headroom without slowing the other
+#: tools down.
+RECON_CRT_SH_TIMEOUT_SECONDS: float = float(
+    os.getenv("RECON_CRT_SH_TIMEOUT_SECONDS", "20")
+)
+
+
+def _parse_bool_env(name: str, default: bool) -> bool:
+    """Parse a boolean env var with a forgiving truthy/falsy vocabulary.
+
+    Accepts ``"1" / "0"``, ``"true" / "false"``,
+    ``"yes" / "no"``, ``"on" / "off"`` (case-insensitive,
+    whitespace-stripped). Anything not on the truthy list — including
+    the empty string — returns :data:`default`. This mirrors the
+    convention used by ``configparser`` / ``distutils.util.strtobool``
+    without pulling in a deprecated stdlib symbol.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    token = raw.strip().lower()
+    if token in {"1", "true", "yes", "on"}:
+        return True
+    if token in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+#: Kill-switch for the crt.sh lookup. crt.sh is a hobby project that
+#: occasionally returns 502 / 503 for long stretches (whole days
+#: during the 2025 winter outage, for example). When the upstream is
+#: unhealthy the orchestrator short-circuits the crt.sh tool and
+#: returns a synthetic, ``ok=True`` :class:`CrtShResult` instead —
+#: the recon report still renders cleanly with no scary **Error**
+#: row, and the rest of the pipeline (DNS / IP info / URL info /
+#: WHOIS) keeps running. Default ``True`` so deployments that do
+#: not set the knob keep the historical behaviour. Operators flip it
+#: to ``"false"`` in ``.env`` when crt.sh is the bottleneck and
+#: want the recon turn to stop paying its latency tax.
+#:
+#: Accepts the forgiving truthy / falsy vocabulary in
+#: :func:`_parse_bool_env` (``1 / 0``, ``true / false``,
+#: ``yes / no``, ``on / off``).
+RECON_CRT_SH_ENABLED: bool = _parse_bool_env("RECON_CRT_SH_ENABLED", True)
+
+
+def _parse_fallback_hosts() -> tuple[str, ...]:
+    """Parse :data:`RECON_FALLBACK_SUBDOMAINS` into a deduplicated tuple.
+
+    The env var is a comma-separated list of hostnames (whitespace
+    tolerated around the commas). Empty entries, entries without a
+    dot, and a leading ``*.`` wildcard prefix are stripped so a
+    typo or a copy-paste from a crt.sh-style row can't poison the
+    report with garbage like ``"foo, , *.bar, baz"`` →
+    ``("foo", "bar", "baz")``. The result is sorted alphabetically
+    so it matches the ordering used by :func:`crt_sh.lookup` —
+    operators reading the report see a stable order regardless of
+    how they wrote the env var.
+    """
+    raw = os.getenv("RECON_FALLBACK_SUBDOMAINS", "") or ""
+    seen: set[str] = set()
+    for entry in raw.split(","):
+        h = entry.strip().lower().lstrip("*.").strip()
+        if not h or "." not in h:
+            continue
+        seen.add(h)
+    return tuple(sorted(seen))
+
+
+#: Optional manual subdomain list used as a substitute when crt.sh
+#: is disabled (see :data:`RECON_CRT_SH_ENABLED`). The string is
+#: parsed at import time via :func:`_parse_fallback_hosts`. The
+#: orchestrator merges these hosts into the crt.sh report so the
+#: "Hosts seen" section still has content even when the live
+#: crt.sh query is skipped. The tuple is frozen so a downstream
+#: consumer cannot mutate it by accident.
+#:
+#: Typical sources for the fallback list:
+#: - ``securitytrails.com`` free preview,
+#: - a ``subfinder`` / ``amass`` JSON dump the operator already ran,
+#: - a manually-curated list from an internal asset inventory.
+RECON_FALLBACK_SUBDOMAINS: tuple[str, ...] = _parse_fallback_hosts()
+
+#: How long recon audit rows live before the cleanup job (Phase 2)
+#: expires them. 90 days is enough for a real engagement audit trail
+#: while bounding the table size for a single-user demo. The value is
+#: read at write time so a config change takes effect on the next row.
+RECON_AUDIT_RETENTION_DAYS: int = int(
+    os.getenv("RECON_AUDIT_RETENTION_DAYS", "90")
+)
+
+#: Whitelisted ``scope_token`` values. The orchestrator requires a scope
+#: token on every call (the chat slash command supplies it), and the
+#: token must be in this set. The set is small and opinionated on
+#: purpose: only the engagements the operator has actually authorised
+#: can run recon. Adding a new value is a one-line edit and is the
+#: *operator's* responsibility — not the user's.
+#:
+#: ``engagement``  : paid / written-authorisation work
+#: ``ctf``         : capture-the-flag competition infrastructure
+#: ``lab``         : intentionally vulnerable practice boxes (the
+#:                   short form used by the slash-command parser and
+#:                   the test suite; ``labs`` is kept as an alias)
+#: ``labs``        : alias of ``lab``
+#: ``redteam``     : internal red-team operations
+#: ``personal-lab``: home network and devices the operator owns
+#: ``bugbounty``   : a public bug-bounty programme listed in scope
+_RECON_SCOPE_TOKENS: frozenset[str] = frozenset({
+    "engagement",
+    "ctf",
+    "lab",
+    "labs",
+    "redteam",
+    "personal-lab",
+    "bugbounty",
+})

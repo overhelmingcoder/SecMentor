@@ -584,6 +584,90 @@ class ModelRouterStreamChatTests(unittest.TestCase):
                 list(router.stream_chat([{"role": "user", "content": "hi"}]))
         self.assertEqual(called["n"], 0)
 
+    def test_model_pin_filters_slots_by_model(self):
+        """``stream_chat(model=...)`` must skip slots whose ``model_id``
+        does not match, even when other healthy slots exist. This is the
+        pin path the file-bearing turn takes so a vision model cannot be
+        swapped for a text-only model mid-stream.
+        """
+        router = self._build(["k1", "k2"], ["vision:free", "text:free"])
+
+        calls: list[tuple[str | None, str | None]] = []
+
+        def fake_stream(_messages, *, model=None, api_key=None, **_kw):
+            calls.append((api_key, model))
+            yield "vision says hi"
+
+        with patch("app.openrouter.stream_chat", side_effect=fake_stream):
+            chunks = list(
+                router.stream_chat(
+                    [{"role": "user", "content": "see image"}],
+                    model="vision:free",
+                )
+            )
+        self.assertEqual(chunks, ["vision says hi"])
+        # Both keys may be tried for vision:free, but no slot should ever
+        # have been called with the text model.
+        self.assertTrue(
+            all(model == "vision:free" for _, model in calls),
+            f"non-vision slot was called: {calls}",
+        )
+        self.assertGreaterEqual(len(calls), 1)
+
+    def test_model_pin_with_no_matching_slot_raises(self):
+        """If the requested ``model`` does not match any configured slot,
+        ``stream_chat`` must raise :class:`AllSlotsExhaustedError` — the
+        same error the unpinned path raises when every slot fails. We do
+        *not* want a silent fallback to a different model.
+        """
+        from app.router import AllSlotsExhaustedError
+
+        router = self._build(["k1"], ["text:free"])
+
+        called = {"n": 0}
+
+        def counting(*_a, **_k):
+            called["n"] += 1
+            yield "should not be reached"
+
+        with patch("app.openrouter.stream_chat", side_effect=counting):
+            with self.assertRaises(AllSlotsExhaustedError):
+                list(
+                    router.stream_chat(
+                        [{"role": "user", "content": "see image"}],
+                        model="vision:free",
+                    )
+                )
+        self.assertEqual(called["n"], 0)
+
+    def test_model_pin_rotates_keys_for_pinned_model(self):
+        """When two keys are configured for the same pinned model, the
+        router must still rotate across keys on a pre-stream failure. The
+        pin restricts the model pool; the key rotation policy is
+        unchanged.
+        """
+        from app.openrouter import OpenRouterClientError
+
+        router = self._build(["k1", "k2"], ["vision:free"])
+
+        calls: list[str] = []
+
+        def fake_stream(_messages, *, model=None, api_key=None, **_kw):
+            calls.append(api_key or "")
+            if len(calls) == 1:
+                raise OpenRouterClientError("bad", status=400, model=model)
+            yield from ["done"]
+
+        with patch("app.openrouter.stream_chat", side_effect=fake_stream):
+            chunks = list(
+                router.stream_chat(
+                    [{"role": "user", "content": "see image"}],
+                    model="vision:free",
+                )
+            )
+        self.assertEqual(chunks, ["done"])
+        self.assertEqual(calls, ["k1", "k2"])
+
 
 if __name__ == "__main__":
     unittest.main()
