@@ -17,6 +17,7 @@ Everything that can be tested without a browser lives in chat_helpers.py.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import time
@@ -70,6 +71,7 @@ from web.chat_helpers import (
     _active_system_prompt,
     _bubble_alignment,
     _build_messages,
+    _coerce_message_text,
     _copy_button_html,
     _copy_button_html_for_bubble,
     _count_chars,
@@ -108,6 +110,44 @@ from app.recon.report import (
     render_report_json,
     render_report_markdown,
 )
+
+# --- Media-file storage safety net -------------------------------------------
+# Streamlit's ``st.chat_input(accept_file="multiple")`` registers every
+# uploaded file in the per-session ``MemoryMediaFileStorage`` and ships
+# the file's media ID to the browser. The browser then echoes that ID
+# back on every subsequent rerun so the input can re-display the file
+# the user previously attached. The catch: ``MemoryMediaFileStorage`` is
+# an in-memory dict on the *server* process. If the server restarts
+# (a Ctrl-C + relaunch, a code change that triggers ``runOnSave``, a
+# Streamlit hot-reload, etc.) and the user keeps the tab open, the
+# browser still holds the old media IDs, the chat input tries to
+# resolve them against the new server's empty store, and Streamlit
+# raises ``MediaFileStorageError`` from inside the widget's render
+# call. The user-facing symptom is a server-side traceback ("Bad
+# filename '...txt'. (No media file with id '...')") and a blank page
+# on every reload.
+#
+# The structural fix is a one-shot guard around the chat-input render:
+# if the underlying storage is missing the file, we (a) show a friendly
+# banner, (b) clear any pending input state so the next render starts
+# from a clean slate, and (c) fall back to a plain text ``st.chat_input``
+# for the rest of the session. The guard is *only* triggered when the
+# server has lost the file — a normal in-process rerun still uses the
+# full file-attached chat input with no behavioural change.
+try:
+    from streamlit.runtime.memory_media_file_storage import (
+        MediaFileStorageError as _MediaFileStorageError,
+    )
+except ImportError:  # pragma: no cover - older Streamlit shape
+    class _MediaFileStorageError(Exception):  # type: ignore[no-redef]
+        """Fallback for Streamlit versions that don't expose the class."""
+
+
+#: Per-session flag set by the media-file guard when a stale file ID
+#: is detected. The next render downgrades the chat input to text-only
+#: so the same exception does not fire on every rerun. Reset by the
+#: "Reset attachments" button below.
+_SESSION_STATE_MEDIA_ERROR = "_media_file_storage_error"
 
 
 # --- Page configuration -------------------------------------------------------
@@ -200,720 +240,41 @@ def _soft_delete_chat(chat_id: str) -> None:
 # surfaces, restrained blue accents, no neon, no glow, no ChatGPT-isms.
 # Layout density is driven by a CSS class on the root container
 # (`.layout-compact` / `.layout-standard` / `.layout-wide` / `.layout-full`)
-# toggled from the sidebar. All rules below only restyle — no backend.
+# toggled from the sidebar.
+#
+# The stylesheet lives in ``web/styles.css`` (single source of truth) so
+# designers can edit CSS without touching Python. We load it lazily, wrap
+# the contents in a single ``<style>`` tag, and inject it through
+# ``st.markdown(..., unsafe_allow_html=True)`` so the rules apply to the
+# entire page (Streamlit hoists the ``<style>`` element out of the
+# markdown container at render time).
+#
+# ``_STYLESHEET_PATH`` is resolved relative to this file so it works
+# whether the app is launched with ``streamlit run`` from the project
+# root or from ``web/``.
 
-_CUSTOM_CSS = """
-<style>
-    /* ---------- Design tokens -----------------------------------------
-       Force a light color scheme so the browser's UA dark-mode stylesheet
-       can never recolor our bubbles, inputs, or code blocks. This is the
-       single most important rule in the whole stylesheet. */
-    :root {
-        color-scheme: light !important;
-        --bg-page:        #eef2f7;
-        --bg-surface:     #ffffff;
-        --bg-surface-2:   #f8fafc;
-        --bg-sidebar:     #0b1220;
-        --bg-sidebar-2:   #111a2e;
-        --border-subtle:  #e2e8f0;
-        --border-strong:  #cbd5e1;
-        --text-primary:   #0f172a;
-        --text-secondary: #334155;
-        --text-muted:     #64748b;
-        --text-inverse:   #e2e8f0;
-        --accent:         #1d4ed8;
-        --accent-soft:    #dbe5ff;
-        --accent-strong:  #1e3a8a;
-        --success:        #047857;
-        --warn:           #b45309;
-        --user-bubble:    #1d4ed8;
-        --user-bubble-2:  #1e40af;
-        --shadow-sm:      0 1px 2px rgba(15, 23, 42, 0.06);
-        --shadow-md:      0 4px 14px rgba(15, 23, 42, 0.08);
-        --radius-sm:      8px;
-        --radius-md:      12px;
-        --radius-lg:      16px;
+_STYLESHEET_PATH = Path(__file__).resolve().parent / "styles.css"
 
-        --container-max:  920px;
-        --content-pad:    1.25rem;
-        --bubble-max:     82%;
-        --bubble-pad-y:   0.85rem;
-        --bubble-pad-x:   1.1rem;
-        --row-gap:        0.65rem;
-        --hero-pad:       1.75rem 2rem;
-    }
 
-    /* Layout density variants. The radio in the sidebar adds one of these
-       classes to a wrapper <div> right under <body> via a small
-       st.markdown below. Everything else reads the CSS variables above. */
-    body.layout-compact  { --container-max: 720px;  --content-pad: 0.75rem;
-                           --bubble-max: 76%; --bubble-pad-y: 0.55rem;
-                           --bubble-pad-x: 0.8rem; --row-gap: 0.35rem;
-                           --hero-pad: 1rem 1.1rem; }
-    body.layout-standard { --container-max: 920px;  --content-pad: 1.25rem;
-                           --bubble-max: 82%; --bubble-pad-y: 0.75rem;
-                           --bubble-pad-x: 1rem; --row-gap: 0.55rem;
-                           --hero-pad: 1.5rem 1.75rem; }
-    body.layout-wide     { --container-max: 1180px; --content-pad: 1.75rem;
-                           --bubble-max: 88%; --bubble-pad-y: 0.85rem;
-                           --bubble-pad-x: 1.1rem; --row-gap: 0.7rem;
-                           --hero-pad: 1.75rem 2rem; }
-    body.layout-full     { --container-max: 100%;   --content-pad: 2.25rem;
-                           --bubble-max: 92%; --bubble-pad-y: 0.95rem;
-                           --bubble-pad-x: 1.2rem; --row-gap: 0.8rem;
-                           --hero-pad: 2rem 2.25rem; }
+@st.cache_data(show_spinner=False)
+def _load_stylesheet() -> str:
+    """Read ``web/styles.css`` and wrap it in a ``<style>`` tag.
 
-    /* ---------- Global page chrome ------------------------------------ */
-    /* `!important` everywhere below to beat Streamlit's own high-
-       specificity theme rules and the browser's prefers-color-scheme
-       dark UA stylesheet. */
-    html, body, .stApp {
-        background: var(--bg-page) !important;
-        color: var(--text-primary) !important;
-    }
-    body, .stApp, .stApp * { color-scheme: light !important; }
-    .stApp header[data-testid="stHeader"] {
-        background: linear-gradient(90deg, #0b1220 0%, #15233f 50%, #0b1220 100%) !important;
-        height: 3.25rem; box-shadow: var(--shadow-sm);
-    }
-    #MainMenu { visibility: hidden; }
-    footer    { visibility: hidden; }
+    Returns the payload as a single string. The result is cached for
+    the life of the Streamlit process — the file is read once, on the
+    first rerun, and never touched again. This keeps the cost of the
+    injection at roughly the cost of a single ``open()`` call.
+    """
+    raw = _STYLESHEET_PATH.read_text(encoding="utf-8").strip()
+    # If the file already starts with ``<style>``, return as-is. This
+    # keeps a hand-edited header (e.g. ``<!-- @import ... -->``) working.
+    if raw.lower().startswith("<style"):
+        return raw
+    return f"<style>\n{raw}\n</style>"
 
-    /* ---------- Main column ------------------------------------------- */
-    .block-container {
-        padding-top: 1.5rem;
-        padding-bottom: 6rem;          /* leave room for the floating chat input */
-        padding-left: var(--content-pad);
-        padding-right: var(--content-pad);
-        max-width: var(--container-max);
-        color: var(--text-primary);
-    }
-    /* Force dark text on every direct Streamlit container in the main
-       area. Without this, the chat_input's inner span and any caption
-       inherits a white color from somewhere in the cascade. */
-    .main .block-container,
-    .main .block-container p,
-    .main .block-container span,
-    .main .block-container div,
-    .main .block-container li,
-    .main .block-container label,
-    .main .block-container small { color: var(--text-primary) !important; }
-    .main .block-container h1,
-    .main .block-container h2,
-    .main .block-container h3 { color: var(--text-primary) !important; }
 
-    /* ---------- Sidebar ----------------------------------------------- */
-    section[data-testid="stSidebar"] {
-        background: linear-gradient(180deg, var(--bg-sidebar) 0%, var(--bg-sidebar-2) 100%);
-        border-right: 1px solid rgba(255,255,255,0.06);
-    }
-    section[data-testid="stSidebar"] * { color: var(--text-inverse) !important; }
-    section[data-testid="stSidebar"] h1,
-    section[data-testid="stSidebar"] h2,
-    section[data-testid="stSidebar"] h3 { color: #c7d2fe !important; letter-spacing: 0.01em; }
-    section[data-testid="stSidebar"] .stMarkdown p { color: #cbd5e1 !important; }
-    section[data-testid="stSidebar"] hr { border-color: rgba(255,255,255,0.08); }
-    /* Sidebar brand block */
-    .sm-brand {
-        display: flex; align-items: center; gap: 0.6rem;
-        padding: 0.25rem 0 0.5rem 0;
-    }
-    .sm-brand .logo {
-        width: 32px; height: 32px;
-        display: inline-flex; align-items: center; justify-content: center;
-        background: linear-gradient(135deg, #1d4ed8 0%, #4338ca 100%);
-        color: #fff; border-radius: 8px;
-        box-shadow: 0 2px 6px rgba(29, 78, 216, 0.35);
-        font-size: 0.95rem;
-    }
-    .sm-brand .name { font-size: 1.1rem; font-weight: 700; color: #f8fafc; letter-spacing: 0.01em; }
-    .sm-brand .tag  { font-size: 0.7rem; color: #94a3b8; letter-spacing: 0.04em; text-transform: uppercase; }
-    /* Sidebar section headings */
-    section[data-testid="stSidebar"] h3 {
-        font-size: 0.72rem !important;
-        text-transform: uppercase;
-        letter-spacing: 0.08em;
-        color: #93c5fd !important;
-        margin-top: 0.75rem !important;
-        margin-bottom: 0.35rem !important;
-        font-weight: 600 !important;
-    }
-    /* Sidebar inputs — dark surfaces, light text */
-    section[data-testid="stSidebar"] .stTextInput input,
-    section[data-testid="stSidebar"] .stTextArea textarea,
-    section[data-testid="stSidebar"] .stNumberInput input,
-    section[data-testid="stSidebar"] .stChatInput input {
-        background: rgba(255,255,255,0.05) !important;
-        color: #f1f5f9 !important;
-        border: 1px solid rgba(255,255,255,0.1) !important;
-        border-radius: var(--radius-sm) !important;
-    }
-    section[data-testid="stSidebar"] .stSelectbox div[data-baseweb="select"] > div {
-        background: rgba(255,255,255,0.05) !important;
-        color: #f1f5f9 !important;
-        border-color: rgba(255,255,255,0.1) !important;
-    }
-    section[data-testid="stSidebar"] label,
-    section[data-testid="stSidebar"] .stMarkdown small,
-    section[data-testid="stSidebar"] .stCaption { color: #cbd5e1 !important; }
-    /* The base sidebar button palette is overridden globally below
-       (see the dark-slate section). Keep this selector out so the
-       `.stButton > button` rules further down can paint every
-       sidebar button with the new dark surface. */
-    section[data-testid="stSidebar"] .stDownloadButton > button {
-        background: linear-gradient(135deg, #1d4ed8 0%, #1e40af 100%);
-        color: #fff;
-        border: 1px solid rgba(255,255,255,0.15);
-        border-radius: var(--radius-sm);
-    }
-    section[data-testid="stSidebar"] .stDownloadButton > button:hover {
-        background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%);
-    }
-    /* Sidebar example-prompt buttons — left aligned, lighter */
-    section[data-testid="stSidebar"] .stButton > button[kind="secondary"] {
-        background: transparent;
-        border: 1px solid rgba(255,255,255,0.08);
-        text-align: left;
-        justify-content: flex-start;
-        font-size: 0.82rem;
-        color: #cbd5e1;
-    }
+st.markdown(_load_stylesheet(), unsafe_allow_html=True)
 
-    /* ---------- Sidebar premium cards (new layout) ------------------- */
-    /* A soft, rounded card that groups a related set of widgets. Used
-       for the core-picks block, the recon help block, the chat-history
-       list, and the overview block. The card sits on top of the dark
-       sidebar gradient and gives the sidebar a layered, panel-based
-       look — closer to a productised desktop client than a long
-       flat form. */
-    .sm-card {
-        background: linear-gradient(180deg, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.02) 100%);
-        border: 1px solid rgba(255,255,255,0.08);
-        border-radius: 12px;
-        padding: 0.85rem 0.9rem 0.95rem 0.9rem;
-        margin-bottom: 0.65rem;
-        box-shadow: 0 1px 0 rgba(0,0,0,0.25), 0 6px 18px rgba(0,0,0,0.18);
-    }
-    .sm-card .sm-card-title {
-        display: flex; align-items: center; gap: 0.45rem;
-        font-size: 0.72rem; font-weight: 700;
-        text-transform: uppercase; letter-spacing: 0.1em;
-        color: #93c5fd !important;
-        margin: 0 0 0.55rem 0;
-    }
-    .sm-card .sm-card-title .dot {
-        width: 6px; height: 6px; border-radius: 50%;
-        background: #38bdf8;
-        box-shadow: 0 0 8px rgba(56,189,248,0.6);
-    }
-    .sm-card .sm-card-sub {
-        font-size: 0.78rem; color: #94a3b8 !important;
-        margin: -0.25rem 0 0.6rem 0; line-height: 1.35;
-    }
-    /* Inline code chip — used to render the `/recon` syntax. */
-    .sm-inline-code {
-        background: rgba(56,189,248,0.12);
-        border: 1px solid rgba(56,189,248,0.28);
-        color: #7dd3fc !important;
-        padding: 0.1rem 0.35rem;
-        border-radius: 6px;
-        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-        font-size: 0.82rem;
-    }
-    /* Mini-pill list inside a card — used to enumerate recon
-       arguments and the example-prompt row. */
-    .sm-pill-list {
-        display: flex; flex-wrap: wrap; gap: 0.3rem;
-        margin: 0.2rem 0 0.55rem 0;
-    }
-    .sm-pill-list .sm-pill {
-        font-size: 0.72rem;
-        padding: 0.18rem 0.55rem;
-        border-radius: 999px;
-        background: rgba(255,255,255,0.06);
-        border: 1px solid rgba(255,255,255,0.10);
-        color: #cbd5e1 !important;
-    }
-    /* Compact chat-row styling for the in-card history list. */
-    .sm-chat-row {
-        display: flex; align-items: center; gap: 0.35rem;
-        padding: 0.18rem 0.4rem;
-        border-radius: 7px;
-        background: rgba(255,255,255,0.03);
-        border: 1px solid rgba(255,255,255,0.05);
-        margin-bottom: 0.22rem;
-        min-height: 1.6rem;
-    }
-    .sm-chat-row.is-active {
-        background: rgba(56,189,248,0.14);
-        border-color: rgba(56,189,248,0.45);
-        box-shadow: inset 0 0 0 1px rgba(56,189,248,0.15);
-    }
-    .sm-chat-row .sm-chat-title {
-        flex: 1; min-width: 0;
-        font-size: 0.80rem; color: #e2e8f0 !important;
-        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-        line-height: 1.05;
-    }
-    .sm-chat-row .sm-chat-meta {
-        font-size: 0.62rem; color: #94a3b8 !important;
-        text-transform: uppercase; letter-spacing: 0.04em;
-    }
-    /* Override Streamlit's default white button inside chat rows so the
-       rows render as slim, dark, in-card pills instead of pale slabs. */
-    section[data-testid="stSidebar"] .sm-chat-row .stButton > button,
-    section[data-testid="stSidebar"] .sm-chat-row button {
-        background: transparent !important;
-        background-color: transparent !important;
-        border: none !important;
-        box-shadow: none !important;
-        color: #e2e8f0 !important;
-        font-weight: 400 !important;
-        padding: 0.05rem 0.25rem !important;
-        min-height: 1.4rem !important;
-        line-height: 1.05 !important;
-        text-align: left !important;
-        justify-content: flex-start !important;
-    }
-    section[data-testid="stSidebar"] .sm-chat-row button:hover {
-        background: rgba(56,189,248,0.10) !important;
-        color: #f0f9ff !important;
-    }
-    section[data-testid="stSidebar"] .sm-chat-row button:focus {
-        background: rgba(56,189,248,0.18) !important;
-        color: #f0f9ff !important;
-        box-shadow: none !important;
-    }
-    section[data-testid="stSidebar"] .sm-chat-row .sm-chat-trash button {
-        color: #64748b !important;
-        padding: 0.05rem 0.35rem !important;
-    }
-    section[data-testid="stSidebar"] .sm-chat-row .sm-chat-trash button:hover {
-        color: #fca5a5 !important;
-        background: rgba(248,113,113,0.10) !important;
-    }
-    /* Active chat row: sky-tinted title text. */
-    .sm-chat-row.is-active .sm-chat-title { color: #bae6fd !important; }
-    /* Trim Streamlit's vertical padding inside cards so the sidebar
-       stays compact and the cards don't bleed into the next section. */
-    section[data-testid="stSidebar"] .sm-card .block-container { padding: 0; }
-    section[data-testid="stSidebar"] .sm-card .element-container { margin-bottom: 0.35rem; }
-    /* Hide the Streamlit expander label colour clash inside our cards. */
-    section[data-testid="stSidebar"] .sm-card details summary { color: #cbd5e1 !important; }
-    /* Recolor the in-card selectbox (recon scope picker) so it stops
-       looking like a pale slab against the dark card background. */
-    section[data-testid="stSidebar"] .sm-card [data-baseweb="select"] > div {
-        background: rgba(15,23,42,0.6) !important;
-        border-color: rgba(148,163,184,0.25) !important;
-        color: #e2e8f0 !important;
-    }
-    section[data-testid="stSidebar"] .sm-card [data-baseweb="select"] > div:hover {
-        border-color: rgba(56,189,248,0.45) !important;
-    }
-    section[data-testid="stSidebar"] .sm-card [data-baseweb="select"] svg {
-        color: #94a3b8 !important;
-    }
-
-    /* Override every sidebar button (regardless of which card it sits
-       in) with the dark slate surface. Streamlit renders each widget
-       as its own root under the sidebar column — the `.sm-card` div
-       is *not* an ancestor of `.stButton`, so the `.sm-card .stButton`
-       selector matches nothing. We therefore style every sidebar
-       button globally; the chat-row rules above still win inside
-       `.sm-chat-row` because their selector has higher specificity
-       (`.sm-card .sm-chat-row .stButton > button`). The dark surface
-       removes the pale "clears on hover" effect. */
-    section[data-testid="stSidebar"] .stButton > button,
-    section[data-testid="stSidebar"] [data-testid="stDownloadButton"] > button,
-    section[data-testid="stSidebar"] [data-testid="baseButton-secondary"] {
-        background-color: rgba(30,41,59,0.92) !important;
-        background: rgba(30,41,59,0.92) !important;
-        border: 1px solid rgba(148,163,184,0.40) !important;
-        color: #f8fafc !important;
-        font-weight: 600 !important;
-        -webkit-text-fill-color: #f8fafc !important;
-        transition: background-color 0.12s ease,
-                    border-color 0.12s ease, color 0.12s ease !important;
-    }
-    section[data-testid="stSidebar"] .stButton > button:hover,
-    section[data-testid="stSidebar"] [data-testid="stDownloadButton"] > button:hover,
-    section[data-testid="stSidebar"] [data-testid="baseButton-secondary"]:hover {
-        background-color: rgba(56,189,248,0.22) !important;
-        background: rgba(56,189,248,0.22) !important;
-        border-color: rgba(56,189,248,0.65) !important;
-        color: #ffffff !important;
-        -webkit-text-fill-color: #ffffff !important;
-    }
-    section[data-testid="stSidebar"] .stButton > button:focus,
-    section[data-testid="stSidebar"] [data-testid="stDownloadButton"] > button:focus,
-    section[data-testid="stSidebar"] [data-testid="baseButton-secondary"]:focus {
-        background-color: rgba(56,189,248,0.26) !important;
-        background: rgba(56,189,248,0.26) !important;
-        border-color: rgba(56,189,248,0.75) !important;
-        color: #ffffff !important;
-        -webkit-text-fill-color: #ffffff !important;
-        box-shadow: none !important;
-    }
-    section[data-testid="stSidebar"] .stButton > button:active,
-    section[data-testid="stSidebar"] [data-testid="stDownloadButton"] > button:active {
-        background-color: rgba(56,189,248,0.34) !important;
-        background: rgba(56,189,248,0.34) !important;
-        border-color: rgba(56,189,248,0.85) !important;
-        color: #ffffff !important;
-        -webkit-text-fill-color: #ffffff !important;
-    }
-
-    /* ---------- Hero (replaces the old h1+p block) ------------------- */
-    .hero {
-        background: linear-gradient(135deg, #0b1220 0%, #15233f 60%, #1e3a8a 100%);
-        color: #f8fafc;
-        padding: var(--hero-pad);
-        border-radius: var(--radius-lg);
-        margin-bottom: 1.25rem;
-        box-shadow: var(--shadow-md);
-        border: 1px solid rgba(255,255,255,0.05);
-        position: relative;
-        overflow: hidden;
-    }
-    .hero::after {
-        /* Subtle radial accent — no glow, no neon. */
-        content: "";
-        position: absolute; right: -80px; top: -80px;
-        width: 280px; height: 280px;
-        background: radial-gradient(circle, rgba(59,130,246,0.18) 0%, rgba(59,130,246,0) 70%);
-        pointer-events: none;
-    }
-    .hero .eyebrow {
-        font-size: 0.7rem;
-        letter-spacing: 0.14em;
-        text-transform: uppercase;
-        color: #93c5fd;
-        font-weight: 600;
-        margin-bottom: 0.35rem;
-    }
-    .hero h1 {
-        margin: 0;
-        font-size: 1.85rem;
-        font-weight: 700;
-        color: #f8fafc;
-        letter-spacing: -0.01em;
-        display: flex; align-items: center; gap: 0.55rem;
-    }
-    .hero h1 .logo {
-        width: 36px; height: 36px;
-        display: inline-flex; align-items: center; justify-content: center;
-        background: linear-gradient(135deg, #2563eb 0%, #4338ca 100%);
-        color: #fff; border-radius: 9px;
-        box-shadow: 0 4px 12px rgba(37, 99, 235, 0.35);
-        font-size: 1.05rem;
-    }
-    .hero p.subtitle {
-        margin: 0.45rem 0 0 0;
-        color: #cbd5e1;
-        font-size: 0.98rem;
-        line-height: 1.45;
-        max-width: 56ch;
-    }
-    .hero p.tagline {
-        margin: 0.6rem 0 0 0;
-        color: #93c5fd;
-        font-size: 0.85rem;
-        letter-spacing: 0.04em;
-    }
-    .hero .badges {
-        display: flex; flex-wrap: wrap; gap: 0.45rem;
-        margin-top: 1rem;
-    }
-    .hero .badge {
-        display: inline-flex; align-items: center; gap: 0.35rem;
-        background: rgba(255,255,255,0.06);
-        border: 1px solid rgba(255,255,255,0.14);
-        color: #e0e7ff;
-        border-radius: 999px;
-        padding: 4px 12px;
-        font-size: 0.78rem;
-        font-weight: 500;
-    }
-    .hero .badge .dot {
-        width: 6px; height: 6px; border-radius: 50%;
-        background: #60a5fa;
-    }
-
-    /* ---------- Hero (kept dark on purpose — it's the brand surface) */
-    .hero, .hero *, .hero p, .hero h1 { color: #f8fafc !important; }
-    .hero .eyebrow, .hero .tagline  { color: #93c5fd !important; }
-    .hero .badge  { color: #e0e7ff !important; }
-    .hero .subtitle { color: #cbd5e1 !important; }
-
-    /* ---------- Status pill (light surface) ------------------------- */
-    .status, .status * { color: var(--text-secondary) !important; }
-
-    /* ---------- Chat bubbles -----------------------------------------
-       High-specificity color rules so the assistant bubble's text is
-       always dark on white, no matter what Streamlit's theme does. */
-    .row { display: flex; margin: var(--row-gap) 0; }
-    .row.right { justify-content: flex-end; }
-    .row.left  { justify-content: flex-start; }
-
-    .bubble-user {
-        background: linear-gradient(135deg, #1d4ed8 0%, #1e40af 100%) !important;
-        color: #ffffff !important;
-        padding: var(--bubble-pad-y) var(--bubble-pad-x);
-        border-radius: 14px 14px 4px 14px;
-        display: inline-block;
-        max-width: var(--bubble-max);
-        box-shadow: var(--shadow-sm);
-        line-height: 1.5;
-        font-size: 0.95rem;
-        word-wrap: break-word;
-    }
-    .bubble-user * { color: #ffffff !important; }
-
-    .bubble-assistant {
-        background: var(--bg-surface) !important;
-        color: var(--text-primary) !important;
-        padding: var(--bubble-pad-y) var(--bubble-pad-x);
-        border-radius: 14px 14px 14px 4px;
-        display: inline-flex;
-        flex-direction: column;
-        align-items: stretch;
-        max-width: var(--bubble-max);
-        border: 1px solid var(--border-subtle);
-        box-shadow: var(--shadow-sm);
-        line-height: 1.6;
-        font-size: 0.95rem;
-        word-wrap: break-word;
-    }
-    /* The first child is the rendered markdown body; everything after
-       it (the copy button, any future action chips) hugs the bottom of
-       the bubble. */
-    .bubble-assistant > :first-child { min-width: 0; }
-    .bubble-assistant > :not(:first-child) { margin-top: 0.45rem; }
-    /* Force every element inside the assistant bubble to inherit dark
-       text — Streamlit wraps rendered markdown in a <p> which would
-       otherwise pick up the page-level white text. */
-    .bubble-assistant,
-    .bubble-assistant *,
-    .bubble-assistant p,
-    .bubble-assistant li,
-    .bubble-assistant span,
-    .bubble-assistant strong,
-    .bubble-assistant em { color: var(--text-primary) !important; }
-    .bubble-assistant p:first-child { margin-top: 0; }
-    .bubble-assistant p:last-child  { margin-bottom: 0; }
-    .bubble-assistant a { color: var(--accent) !important; text-decoration: underline; }
-    .bubble-assistant pre {
-        background: #0f172a !important;
-        color: #e2e8f0 !important;
-        border-radius: 8px;
-        padding: 0.75rem 0.9rem;
-        font-size: 0.82rem;
-        overflow-x: auto;
-        margin: 0.6rem 0;
-        border: 1px solid #1e293b;
-    }
-    .bubble-assistant pre * { color: #e2e8f0 !important; }
-    .bubble-assistant code {
-        background: #eef2f7 !important;
-        color: #1e293b !important;
-        padding: 1px 6px;
-        border-radius: 4px;
-        font-size: 0.85em;
-    }
-    .bubble-assistant pre code {
-        background: transparent !important; color: #e2e8f0 !important; padding: 0;
-    }
-    .bubble-assistant table {
-        border-collapse: collapse;
-        font-size: 0.85rem;
-        margin: 0.5rem 0;
-    }
-    .bubble-assistant th, .bubble-assistant td {
-        border: 1px solid var(--border-subtle);
-        padding: 4px 8px;
-    }
-    .bubble-assistant th {
-        background: var(--bg-surface-2) !important;
-        text-align: left;
-        font-weight: 600;
-    }
-    .bubble-system {
-        background: #fef3c7 !important;
-        color: #78350f !important;
-        padding: 0.5rem 0.85rem;
-        border-radius: 10px;
-        font-size: 0.85rem;
-        border: 1px solid #fde68a;
-    }
-    .bubble-thinking {
-        background: var(--bg-surface) !important;
-        color: var(--text-secondary) !important;
-        padding: var(--bubble-pad-y) var(--bubble-pad-x);
-        border-radius: 14px 14px 14px 4px;
-        display: inline-flex; align-items: center; gap: 0.5rem;
-        max-width: var(--bubble-max);
-        border: 1px solid var(--border-subtle);
-        box-shadow: var(--shadow-sm);
-        font-size: 0.9rem;
-        font-style: italic;
-    }
-    .bubble-thinking * { color: var(--text-secondary) !important; }
-
-    /* ---------- Copy-to-clipboard button (Tier 1 #4) ------------------
-       Sits inside the assistant bubble, right-aligned at the bottom,
-       ChatGPT-style. Theme-aware (light surface on the navy page),
-       tiny, hover hint. The whole button is a single inline <button>
-       rendered by ``web.chat_helpers._copy_button_html``; we only
-       style it here. */
-    .bubble-copy-btn {
-        align-self: flex-end;
-        margin-top: 0.45rem;
-        background: transparent !important;
-        color: var(--text-secondary) !important;
-        border: 1px solid var(--border-subtle);
-        border-radius: 999px;
-        padding: 2px 9px;
-        font-size: 0.7rem;
-        font-weight: 500;
-        line-height: 1.4;
-        cursor: pointer;
-        transition: background 120ms ease, border-color 120ms ease,
-                    color 120ms ease, transform 80ms ease;
-        user-select: none;
-        display: inline-flex;
-        align-items: center;
-        gap: 0.3rem;
-    }
-    .bubble-copy-btn:hover {
-        background: var(--bg-surface-2) !important;
-        border-color: var(--border-strong);
-        color: var(--text-primary) !important;
-    }
-    .bubble-copy-btn:active { transform: translateY(1px); }
-    .bubble-copy-btn:focus-visible {
-        outline: 2px solid var(--accent);
-        outline-offset: 2px;
-    }
-
-    /* ---------- Role labels (You / SecMentor) ------------------------ */
-    .role-label {
-        font-size: 0.7rem;
-        font-weight: 600;
-        color: var(--text-muted) !important;
-        margin: 0 0 3px 0;
-        letter-spacing: 0.06em;
-        text-transform: uppercase;
-    }
-    .row.right .role-label { text-align: right; }
-    .row.left  .role-label { text-align: left;  }
-
-    /* ---------- Status pill (bottom) --------------------------------- */
-    .status {
-        display: inline-flex; align-items: center; flex-wrap: wrap; gap: 0.55rem;
-        font-size: 0.78rem;
-        color: var(--text-muted);
-        background: var(--bg-surface) !important;
-        border: 1px solid var(--border-subtle);
-        border-radius: 999px;
-        padding: 6px 14px;
-        margin-top: 0.75rem;
-        box-shadow: var(--shadow-sm);
-    }
-    .status .sep { color: var(--border-strong) !important; }
-    .status .pulse {
-        display: inline-block; width: 8px; height: 8px;
-        background: #10b981; border-radius: 50%;
-        margin-right: 2px;
-        animation: pulse 1.8s ease-in-out infinite;
-    }
-    .status.thinking .pulse { background: #f59e0b; }
-    @keyframes pulse {
-        0%, 100% { opacity: 1; }
-        50%      { opacity: 0.45; }
-    }
-
-    /* ---------- Empty state ------------------------------------------ */
-    .empty-state {
-        background: var(--bg-surface) !important;
-        color: var(--text-primary) !important;
-        border: 1px solid var(--border-subtle);
-        border-radius: var(--radius-md);
-        padding: 2rem 1.75rem;
-        margin: 1rem 0 1.25rem 0;
-        text-align: center;
-        box-shadow: var(--shadow-sm);
-    }
-    .empty-state * { color: var(--text-primary) !important; }
-    .empty-state p  { color: var(--text-secondary) !important; }
-    .empty-state .icon {
-        width: 48px; height: 48px; margin: 0 auto 0.6rem auto;
-        display: inline-flex; align-items: center; justify-content: center;
-        background: var(--accent-soft) !important; color: var(--accent-strong) !important;
-        border-radius: 12px; font-size: 1.3rem;
-    }
-    .empty-state h3 {
-        margin: 0 0 0.35rem 0;
-        font-size: 1.05rem;
-        font-weight: 600;
-    }
-    .empty-state .suggestions {
-        display: flex; flex-wrap: wrap; gap: 0.4rem; justify-content: center;
-        margin-top: 1rem;
-    }
-    .empty-state .suggestions .chip {
-        background: var(--bg-surface-2) !important;
-        border: 1px solid var(--border-subtle);
-        color: var(--text-secondary) !important;
-        font-size: 0.78rem;
-        padding: 4px 10px;
-        border-radius: 999px;
-    }
-
-    /* ---------- Chat input (floating card) --------------------------- */
-    /* The chat input is bottom-positioned by Streamlit. Wrap it in a
-       card-like surface so it visually anchors the layout. */
-    [data-testid="stChatInput"] {
-        background: var(--bg-surface) !important;
-        border: 1px solid var(--border-strong) !important;
-        border-radius: 14px !important;
-        box-shadow: 0 6px 24px rgba(15, 23, 42, 0.10) !important;
-        padding: 4px 6px !important;
-    }
-    [data-testid="stChatInput"] textarea,
-    [data-testid="stChatInput"] input {
-        color: var(--text-primary) !important;
-        background: transparent !important;
-        font-size: 0.96rem !important;
-        caret-color: var(--accent) !important;
-    }
-    [data-testid="stChatInput"] textarea::placeholder {
-        color: var(--text-muted) !important;
-        opacity: 1 !important;
-    }
-    [data-testid="stChatInput"] button,
-    [data-testid="stChatInput"] [data-testid="baseButton-secondary"] {
-        background: var(--accent) !important;
-        color: #ffffff !important;
-        border-radius: 10px !important;
-    }
-
-    /* ---------- Tighter captions ------------------------------------- */
-    .stCaption, [data-testid="stCaptionContainer"],
-    .stCaption p, [data-testid="stCaptionContainer"] p {
-        color: var(--text-muted) !important;
-    }
-    /* Captions inside the main column: a touch darker for legibility. */
-    .main .stCaption, .main [data-testid="stCaptionContainer"],
-    .main .stCaption p {
-        color: var(--text-secondary) !important;
-    }
-
-    /* ---------- Streamlit default widget fixes ----------------------- */
-    .stAlert p { color: inherit !important; }
-    .stAlert[data-baseweb="notification"] * { color: inherit !important; }
-</style>
-"""
-st.markdown(_CUSTOM_CSS, unsafe_allow_html=True)
 # Per-bubble copy buttons are rendered inline by
 # ``_render_copy_button_for_bubble`` — one ``st.components.v1.html`` call
 # per assistant message. Each iframe contains the reply text and a
@@ -1141,7 +502,7 @@ def _init_state() -> None:
     if "show_role_labels" not in st.session_state:
         st.session_state["show_role_labels"] = True
     # Layout density mode — drives a CSS class on <body> via a small
-    # st.markdown in the sidebar block. See _CUSTOM_CSS for token
+    # st.markdown in the sidebar block. See ``web/styles.css`` for token
     # overrides. The default ("standard") matches the original 920px
     # max-width so existing layouts look identical on first load.
     if "layout_mode" not in st.session_state:
@@ -1154,8 +515,8 @@ _init_state()
 # --- Sidebar -----------------------------------------------------------------
 # All sidebar widgets live in ``_render_sidebar`` so main() stays linear and
 # the layout is easy to reason about. The new layout is card-based (CSS in
-# ``_CUSTOM_CSS``: .sm-card / .sm-card-title / .sm-pill / .sm-chat-row) and
-# orders sections by user value:
+# ``web/styles.css``: .sm-card / .sm-card-title / .sm-pill / .sm-chat-row)
+# and orders sections by user value:
 #
 #   1. Brand block
 #   2. CORE PICKS  — Layout, Teaching mode, Model, Display, Advanced
@@ -1195,7 +556,7 @@ def _render_sidebar() -> None:
 
     # Layout mode toggle. Drives a class on <body> (`.layout-compact`,
     # `.layout-standard`, `.layout-wide`, `.layout-full`) so the CSS
-    # tokens in _CUSTOM_CSS pick the right container width, bubble
+    # tokens in ``web/styles.css`` pick the right container width, bubble
     # padding, sidebar density, and hero size. Streamlit does not let
     # us set attributes on <body> declaratively, so we ship a tiny
     # client-side script that runs on every page load and applies the
@@ -1772,6 +1133,17 @@ def _render_bubble(message: ChatMessage) -> None:
     """
     role = message.get("role", "assistant")
     content = message.get("content", "")
+    # ``content`` can be either a ``str`` (text-only turn) or a
+    # ``list[dict]`` of multimodal parts (image-bearing turn, persisted
+    # as JSON and re-decoded by ``app.storage.list_messages``). The
+    # rendering branches below call ``str``-only methods
+    # (``content.replace(...)``, ``st.markdown(content)``, the copy
+    # button's markdown-to-plain pipeline) that blow up with
+    # ``AttributeError: 'list' object has no attribute 'replace'`` on
+    # the list shape. Coerce once at the top so every branch sees a
+    # ``str``; ``_coerce_message_text`` preserves the user's text and
+    # replaces image parts with a short `[image: ...]` placeholder.
+    content = _coerce_message_text(content)
     align = _bubble_alignment(role)
     show_label = bool(st.session_state.get("show_role_labels", True))
     label_text = "You" if role == "user" else "SecMentor"
@@ -2528,6 +1900,28 @@ def _ask(prompt: str | dict[str, object] | None) -> None:
         st.caption(
             "Tried: " + ", ".join(router.slot_labels())
         )
+        # Vision-aware diagnostic note. When the failing turn was
+        # pinned to the only free vision model
+        # (``nvidia/nemotron-nano-12b-vl:free``), the pool collapses
+        # from ``len(keys) × len(models)`` to ``len(keys) × 1`` — every
+        # slot shares the same upstream provider. A single Nemotron
+        # throttle therefore burns the whole pool. Surface a one-line
+        # hint so the user can tell "Nemotron is throttling" from
+        # "all my keys are wrong". Detection: the request attached
+        # files (so we were on the pinned vision path) AND the pinned
+        # model is the only known vision model id. The text path
+        # keeps the original generic banner.
+        _vision_pool_collapsed = bool(
+            request.get("had_files") and model_supports_vision(model)
+        )
+        if _vision_pool_collapsed:
+            st.caption(
+                "Vision pool is single-model "
+                f"(`{model}`) — every (key, model) slot shares the "
+                "same upstream provider, so one provider throttle "
+                "exhausts the pool. Wait a minute and retry, or "
+                "switch to a text-only turn for now."
+            )
         with st.expander("Last error per slot (for debugging)", expanded=False):
             for slot_label in router.slot_labels():
                 # Re-derive the slot to surface its last_error. The
@@ -2952,11 +2346,68 @@ _ACCEPTED_FILE_TYPES: list[str] = [
 # leaves its right edge anchored to the chat input's left edge below.
 _render_chatbox_model_picker()
 
-user_chat = st.chat_input(
-    "Ask a cybersecurity question… (attach files with the 📎 button)",
-    accept_file="multiple",
-    file_type=_ACCEPTED_FILE_TYPES,
-)
+# --- Chat input with media-file safety net ---------------------------------
+# ``st.chat_input(accept_file="multiple")`` is the standard way to let
+# users attach files alongside their question, but Streamlit stores the
+# file bytes in a per-session in-memory store keyed by content hash.
+# When the server restarts (or the Streamlit worker is recycled) and
+# the user keeps the tab open, the browser still echoes the previous
+# file's media ID back to the new server, which then raises
+# ``MediaFileStorageError`` from inside the widget's render call —
+# blanking the whole page with a server-side traceback.
+#
+# The guard below catches that exact failure mode, shows a one-time
+# recovery banner, clears the pending request so a partial answer is
+# not finalised against lost data, and swaps in a plain text
+# ``st.chat_input`` for the rest of the session. The downgrade is
+# sticky (per-session) so the next rerun is silent; a manual "Reset
+# attachments" button re-enables the file picker for users who
+# restarted the server intentionally and want to attach again.
+if st.session_state.get(_SESSION_STATE_MEDIA_ERROR):
+    st.warning(
+        "An attachment from a previous server session is no longer "
+        "available — the file input has been temporarily disabled. "
+        "Re-attach your file (or re-type the question) and the "
+        "next reply will work normally.",
+        icon="📎",
+    )
+    if st.button(
+        "Reset attachments (re-enable file picker)",
+        key="_reset_attachments_btn",
+    ):
+        st.session_state.pop(_SESSION_STATE_MEDIA_ERROR, None)
+        st.rerun()
+    # Plain text fallback — no accept_file, so the chat input never
+    # touches the media store and the original error cannot fire
+    # again this session.
+    user_chat = st.chat_input(
+        "Ask a cybersecurity question…",
+    )
+else:
+    try:
+        user_chat = st.chat_input(
+            "Ask a cybersecurity question… (attach files with the 📎 button)",
+            accept_file="multiple",
+            file_type=_ACCEPTED_FILE_TYPES,
+        )
+    except _MediaFileStorageError as _media_exc:
+        # The widget's own re-serialisation step raised. Mark the
+        # session so the *next* render uses the text-only fallback,
+        # surface a one-time friendly banner, drop the in-flight
+        # request so a partial reply is not finalised against lost
+        # file data, and rerun into the safe path.
+        st.session_state[_SESSION_STATE_MEDIA_ERROR] = True
+        st.session_state.pop("pending_request", None)
+        st.session_state.pop("pending_started_at", None)
+        # Log the raw exception for debugging without exposing the
+        # full storage error to the user (the underlying message
+        # embeds the lost file's media ID, which is meaningless to
+        # the user but a useful breadcrumb in the server log).
+        logging.getLogger(__name__).warning(
+            "Media file storage raised during chat input render: %s",
+            _media_exc,
+        )
+        st.rerun()
 if user_chat:
     # `st.chat_input` returns a `ChatInputValue` when `accept_file` is
     # set, with `.text` (str) and `.files` (list[UploadedFile]).

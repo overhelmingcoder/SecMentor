@@ -1109,6 +1109,40 @@ def vision_timeout_seconds() -> float:
     return _VISION_TIMEOUT_SECONDS
 
 
+# Per-call tunables forwarded to ``router.stream_chat`` from
+# :func:`stream_vision_turn_with_fallback`. These exist because the
+# free-tier vision pool is effectively five slots (one model id
+# ``nvidia/nemotron-nano-12b-v2-vl:free`` × N api keys), all sharing
+# one upstream provider. A 60-second rate-limit cooldown on one slot
+# is therefore a 60-second cooldown on the *only* upstream that can
+# serve the pinned model — the pool collapses from 5 "independent"
+# slots to 1 throttle bucket. Combined with the default
+# ``max_attempts=6`` and a 45s timeout, a stuck Nemotron can pin a
+# user turn for ~9 minutes. These tunables cap the worst case at
+# roughly ``2 × (45s + 10s) ≈ 110s`` before the helper degrades to
+# text, which is within the user-tolerable "still working" window.
+# The text fallback uses the same tunables so a degraded turn
+# cannot monopolise the text pool either. Mutating this dict at
+# runtime is supported (the helper reads it lazily on each call)
+# but not encouraged — patch it in tests via ``monkeypatch``.
+_VISION_STREAM_TUNABLES: dict[str, float] = {
+    "max_attempts": 2,
+    "rate_limit_cooldown_seconds": 10.0,
+}
+
+
+def vision_stream_tunables() -> dict[str, float]:
+    """Return a *copy* of the per-call vision-stream tunables.
+
+    Returning a copy prevents call sites from mutating the module
+    constant via the returned reference. The test suite asserts on
+    the values via this helper rather than the bare dict so a
+    future refactor (e.g. a frozen dataclass) stays a single-line
+    change. See :data:`_VISION_STREAM_TUNABLES` for the rationale.
+    """
+    return dict(_VISION_STREAM_TUNABLES)
+
+
 def degrade_vision_to_text(
     text: str | list[dict[str, object]] | None,
     files: Iterable[_UploadedFileLike] | None,
@@ -1328,6 +1362,22 @@ def stream_vision_turn_with_fallback(
     does not call ``st.write_stream``, and does not touch
     ``time.sleep``. The caller decides how to render the chunks and
     how to assemble the final ``reply`` string for the transcript.
+
+    Both the vision attempt and the text fallback pass the tight
+    tunables in :data:`_VISION_STREAM_TUNABLES` (a small ``max_attempts``
+    cap and a short rate-limit cooldown) to ``router.stream_chat``.
+    The free-tier vision pool is effectively five slots
+    (one model id × N keys), all sharing the same upstream
+    provider, so a 60-second cooldown on a single Nemotron throttle
+    burns the whole pool before the user sees a useful error.
+    ``max_attempts=2`` plus ``rate_limit_cooldown_seconds=10``
+    caps the worst-case wall clock at roughly ``2 × (45s timeout
+    + 10s cooldown) ≈ 110s`` before we degrade to text — the
+    user gets a useful reply within two minutes instead of
+    staring at "Thinking…" for nine. The text fallback uses the
+    same tunables because the rest of the conversation still has
+    to work after a vision failure and we do not want a degraded
+    turn to monopolise the text pool either.
     """
     yielded_any = False
     last_exc: BaseException | None = None
@@ -1338,6 +1388,10 @@ def stream_vision_turn_with_fallback(
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            max_attempts=_VISION_STREAM_TUNABLES["max_attempts"],
+            rate_limit_cooldown_seconds=_VISION_STREAM_TUNABLES[
+                "rate_limit_cooldown_seconds"
+            ],
         ):
             if chunk:
                 yielded_any = True
@@ -1386,6 +1440,10 @@ def stream_vision_turn_with_fallback(
         temperature=temperature,
         max_tokens=max_tokens,
         timeout=timeout,
+        max_attempts=_VISION_STREAM_TUNABLES["max_attempts"],
+        rate_limit_cooldown_seconds=_VISION_STREAM_TUNABLES[
+            "rate_limit_cooldown_seconds"
+        ],
     ):
         if chunk:
             yield (chunk, "text")
@@ -1943,6 +2001,101 @@ def _markdown_to_plain_text(content: str) -> str:
     text = _MARKDOWN_BLANK_LINES_RE.sub("\n\n", text)
 
     return text.strip("\n")
+
+
+def _coerce_message_text(content: object) -> str:
+    """Coerce a chat message ``content`` field into a plain-text string.
+
+    The on-disk schema (:mod:`app.storage`) stores ``content`` as a JSON
+    blob, which round-trips through :func:`storage.list_messages` to one
+    of two shapes:
+
+    * ``str`` — the common text-only turn ("explain SQL injection").
+    * ``list[dict]`` — a multimodal turn with one or more ``{"type": ...,
+      "text"|"image_url": ...}`` parts, used when the user attached an
+      image to the question.
+
+    Render-side helpers in the view layer were originally written with
+    the ``str`` shape in mind: ``content.replace(...)``,
+    ``st.markdown(content)``, etc. When a multimodal turn is replayed
+    from history those helpers blow up with
+    ``AttributeError: 'list' object has no attribute 'replace'`` (or
+    similar), and the entire rerun aborts — so the user loses *every*
+    bubble in the current chat, not just the multimodal one. This
+    helper normalises both shapes to a single ``str`` so the view can
+    treat every message uniformly.
+
+    Behaviour
+    ---------
+    * ``str`` input is returned verbatim. Whitespace is preserved so a
+      leading newline (rare, but legal) survives.
+    * ``list`` input is walked part-by-part. Text parts
+      (``{"type": "text", "text": "..."}`` and the legacy
+      ``{"type": "text", "text": "..."}`` shape with a missing ``type``
+      key — we accept both because some OpenRouter-compatible providers
+      omit the discriminator) are concatenated with a single space
+      separator; image parts
+      (``{"type": "image_url", "image_url": {...}}``) are rendered as
+      a short placeholder so the bubble is not blank but the user is
+      not lied to about what was attached. The placeholder format is
+      ``"[image: <url-or-data-uri-prefix>]"`` so it is greppable in
+      logs and obviously not part of the user's actual question.
+    * Anything else (``None``, ``int``, ``dict``, ...) is stringified
+      with ``str()`` so the bubble still renders instead of crashing
+      the rerun. The defensive fallback exists because the schema
+      contract is "JSON blob" and a future caller could add a shape
+      we have not seen yet — failing the entire render path on an
+      unknown shape is worse than showing the user a slightly weird
+      bubble.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                # Tolerate stray scalars inside a parts list (some
+                # providers send ``[{"text": "..."}, "ignored"]``).
+                # Stringify them so the bubble keeps something useful.
+                parts.append(str(item))
+                continue
+            part_type = item.get("type")
+            if part_type == "image_url" or "image_url" in item:
+                # Surface the image attachment in plain text without
+                # trying to embed an <img> tag — the bubble is a
+                # plain-text context. The URL may be a data URI; we
+                # only show a short prefix to avoid ballooning the
+                # transcript with base64 noise.
+                url = item.get("image_url")
+                if isinstance(url, dict):
+                    url = url.get("url") or ""
+                if not isinstance(url, str):
+                    url = ""
+                if url.startswith("data:"):
+                    url = url[:32] + "..."
+                parts.append(f"[image: {url}]")
+            elif "text" in item:
+                # OpenAI-compatible content parts. The discriminator
+                # may be missing (``{"text": "..."}`` alone), so we
+                # accept the field rather than requiring ``type``.
+                text_value = item.get("text")
+                if isinstance(text_value, str):
+                    parts.append(text_value)
+                else:
+                    parts.append(str(text_value))
+            elif part_type is not None:
+                # Unknown structured part — render as a placeholder
+                # so the transcript is honest about the shape without
+                # crashing.
+                parts.append(f"[{part_type}]")
+            else:
+                # A bare ``{"foo": "bar"}`` dict inside a parts list
+                # has no field we know how to render. Skip it
+                # silently rather than stringifying the whole dict,
+                # which would dump JSON into the bubble.
+                continue
+        return " ".join(p for p in parts if p)
+    return str(content)
 
 
 def _copy_button_html_for_bubble(content: str) -> str:

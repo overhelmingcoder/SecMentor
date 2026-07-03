@@ -466,6 +466,8 @@ class ModelRouter:
         max_tokens: int | None = None,
         model: str | None = None,
         timeout: float | None = None,
+        max_attempts: int | None = None,
+        rate_limit_cooldown_seconds: float | None = None,
     ) -> Iterator[str]:
         """Stream the assistant's reply, rotating across the pool on failure.
 
@@ -490,6 +492,19 @@ class ModelRouter:
         text fallback within a user-perceivable window. See
         :meth:`chat` for the full rationale.
 
+        ``max_attempts`` and ``rate_limit_cooldown_seconds`` are
+        optional **per-call** overrides on top of the constructor
+        defaults. The vision path passes tighter values
+        (``max_attempts=2``, ``rate_limit_cooldown_seconds=10``) so
+        a stuck Nemotron throttle burns at most ~2 attempts × (45s
+        timeout + 10s cooldown) ≈ 110s instead of the previous
+        ~9 minutes. Defaults of ``None`` mean "use whatever the
+        router was constructed with", so the text path is
+        unaffected. ``max_attempts=0`` is treated as "use the
+        constructor default" rather than "give up immediately",
+        so callers cannot accidentally disable rotation by passing
+        a default-valued parameter.
+
         * If the upstream raises **before** yielding any delta
           (auth error, 4xx, 5xx on the first chunk, or a network
           failure during the request open), we move to the next
@@ -512,6 +527,15 @@ class ModelRouter:
         rotation, so an in-slot retry would only matter for
         two-attempt pools).
         """
+        # Resolve per-call overrides. ``None`` or ``<= 0`` for
+        # ``max_attempts`` falls back to the constructor default —
+        # the text path passes nothing and continues to walk the
+        # whole pool the same way it always did.
+        effective_max_attempts = (
+            self._max_attempts
+            if max_attempts is None or max_attempts <= 0
+            else max_attempts
+        )
         last_error: BaseException | None = None
         attempts = 0
         tried_slots: list[str] = []
@@ -519,6 +543,18 @@ class ModelRouter:
         for offset, slot in enumerate(
             self._iter_healthy_slots_starting_at(start, model=model)
         ):
+            if attempts >= effective_max_attempts:
+                # Honour the per-call cap before burning another
+                # network round-trip. The vision caller relies on
+                # this to fail fast; the text path never passes an
+                # override, so this branch is unreachable there.
+                logger.warning(
+                    "ModelRouter.stream_chat hit max_attempts=%d "
+                    "(model=%s); giving up before next slot",
+                    effective_max_attempts,
+                    model,
+                )
+                break
             attempts += 1
             tried_slots.append(slot.short_label())
             try:
@@ -535,7 +571,9 @@ class ModelRouter:
                 # The request could not even be opened. Apply the
                 # same per-slot policy as chat() — disable on
                 # auth, sleep on rate-limit, otherwise move on.
-                self._record_slot_failure(slot, exc)
+                self._record_slot_failure(
+                    slot, exc, cooldown_seconds=rate_limit_cooldown_seconds,
+                )
                 if isinstance(exc, openrouter.OpenRouterAuthError):
                     continue
                 delay = self._backoff_for(exc)
@@ -543,7 +581,9 @@ class ModelRouter:
                     self._sleep(delay)
                 if (
                     isinstance(exc, openrouter.OpenRouterRateLimitError)
-                    and self._retries_remaining(slot, offset) > 0
+                    and self._retries_remaining(
+                        slot, offset, max_attempts=effective_max_attempts
+                    ) > 0
                 ):
                     continue
                 last_error = exc
@@ -593,7 +633,9 @@ class ModelRouter:
                     # friendly message; do not rotate, do not
                     # advance the start index.
                     raise
-                self._record_slot_failure(slot, exc)
+                self._record_slot_failure(
+                    slot, exc, cooldown_seconds=rate_limit_cooldown_seconds,
+                )
                 if isinstance(exc, openrouter.OpenRouterAuthError):
                     continue
                 delay = self._backoff_for(exc)
@@ -635,7 +677,11 @@ class ModelRouter:
         slot.cooldown_until = None
 
     def _record_slot_failure(
-        self, slot: KeySlot, exc: BaseException
+        self,
+        slot: KeySlot,
+        exc: BaseException,
+        *,
+        cooldown_seconds: float | None = None,
     ) -> None:
         """Record a failure on a slot and disable it on auth errors.
 
@@ -648,19 +694,27 @@ class ModelRouter:
         ``cooldown_until`` timestamp forward by the configured
         cooldown (or the upstream ``Retry-After`` value, whichever
         is larger), so the pool walk skips it on the next call
-        instead of burning another 429 round-trip.
+        instead of burning another 429 round-trip. ``cooldown_seconds``
+        is an optional per-call override — when set, the streaming
+        path uses it (e.g. the vision caller passes a tight 10s
+        window so a single Nemotron throttle does not block every
+        other key for 60s) instead of the constructor default.
         """
         slot.last_error = exc
         if isinstance(exc, openrouter.OpenRouterAuthError):
             slot.disabled = True
             return
         if isinstance(exc, openrouter.OpenRouterRateLimitError):
-            self._set_rate_limit_cooldown(slot, exc)
+            self._set_rate_limit_cooldown(
+                slot, exc, cooldown_seconds=cooldown_seconds
+            )
 
     def _set_rate_limit_cooldown(
         self,
         slot: KeySlot,
         exc: openrouter.OpenRouterRateLimitError,
+        *,
+        cooldown_seconds: float | None = None,
     ) -> None:
         """Push ``slot.cooldown_until`` forward by the cooldown window.
 
@@ -668,8 +722,17 @@ class ModelRouter:
         cooldown is immune to DST changes and clock skew. The window
         is ``max(rate_limit_cooldown_seconds, upstream_retry_after)``,
         honouring the upstream's hint when it sends one.
+
+        ``cooldown_seconds`` is an optional per-call override. The
+        streaming path passes it so the vision caller does not have
+        to share its low-throttle cooldown with every other caller
+        on the same router instance.
         """
-        window = self._rate_limit_cooldown_seconds
+        window = (
+            self._rate_limit_cooldown_seconds
+            if cooldown_seconds is None
+            else cooldown_seconds
+        )
         upstream_hint = self._backoff_for(exc)
         if upstream_hint > window:
             window = upstream_hint
@@ -682,7 +745,13 @@ class ModelRouter:
             upstream_hint,
         )
 
-    def _retries_remaining(self, slot: KeySlot, offset: int) -> int:
+    def _retries_remaining(
+        self,
+        slot: KeySlot,
+        offset: int,
+        *,
+        max_attempts: int | None = None,
+    ) -> int:
         """Best-effort estimate of retries left in this slot.
 
         Used only to decide whether to take a second swing at the
@@ -690,8 +759,15 @@ class ModelRouter:
         after a short sleep). The math matches :meth:`chat`: with
         ``max_attempts = len(slots) * 2``, each slot gets up to
         two attempts.
+
+        ``max_attempts`` is the optional per-call override used by
+        the streaming vision path — when the caller asks for a
+        tight cap (e.g. ``max_attempts=2``), the retry budget per
+        slot shrinks to match. ``None`` (the default) keeps the
+        constructor-level behaviour.
         """
-        max_attempts = self._max_attempts or len(self._slots) * 2
+        if max_attempts is None or max_attempts <= 0:
+            max_attempts = self._max_attempts or len(self._slots) * 2
         # Offset is the slot's position in the rotation (0..N-1);
         # we've already made one attempt on this slot.
         return max(0, max_attempts - 1 - (offset * 2))

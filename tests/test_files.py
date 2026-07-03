@@ -945,16 +945,19 @@ class _FakeRouter:
 
     def __init__(self, scripts):
         self._scripts = list(scripts)
-        self.calls = []  # list of dicts: {model, timeout, messages}
+        self.calls = []  # list of dicts: {model, timeout, messages, …}
 
     def stream_chat(self, messages, *, model=None, temperature=None,
-                    max_tokens=None, timeout=None):
+                    max_tokens=None, timeout=None,
+                    max_attempts=None, rate_limit_cooldown_seconds=None):
         if not self._scripts:
             raise AssertionError("FakeRouter: no more scripts queued")
         self.calls.append({
             "model": model,
             "timeout": timeout,
             "messages": messages,
+            "max_attempts": max_attempts,
+            "rate_limit_cooldown_seconds": rate_limit_cooldown_seconds,
         })
         script = self._scripts.pop(0)
         if isinstance(script, BaseException) or (
@@ -1392,6 +1395,135 @@ class VisionTimeoutTests(unittest.TestCase):
         # int/float coercion at the call site.
         from web.chat_helpers import vision_timeout_seconds
         self.assertIsInstance(vision_timeout_seconds(), float)
+
+
+class VisionStreamTunablesTests(unittest.TestCase):
+    """Pin the per-call retry budget the vision helper forces on
+    :func:`ModelRouter.stream_chat`.
+
+    Background: the free-tier Nemotron vision model on OpenRouter is
+    the *only* working vision route, and every configured (key, model)
+    slot resolves to the same upstream provider. A 429 therefore
+    affects every slot simultaneously; with the router's default
+    60-second cooldown and ``max_attempts = len(slots)*2`` cap, a
+    single 429 used to wedge the user for ~2 minutes. The vision
+    helper now passes a tight budget (2 attempts, 10s cooldown) so
+    the failure surfaces fast and degrades to the text fallback.
+    These tests pin that contract.
+    """
+
+    def test_vision_stream_tunables_helper_returns_expected_budget(self):
+        from web.chat_helpers import vision_stream_tunables
+        tunables = vision_stream_tunables()
+        self.assertEqual(
+            tunables.get("max_attempts"), 2,
+            "vision path must cap at 2 attempts so a stuck 429 "
+            "degrades quickly instead of walking the full pool",
+        )
+        self.assertEqual(
+            tunables.get("rate_limit_cooldown_seconds"), 10.0,
+            "vision path must use a short cooldown (10s) so the "
+            "next slot is reachable within a couple of seconds",
+        )
+
+    def test_vision_stream_tunables_returns_a_defensive_copy(self):
+        """Mutating the returned dict must not affect subsequent
+        callers. The helper exposes a *snapshot* of the budget, not
+        a reference to the module-level constant.
+        """
+        from web.chat_helpers import vision_stream_tunables
+        first = vision_stream_tunables()
+        first["max_attempts"] = 999  # would-be global mutation
+        second = vision_stream_tunables()
+        self.assertEqual(second["max_attempts"], 2)
+        self.assertNotEqual(first, second)
+
+    def test_stream_vision_turn_forwards_tunables_on_vision_call(self):
+        """``stream_vision_turn_with_fallback`` must pass the tight
+        budget on the *vision* ``router.stream_chat`` call so a
+        429 on Nemotron doesn't burn through the generic 60s
+        cooldown the rest of the app uses.
+        """
+        from web.chat_helpers import stream_vision_turn_with_fallback
+
+        # Single script: vision path succeeds. ``_FakeRouter`` now
+        # records ``max_attempts`` and ``rate_limit_cooldown_seconds``.
+        router = _FakeRouter([["vision says hi"]])
+        list(stream_vision_turn_with_fallback(
+            router=router,
+            messages=[{"role": "user", "content": "describe"}],
+            vision_model_id="nvidia/nemotron-nano-12b-v2-vl:free",
+            fallback_model_id="mistralai/mistral-small:free",
+            content="describe",
+            files=None,
+            timeout=45.0,
+        ))
+        self.assertEqual(len(router.calls), 1)
+        call = router.calls[0]
+        self.assertEqual(
+            call["max_attempts"], 2,
+            "vision stream_chat call must receive max_attempts=2",
+        )
+        self.assertEqual(
+            call["rate_limit_cooldown_seconds"], 10.0,
+            "vision stream_chat call must receive "
+            "rate_limit_cooldown_seconds=10.0",
+        )
+        self.assertEqual(
+            call["model"], "nvidia/nemotron-nano-12b-v2-vl:free",
+        )
+
+    def test_stream_vision_turn_forwards_tunables_on_text_fallback(self):
+        """The same tight budget must also reach the *text fallback*
+        ``router.stream_chat`` call. Otherwise the text fallback
+        would inherit the generic 60s cooldown while the vision
+        call used 10s, and a flaky text model would still wedge
+        the user.
+        """
+        from app.openrouter import OpenRouterServerError
+
+        from web.chat_helpers import stream_vision_turn_with_fallback
+
+        # First script raises (vision degraded); second script yields
+        # the text fallback answer. We then assert on both calls.
+        router = _FakeRouter([
+            OpenRouterServerError("504", status=504),
+            ["text fallback answer"],
+        ])
+        list(stream_vision_turn_with_fallback(
+            router=router,
+            messages=[{"role": "user", "content": "describe"}],
+            vision_model_id="nvidia/nemotron-nano-12b-v2-vl:free",
+            fallback_model_id="mistralai/mistral-small:free",
+            content="describe",
+            files=None,
+            timeout=45.0,
+        ))
+        self.assertEqual(
+            len(router.calls), 2,
+            "expected one vision call + one text fallback call",
+        )
+        # Both calls — the failed vision attempt *and* the successful
+        # text fallback — must carry the tight tunables. This is the
+        # regression guard: an edit that only threads the kwargs on
+        # one of the two call sites must fail this test.
+        for idx, call in enumerate(router.calls):
+            self.assertEqual(
+                call["max_attempts"], 2,
+                f"call #{idx} (model={call['model']!r}) did not "
+                f"receive max_attempts=2",
+            )
+            self.assertEqual(
+                call["rate_limit_cooldown_seconds"], 10.0,
+                f"call #{idx} (model={call['model']!r}) did not "
+                f"receive rate_limit_cooldown_seconds=10.0",
+            )
+        # And the second call must be pinned to the text fallback
+        # model id (the whole point of the fallback).
+        self.assertEqual(
+            router.calls[1]["model"],
+            "mistralai/mistral-small:free",
+        )
 
 
 if __name__ == "__main__":

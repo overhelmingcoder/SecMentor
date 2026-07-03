@@ -669,5 +669,260 @@ class ModelRouterStreamChatTests(unittest.TestCase):
         self.assertEqual(calls, ["k1", "k2"])
 
 
+# --- ModelRouter.stream_chat per-call tunables -----------------------------
+
+
+class ModelRouterStreamChatTunableTests(unittest.TestCase):
+    """Pin the per-call ``max_attempts`` and ``rate_limit_cooldown_seconds``
+    kwargs on ``ModelRouter.stream_chat``.
+
+    The vision caller (see ``web/chat_helpers.stream_vision_turn_with_fallback``)
+    needs a tighter retry budget than the generic text path because
+    the free-tier Nemotron vision model shares one upstream provider
+    across every (key, model) slot. Long cooldowns and high attempt
+    caps turn a single 429 into a multi-minute stall. These tests
+    pin the contract that ``stream_chat`` honours the per-call
+    overrides.
+    """
+
+    def _build(self, keys, models, **kwargs):
+        from app.router import build_from_config
+
+        return build_from_config(keys, models, **kwargs)
+
+    def _always_rate_limited(self, _messages, *, model=None, api_key=None, **_kw):
+        """Fake ``app.openrouter.stream_chat`` that always 429s.
+
+        Body is left ``None`` so :py:meth:`ModelRouter._backoff_for`
+        returns the router's ``backoff_seconds`` default. Tests pass
+        ``backoff_seconds=0`` to keep the cooldown arithmetic
+        deterministic.
+        """
+        from app.openrouter import OpenRouterRateLimitError
+
+        def _gen():
+            raise OpenRouterRateLimitError("throttled", status=429, model=model)
+            yield  # pragma: no cover — make this a generator
+
+        return _gen()
+
+    def test_max_attempts_override_caps_attempts(self):
+        """``max_attempts=2`` must limit the router to exactly two
+        upstream calls, regardless of the constructor default.
+
+        This is the cap the vision caller relies on: even on a
+        pool of four slots, we want to give up after two tries so
+        the user sees a fast failure instead of waiting through
+        every cooldowned slot.
+        """
+        from app.router import AllSlotsExhaustedError
+
+        # 4 slots, but max_attempts=2 means only the first two
+        # should ever be called before we raise.
+        router = self._build(
+            ["k1", "k2", "k3", "k4"],
+            ["m:free"],
+            max_attempts=4,  # constructor default — would normally cap at 4
+            sleep=lambda _s: None,
+        )
+
+        calls: list[str] = []
+
+        def fake_stream(_messages, *, model=None, api_key=None, **_kw):
+            calls.append(api_key or "")
+            return self._always_rate_limited(
+                _messages, model=model, api_key=api_key, **_kw
+            )
+
+        with patch("app.openrouter.stream_chat", side_effect=fake_stream):
+            with self.assertRaises(AllSlotsExhaustedError):
+                list(
+                    router.stream_chat(
+                        [{"role": "user", "content": "hi"}],
+                        max_attempts=2,  # per-call override
+                    )
+                )
+
+        self.assertEqual(
+            len(calls),
+            2,
+            f"expected exactly 2 upstream calls (per-call max_attempts=2), "
+            f"got {len(calls)}: {calls}",
+        )
+
+    def test_rate_limit_cooldown_override_is_honoured(self):
+        """``rate_limit_cooldown_seconds=10`` must set ``cooldown_until``
+        to ~10s ahead of ``now``, not the router's constructor default.
+
+        This is the half of the vision tunables that prevents a 429
+        from wedging the slot for a full minute. We assert against
+        ``cooldown_until`` directly because that is the field the
+        router uses on its next iteration to decide whether the
+        slot is healthy.
+        """
+        import time as _time
+
+        from app.openrouter import OpenRouterRateLimitError
+        from app.router import AllSlotsExhaustedError
+
+        # Constructor default is 60s; the per-call override is 10s.
+        # We also zero out ``backoff_seconds`` so the upstream-hint
+        # path in ``_set_rate_limit_cooldown`` cannot inflate the
+        # window above the override.
+        router = self._build(
+            ["k1"],
+            ["m:free"],
+            rate_limit_cooldown_seconds=60.0,
+            backoff_seconds=0.0,
+            sleep=lambda _s: None,
+        )
+
+        def fake_stream(_messages, *, model=None, api_key=None, **_kw):
+            # Body=None → _backoff_for returns 0.0 → window stays
+            # at the override value (10.0).
+            raise OpenRouterRateLimitError(
+                "throttled", status=429, model=model, body=None
+            )
+
+        before = _time.monotonic()
+        with patch("app.openrouter.stream_chat", side_effect=fake_stream):
+            with self.assertRaises(AllSlotsExhaustedError):
+                list(
+                    router.stream_chat(
+                        [{"role": "user", "content": "hi"}],
+                        rate_limit_cooldown_seconds=10.0,
+                    )
+                )
+        after = _time.monotonic()
+
+        slot = router._slots[0]
+        self.assertIsNotNone(
+            slot.cooldown_until,
+            "expected cooldown_until to be set after a 429",
+        )
+        # The cooldown window is recorded as now+override at the
+        # moment _set_rate_limit_cooldown ran. We measure it from
+        # both ``before`` and ``after`` so the test is robust to
+        # which side of the call the monotonic clock ticks on.
+        cooldown_remaining = slot.cooldown_until - before
+        self.assertGreater(
+            cooldown_remaining,
+            9.0,
+            f"cooldown should be ~10s, got {cooldown_remaining:.2f}s",
+        )
+        self.assertLess(
+            cooldown_remaining,
+            11.0,
+            f"cooldown should not exceed the override by much, "
+            f"got {cooldown_remaining:.2f}s",
+        )
+        # And it must not be the constructor default of ~60s.
+        self.assertLess(
+            cooldown_remaining,
+            30.0,
+            "cooldown looks like it used the constructor default "
+            "(60s), not the per-call override",
+        )
+        # Sanity: the slot was actually marked in cooldown.
+        self.assertTrue(
+            slot.is_in_cooldown(_time.monotonic()),
+            "slot should be in cooldown immediately after the 429",
+        )
+        # And ``after`` is strictly later, just so the assertion
+        # above has a meaningful upper bound.
+        self.assertGreaterEqual(after, before)
+
+    def test_default_cooldown_used_when_no_override(self):
+        """When no ``rate_limit_cooldown_seconds`` override is
+        passed, ``stream_chat`` must fall back to the router's
+        constructor value. This is the regression guard for the
+        default path — we must not have broken the generic text
+        caller.
+        """
+        import time as _time
+
+        from app.openrouter import OpenRouterRateLimitError
+        from app.router import AllSlotsExhaustedError
+
+        # Constructor default is 60s; we pass nothing on the call.
+        router = self._build(
+            ["k1"],
+            ["m:free"],
+            rate_limit_cooldown_seconds=60.0,
+            backoff_seconds=0.0,
+            sleep=lambda _s: None,
+        )
+
+        def fake_stream(_messages, *, model=None, **_kw):
+            raise OpenRouterRateLimitError("throttled", status=429, model=model, body=None)
+
+        before = _time.monotonic()
+        with patch("app.openrouter.stream_chat", side_effect=fake_stream):
+            with self.assertRaises(AllSlotsExhaustedError):
+                list(router.stream_chat([{"role": "user", "content": "hi"}]))
+
+        slot = router._slots[0]
+        self.assertIsNotNone(slot.cooldown_until)
+        cooldown_remaining = slot.cooldown_until - before
+        self.assertGreater(
+            cooldown_remaining,
+            55.0,
+            f"default cooldown should be ~60s, got {cooldown_remaining:.2f}s",
+        )
+
+    def test_max_attempts_override_only_takes_effect_when_positive(self):
+        """A ``max_attempts`` override of 0 or a negative number
+        must not bypass the constructor cap. We treat the override
+        as "set this explicitly" only when it is a positive
+        integer.
+        """
+        from app.openrouter import OpenRouterRateLimitError
+        from app.router import AllSlotsExhaustedError
+
+        # 4 slots, constructor cap 2. The override of 0 must be
+        # ignored so we still see 2 upstream calls (the constructor
+        # cap), not 0 (which would short-circuit and never call
+        # upstream) and not 4 (which would ignore the cap entirely).
+        router = self._build(
+            ["k1", "k2", "k3", "k4"],
+            ["m:free"],
+            max_attempts=2,
+            sleep=lambda _s: None,
+        )
+
+        calls: list[str] = []
+
+        def fake_stream(_messages, *, model=None, api_key=None, **_kw):
+            calls.append(api_key or "")
+            raise OpenRouterRateLimitError(
+                "throttled", status=429, model=model, body=None
+            )
+
+        with patch("app.openrouter.stream_chat", side_effect=fake_stream):
+            with self.assertRaises(AllSlotsExhaustedError):
+                list(
+                    router.stream_chat(
+                        [{"role": "user", "content": "hi"}],
+                        max_attempts=0,  # must be ignored → cap=2 wins
+                    )
+                )
+
+        # Two upstream calls — matches the constructor cap. If the
+        # override had been honoured, we'd see 0 calls. If the cap
+        # had been bypassed entirely, we'd see up to 4.
+        self.assertEqual(
+            len(calls),
+            2,
+            f"max_attempts=0 must fall back to the constructor cap (2); "
+            f"got {len(calls)} calls: {calls}",
+        )
+        # And the slots are merely in cooldown, not permanently
+        # disabled (429 ≠ auth failure).
+        self.assertTrue(
+            all(not s.disabled for s in router._slots),
+            "429s must not disable slots",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

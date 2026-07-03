@@ -1770,6 +1770,239 @@ class StreamlitChatInputFileUploadTests(unittest.TestCase):
         )
 
 
+class StreamlitChatInputMediaGuardTests(unittest.TestCase):
+    """Pin the per-session ``MediaFileStorageError`` guard.
+
+    Streamlit's ``st.chat_input(accept_file="multiple")`` registers
+    uploaded file bytes in a per-session in-memory store keyed by
+    content hash, and ships the file's media ID to the browser. The
+    browser echoes that ID back on every subsequent rerun so the
+    input can re-display the file the user previously attached. If
+    the server is restarted (Ctrl-C + relaunch, code change, hot
+    reload) and the user keeps the tab open, the new server's media
+    store is empty and Streamlit raises ``MediaFileStorageError``
+    from inside the widget's render call. The user sees a blank page
+    and a server-side traceback.
+
+    The fix is a per-call ``try/except`` around the chat input
+    render that (a) catches the error, (b) marks the session as
+    "media-broken" so the next render swaps in a text-only fallback,
+    (c) clears any in-flight pending request so a partial reply is
+    not finalised against lost data, and (d) surfaces a one-time
+    friendly banner explaining the situation. These tests pin those
+    four behaviours structurally — they fail loudly if anyone
+    regresses the guard or removes the fallback.
+    """
+
+    def test_view_imports_the_media_file_storage_exception(self):
+        # The guard requires the exception class. If a future
+        # Streamlit rename moves the class, this test points the
+        # maintainer at the right path to update.
+        src = _read_streamlit_view()
+        self.assertIn(
+            "from streamlit.runtime.memory_media_file_storage import",
+            src,
+            "view must import MediaFileStorageError from "
+            "streamlit.runtime.memory_media_file_storage so the "
+            "guard can catch a stale file ID from a previous "
+            "server session.",
+        )
+        self.assertIn(
+            "MediaFileStorageError",
+            src,
+            "view must bind the MediaFileStorageError class to a "
+            "local alias (with a fallback class definition for "
+            "older Streamlit versions) before the guard runs.",
+        )
+
+    def test_view_wraps_chat_input_in_media_storage_try_block(self):
+        # The actual guard: the chat input call must sit inside a
+        # try block whose except arm catches MediaFileStorageError.
+        src = _read_streamlit_view()
+        # We require the literal sequence: ``except _MediaFileStorageError``
+        # appears at least once. The local alias is ``_MediaFileStorageError``
+        # so the test does not have to know the exact import binding.
+        self.assertRegex(
+            src,
+            r"except\s+_MediaFileStorageError\b",
+            "st.chat_input(accept_file='multiple') must be wrapped "
+            "in a try/except _MediaFileStorageError; without it a "
+            "server restart with an open browser tab raises "
+            "MediaFileStorageError from inside the widget render "
+            "and blanks the page with a server-side traceback.",
+        )
+
+    def test_guard_marks_session_with_a_sticky_error_flag(self):
+        # The first render that catches the error must flip a
+        # per-session flag so the *next* render downgrades to a
+        # text-only chat input (otherwise the same exception fires
+        # on every rerun and the user is stuck).
+        src = _read_streamlit_view()
+        self.assertIn(
+            "_SESSION_STATE_MEDIA_ERROR",
+            src,
+            "view must define a session-state key for the media "
+            "error flag (e.g. _SESSION_STATE_MEDIA_ERROR) and write "
+            "to it from the guard's except arm.",
+        )
+        # The flag must be set to True (not None / not deleted)
+        # so a follow-up ``st.session_state.get(...)`` returns True.
+        self.assertRegex(
+            src,
+            r"st\.session_state\[_SESSION_STATE_MEDIA_ERROR\]\s*=\s*True",
+            "guard must set the media error flag to True; a None "
+            "value or a deletion would not downgrade the chat "
+            "input on the next render and the same exception "
+            "would fire in a loop.",
+        )
+
+    def test_guard_drops_in_flight_pending_request(self):
+        # Critical: a partial reply that was finalised against a
+        # lost file would leave the assistant half-answering a
+        # question the user can no longer reproduce. The guard must
+        # drop the in-flight request before rerunning.
+        src = _read_streamlit_view()
+        self.assertIn(
+            'st.session_state.pop("pending_request", None)',
+            src,
+            "guard must drop the in-flight 'pending_request' so a "
+            "partial reply is not finalised against lost file data "
+            "after the server restarts.",
+        )
+        self.assertIn(
+            'st.session_state.pop("pending_started_at", None)',
+            src,
+            "guard must drop the matching 'pending_started_at' "
+            "timestamp so a stale turn cannot be re-driven by the "
+            "two-pass chat_input pattern after a media-store reset.",
+        )
+
+    def test_fallback_chat_input_omits_accept_file(self):
+        # The text-only fallback must NOT use accept_file — if it
+        # did, the same media-store lookup would fire on every
+        # render and the guard would loop. A plain
+        # ``st.chat_input("…")`` (no accept_file kwarg) is what
+        # downgrades the input to text-only.
+        src = _read_streamlit_view()
+        chat_input_calls = list(
+            re.finditer(r"st\.chat_input\s*\(", src)
+        )
+        self.assertGreaterEqual(
+            len(chat_input_calls), 2,
+            "view must have at least two st.chat_input calls — "
+            "the guarded primary (with accept_file) and the "
+            "text-only fallback (without).",
+        )
+        # Find each call's body via a bracket-balance scan, then
+        # collect a {position: body} mapping so the test can pick
+        # the text-only fallback (no accept_file) and the primary
+        # (with accept_file) by their keyword shape rather than by
+        # source order — the order depends on which branch the
+        # maintainer puts the fallback in.
+        def _body(call_match: "re.Match[str]") -> str:
+            depth = 0
+            end_idx = None
+            for i in range(call_match.end() - 1, len(src)):
+                c = src[i]
+                if c == "(":
+                    depth += 1
+                elif c == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end_idx = i
+                        break
+            self.assertIsNotNone(
+                end_idx,
+                "could not find the closing paren of one of the "
+                "st.chat_input calls",
+            )
+            return src[call_match.end():end_idx]
+
+        bodies = [_body(m) for m in chat_input_calls]
+        has_primary = any("accept_file" in b for b in bodies)
+        self.assertTrue(
+            has_primary,
+            "the primary st.chat_input call must still pass "
+            "accept_file='multiple' so file attachments work in "
+            "the normal (in-process) path",
+        )
+        text_only = [b for b in bodies if "accept_file" not in b]
+        self.assertTrue(
+            text_only,
+            "view must have at least one st.chat_input call "
+            "without accept_file — the text-only fallback used "
+            "when MediaFileStorageError has been raised this "
+            "session.",
+        )
+
+    def test_guard_logs_to_python_logger_not_st_error(self):
+        # The raw ``MediaFileStorageError`` message embeds the lost
+        # file's media ID — a useful breadcrumb in the server log,
+        # but noise the user does not need to see. The guard must
+        # log to the Python ``logging`` module (which Streamlit
+        # routes to the server console) and not call ``st.error``.
+        src = _read_streamlit_view()
+        # Find the guard's except block.
+        match = re.search(
+            r"except\s+_MediaFileStorageError\b.*?(?=\n\S|\Z)",
+            src,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(
+            match,
+            "could not locate the guard's except arm in the view",
+        )
+        except_body = match.group(0)
+        self.assertIn(
+            "logging.getLogger(",
+            except_body,
+            "guard must log the MediaFileStorageError to the "
+            "Python logging module (server console) so the lost "
+            "file's media ID is preserved for debugging without "
+            "leaking it into the chat UI.",
+        )
+        self.assertNotIn(
+            "st.error(",
+            except_body,
+            "guard must not call st.error on the raw exception — "
+            "the storage error message embeds the lost file's "
+            "media ID and adds zero value to the user, who only "
+            "needs to know 'the attachment is gone, re-attach'.",
+        )
+
+    def test_fallback_renders_a_recovery_banner_and_reset_button(self):
+        # When the session is in the media-error state, the next
+        # render must show (a) a st.warning explaining the
+        # situation and (b) a button the user can click to
+        # re-enable the file picker (in case they restarted the
+        # server intentionally and want to attach again).
+        src = _read_streamlit_view()
+        # Both the flag check and the warning/button must be
+        # present at module-level so they run on every rerun.
+        self.assertIn(
+            'st.session_state.get(_SESSION_STATE_MEDIA_ERROR)',
+            src,
+            "view must check the media-error flag at the top of "
+            "every script run and render a recovery banner + "
+            "reset button when it is set.",
+        )
+        self.assertIn(
+            "st.warning(",
+            src,
+            "recovery branch must call st.warning so the user "
+            "sees a clear, dismissable explanation that the "
+            "attachment is no longer available.",
+        )
+        # The reset button must clear the flag and rerun.
+        self.assertRegex(
+            src,
+            r"st\.session_state\.pop\(\s*_SESSION_STATE_MEDIA_ERROR\s*,\s*None\s*\)",
+            "reset button must pop the media-error flag from "
+            "session_state so the next render re-enables the "
+            "file picker.",
+        )
+
+
 # --- Copy-to-clipboard helper (Tier 1 #4) -----------------------------------
 # Verifies that ``web.chat_helpers._copy_button_html`` produces a tiny,
 # self-contained HTML <button> whose payload cannot break out of the
@@ -3225,6 +3458,260 @@ class PersistOnAskTests(unittest.TestCase):
                 "`st.caption(...)` so the user knows the transcript is "
                 "session-state-only this turn",
             )
+
+
+# --- Multimodal message content coercion ------------------------------------
+#
+# The view's `_render_bubble` (web/streamlit_app.py) renders every past
+# turn by replaying ``st.session_state["messages"]``. After the user
+# uploads an image, the persisted ``content`` is a JSON-encoded
+# ``list[dict]`` (a multimodal parts list), and ``app.storage.list_messages``
+# decodes it back to a real ``list`` when the chat is reopened. The
+# pre-fix renderer treated ``content`` as ``str`` and called
+# ``content.replace(...)`` on it, which raised
+# ``AttributeError: 'list' object has no attribute 'replace'`` and
+# blanked the entire transcript on the very next rerun.
+#
+# The fix is a tiny pure helper in ``web.chat_helpers``,
+# ``_coerce_message_text``, called once at the top of the render branch
+# so every downstream method (``st.markdown``, ``.replace(...)``, the
+# copy-button markdown-to-plain pipeline) sees a ``str``. These tests
+# pin the contract: the helper must return a ``str`` for every input
+# shape, must preserve text parts verbatim, must surface image parts
+# as a short placeholder, must not crash on unknown shapes, and must
+# not crash on ``None``. They run without Streamlit.
+
+
+class CoerceMessageTextTests(unittest.TestCase):
+    """Pin the ``_coerce_message_text(content) -> str`` contract.
+
+    Defensive coverage for every shape ``app.storage.list_messages``
+    can produce (or that a future caller could add): plain string,
+    multimodal parts list, an unknown structured part, ``None``, and
+    stray scalar shapes.
+    """
+
+    def setUp(self) -> None:
+        from web import chat_helpers  # lazy import keeps the top-of-file
+        # import list minimal and matches the rest of this module.
+        self._fn = chat_helpers._coerce_message_text
+
+    def test_plain_string_passes_through_verbatim(self) -> None:
+        # The common text-only path. The helper must NOT strip, lowercase,
+        # or otherwise mutate the string — the copy button then runs
+        # ``_markdown_to_plain_text`` on the result, and any whitespace
+        # loss here would mangle fenced code blocks.
+        self.assertEqual(
+            self._fn("hello world"), "hello world"
+        )
+        self.assertEqual(
+            self._fn("  leading and trailing  "),
+            "  leading and trailing  ",
+        )
+        self.assertEqual(self._fn(""), "")
+
+    def test_list_with_text_part_returns_text(self) -> None:
+        # A single text part. Must produce the literal text without
+        # surrounding whitespace.
+        self.assertEqual(
+            self._fn([{"type": "text", "text": "why is SQL injection bad?"}]),
+            "why is SQL injection bad?",
+        )
+
+    def test_list_with_text_part_missing_type_key(self) -> None:
+        # Some OpenAI-compatible providers omit the ``type`` discriminator
+        # on text parts and just send ``{"text": "..."}``. The helper must
+        # accept the field rather than requiring ``type``.
+        self.assertEqual(
+            self._fn([{"text": "Explain CSRF."}]),
+            "Explain CSRF.",
+        )
+
+    def test_list_with_image_url_string(self) -> None:
+        # An image attached as a plain URL string. Must produce a
+        # short placeholder rather than the URL itself, and must NOT
+        # silently drop the text part.
+        out = self._fn([
+            {"type": "text", "text": "what does this say?"},
+            {"type": "image_url", "image_url": "https://x.example/a.png"},
+        ])
+        self.assertIn("what does this say?", out)
+        self.assertIn("[image:", out)
+        self.assertIn("https://x.example/a.png", out)
+
+    def test_list_with_image_url_dict_truncates_data_uris(self) -> None:
+        # The common case is a base64 data URI; the value can run to
+        # ~50 KB for a screenshot. Embedding the full URI in the
+        # transcript would balloon ``st.session_state`` and slow every
+        # rerun. The helper must keep just a short prefix.
+        data_uri = (
+            "data:image/png;base64,"
+            + "Z" * 500  # well past the 32-char cutoff
+        )
+        out = self._fn([{
+            "type": "image_url",
+            "image_url": {"url": data_uri},
+        }])
+        self.assertIn("[image:", out)
+        # A tail that lives only past the 32-char cutoff must NOT appear —
+        # that would be the original bug, embedding 50 KB of base64 into
+        # ``st.session_state`` on every rerun.
+        self.assertNotIn("Z" * 50, out)
+        self.assertIn("...", out)
+
+    def test_list_with_unknown_part_type_renders_placeholder(self) -> None:
+        # A future OpenRouter revision could add ``type: audio_url`` (or
+        # anything else). The helper must NOT crash, and must surface
+        # the unknown part as a small labelled placeholder rather than
+        # dumping the dict into the bubble.
+        out = self._fn([{"type": "audio_url", "audio_url": "x"}])
+        self.assertIn("[audio_url]", out)
+
+    def test_list_with_empty_text_part_is_skipped(self) -> None:
+        # A text part with an empty string must NOT contribute a literal
+        # "[]" or extra whitespace to the bubble.
+        out = self._fn([
+            {"type": "text", "text": ""},
+            {"type": "text", "text": "real question"},
+        ])
+        self.assertEqual(out, "real question")
+
+    def test_list_with_bare_dict_without_text_or_type_is_skipped(self) -> None:
+        # ``[{"foo": "bar"}]`` has no field we know how to render.
+        # The helper must skip it silently rather than stringifying the
+        # whole dict (which would dump JSON into the bubble).
+        out = self._fn([{"foo": "bar"}, {"type": "text", "text": "ok"}])
+        self.assertEqual(out, "ok")
+
+    def test_list_with_non_dict_item_stringifies(self) -> None:
+        # Some providers send ``[{"text": "..."}, "stray scalar"]``.
+        # Stringify the scalar so the bubble keeps something useful.
+        out = self._fn(["just a string", {"type": "text", "text": "ok"}])
+        self.assertIn("just a string", out)
+        self.assertIn("ok", out)
+
+    def test_none_returns_stringified_none(self) -> None:
+        # The schema contract is "JSON blob" so a future caller could
+        # fail to set ``content``. The helper must NOT crash; stringifying
+        # ``None`` is the friendliest outcome (the bubble shows the
+        # literal ``None`` and the user can scroll past it).
+        self.assertEqual(self._fn(None), "None")
+
+    def test_int_returns_stringified_int(self) -> None:
+        # Defensive: stringify any unknown scalar rather than crashing
+        # the whole rerun (the original bug). The value of "None" or
+        # "42" in a bubble is bad UX, but a crashed rerun is worse.
+        self.assertEqual(self._fn(42), "42")
+
+    def test_never_returns_a_list(self) -> None:
+        # The renderer's first line after the helper is
+        # ``content = _coerce_message_text(content)``. The downstream
+        # methods (``content.replace(...)``, ``st.markdown(content)``,
+        # the copy button's markdown-to-plain pipeline) all assume
+        # ``str``. If the helper ever returned a list, the original
+        # bug would recur silently. Pin the return type as ``str`` for
+        # every shape.
+        for input_value in (
+            "string",
+            [{"type": "text", "text": "x"}],
+            [{"type": "image_url", "image_url": "http://x"}],
+            None,
+            42,
+            3.14,
+            True,
+            {"text": "bare dict"},
+        ):
+            with self.subTest(input=repr(input_value)):
+                self.assertIsInstance(
+                    self._fn(input_value), str,
+                    f"_coerce_message_text returned non-str for {input_value!r}",
+                )
+
+
+# --- OpenRouter streaming delta list-shape ----------------------------------
+#
+# Companion regression for the engine-side fix in
+# ``app.openrouter.stream_chat``. Some OpenRouter-compatible providers
+# stream ``delta.content`` as a ``list[dict]`` of structured parts
+# (typically one text part, occasionally text + a tool-call preamble)
+# instead of a plain string. The pre-fix parser only yielded the chunk
+# when ``content`` was a ``str``, so every list-shaped delta was
+# silently dropped, the router's "stream returned no deltas" guard
+# fired, and the user saw an empty bubble + a generic OpenRouter error
+# banner.
+#
+# The fix is a four-line inline flatten in the SSE loop. We don't have
+# a free-standing helper to unit-test (it's inside the streaming
+# generator and depends on a real ``requests.Response``), so we pin
+# the contract structurally: the source must contain the
+# ``isinstance(content, list)`` branch that walks the parts and
+# concatenates the text fields. If anyone refactors the SSE loop and
+# regresses the list-delta path, this test fires.
+
+
+class OpenRouterStreamListDeltaTests(unittest.TestCase):
+    """Pin the ``delta.content`` list-shape handling in ``stream_chat``.
+
+    The stream is wired into the ``st.write_stream`` consumer and the
+    router's "no deltas" guard: any list-shaped delta that is silently
+    dropped makes a healthy upstream look like a transient failure. The
+    fix inlines a small flatten — these tests pin that the flatten
+    (a) exists in the source, (b) walks both ``list[dict]`` and
+    ``list[str]`` shapes, (c) only yields the result when it is
+    non-empty (preserving the original ``and content`` truthiness).
+    """
+
+    def setUp(self) -> None:
+        from app import openrouter as _openrouter
+        self._module = openrouter
+
+    def _stream_chat_source(self) -> str:
+        import inspect
+        return inspect.getsource(self._module.stream_chat)
+
+    def test_stream_chat_handles_list_shaped_delta(self) -> None:
+        src = self._stream_chat_source()
+        # The flatten branch is anchored on an ``isinstance(content, list)``
+        # check immediately after the ``delta.get("content")`` lookup. If
+        # the SSE loop is refactored and this branch disappears, every
+        # list-shaped upstream falls back to the silent-drop path and the
+        # regression is invisible to the unit suite.
+        self.assertIn(
+            "isinstance(content, list)",
+            src,
+            "stream_chat must contain an isinstance(content, list) branch "
+            "to flatten list-shaped OpenRouter deltas; without it a "
+            "list-shaped delta is silently dropped and the router raises "
+            "the 'no deltas' OpenRouterError.",
+        )
+
+    def test_stream_chat_extracts_text_field_from_each_part(self) -> None:
+        src = self._stream_chat_source()
+        # The flatten walks each dict in the parts list and pulls the
+        # ``text`` field. Pin that the structural shape is preserved
+        # so a future refactor cannot accidentally stringify the
+        # whole dict (which would dump JSON into the bubble).
+        self.assertIn('item.get("text")', src)
+        # And the per-part contribution must land in ``parts`` so the
+        # final ``"".join(parts)`` returns the assembled reply.
+        self.assertIn("parts.append(text_value)", src)
+        self.assertIn('"".join(parts)', src)
+
+    def test_stream_chat_still_yields_only_non_empty_deltas(self) -> None:
+        src = self._stream_chat_source()
+        # The original ``isinstance(content, str) and content`` truthiness
+        # guard must remain after the flatten so a list whose parts
+        # all stringify to "" does not produce a spurious yield that
+        # would then be filtered out by ``st.write_stream``'s own
+        # empty-string check (and waste a chunk budget).
+        self.assertIn(
+            'isinstance(content, str) and content',
+            src,
+            "stream_chat must keep the non-empty delta guard after the "
+            "flatten; without it an empty flattening result would yield "
+            "an empty string and the bubble would gain a literal "
+            "no-op delta.",
+        )
 
 
 if __name__ == "__main__":

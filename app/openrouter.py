@@ -698,6 +698,29 @@ def stream_chat(
                 continue
             delta = (choices[0] or {}).get("delta") or {}
             content = delta.get("content")
+            # ``delta.content`` is normally a ``str`` (the new text in
+            # this SSE chunk) but some OpenRouter-compatible providers
+            # emit a ``list[dict]`` of structured parts — typically a
+            # single text part, occasionally text + a tool-call
+            # preamble. The previous ``isinstance(content, str) and
+            # content`` guard silently dropped every list-shaped
+            # delta, so a healthy stream that happened to use the
+            # list shape produced zero deltas and the router's
+            # "stream returned no deltas" guard fired mid-turn.
+            # Flatten both shapes to a string here; an empty
+            # flattening result (e.g. a ``null`` content for the
+            # first ``role`` event) is still filtered out by the
+            # truthiness check below.
+            if isinstance(content, list):
+                parts: list[str] = []
+                for item in content:
+                    if isinstance(item, dict):
+                        text_value = item.get("text")
+                        if isinstance(text_value, str):
+                            parts.append(text_value)
+                    elif isinstance(item, str):
+                        parts.append(item)
+                content = "".join(parts)
             if isinstance(content, str) and content:
                 yield content
     except requests.RequestException as exc:

@@ -1,0 +1,965 @@
+<style>
+    /* ---------- Design tokens -----------------------------------------
+       Force a light color scheme so the browser's UA dark-mode stylesheet
+       can never recolor our bubbles, inputs, or code blocks. This is the
+       single most important rule in the whole stylesheet. */
+    :root {
+        color-scheme: light !important;
+        --bg-page:        #eef2f7;
+        --bg-surface:     #ffffff;
+        --bg-surface-2:   #f8fafc;
+        --bg-sidebar:     #0b1220;
+        --bg-sidebar-2:   #111a2e;
+        --border-subtle:  #e2e8f0;
+        --border-strong:  #cbd5e1;
+        --text-primary:   #0f172a;
+        --text-secondary: #334155;
+        --text-muted:     #64748b;
+        --text-inverse:   #e2e8f0;
+        --accent:         #1d4ed8;
+        --accent-soft:    #dbe5ff;
+        --accent-strong:  #1e3a8a;
+        --success:        #047857;
+        --warn:           #b45309;
+        --user-bubble:    #1d4ed8;
+        --user-bubble-2:  #1e40af;
+        --shadow-sm:      0 1px 2px rgba(15, 23, 42, 0.06);
+        --shadow-md:      0 4px 14px rgba(15, 23, 42, 0.08);
+        --radius-sm:      8px;
+        --radius-md:      12px;
+        --radius-lg:      16px;
+
+        --container-max:  920px;
+        --content-pad:    1.25rem;
+        --bubble-max:     82%;
+        --bubble-pad-y:   0.85rem;
+        --bubble-pad-x:   1.1rem;
+        --row-gap:        0.65rem;
+        --hero-pad:       1.75rem 2rem;
+    }
+
+    /* Layout density variants. The radio in the sidebar adds one of these
+       classes to a wrapper <div> right under <body> via a small
+       st.markdown below. Everything else reads the CSS variables above. */
+    body.layout-compact  { --container-max: 720px;  --content-pad: 0.75rem;
+                           --bubble-max: 76%; --bubble-pad-y: 0.55rem;
+                           --bubble-pad-x: 0.8rem; --row-gap: 0.35rem;
+                           --hero-pad: 1rem 1.1rem; }
+    body.layout-standard { --container-max: 920px;  --content-pad: 1.25rem;
+                           --bubble-max: 82%; --bubble-pad-y: 0.75rem;
+                           --bubble-pad-x: 1rem; --row-gap: 0.55rem;
+                           --hero-pad: 1.5rem 1.75rem; }
+    body.layout-wide     { --container-max: 1180px; --content-pad: 1.75rem;
+                           --bubble-max: 88%; --bubble-pad-y: 0.85rem;
+                           --bubble-pad-x: 1.1rem; --row-gap: 0.7rem;
+                           --hero-pad: 1.75rem 2rem; }
+    body.layout-full     { --container-max: 100%;   --content-pad: 2.25rem;
+                           --bubble-max: 92%; --bubble-pad-y: 0.95rem;
+                           --bubble-pad-x: 1.2rem; --row-gap: 0.8rem;
+                           --hero-pad: 2rem 2.25rem; }
+
+    /* ---------- Global page chrome ------------------------------------ */
+    /* `!important` everywhere below to beat Streamlit's own high-
+       specificity theme rules and the browser's prefers-color-scheme
+       dark UA stylesheet. */
+    html, body, .stApp {
+        background: var(--bg-page) !important;
+        color: var(--text-primary) !important;
+    }
+    body, .stApp, .stApp * { color-scheme: light !important; }
+    .stApp header[data-testid="stHeader"] {
+        background: linear-gradient(90deg, #0b1220 0%, #15233f 50%, #0b1220 100%) !important;
+        height: 3.25rem; box-shadow: var(--shadow-sm);
+    }
+    #MainMenu { visibility: hidden; }
+    footer    { visibility: hidden; }
+
+    /* ---------- Main column ------------------------------------------- */
+    .block-container {
+        padding-top: 1.5rem;
+        padding-bottom: 6rem;          /* leave room for the floating chat input */
+        padding-left: var(--content-pad);
+        padding-right: var(--content-pad);
+        max-width: var(--container-max);
+        color: var(--text-primary);
+    }
+    /* Force dark text on Streamlit-rendered markdown in the main area
+       only. The previous version used `.main .block-container p`,
+       `span`, `div`, `li`, `label`, `small` with `!important`, which
+       repainted BaseWeb internals (selectbox, file uploader, slider,
+       button labels) and made them invisible. We now scope the rule
+       to the elements Streamlit actually produces for markdown. */
+    .main .block-container,
+    .main .block-container .stMarkdown p,
+    .main .block-container .stMarkdown li,
+    .main .block-container .stMarkdown strong,
+    .main .block-container .stMarkdown em,
+    .main .block-container .stMarkdown code,
+    .main .block-container label,
+    .main .block-container small { color: var(--text-primary) !important; }
+    .main .block-container h1,
+    .main .block-container h2,
+    .main .block-container h3 { color: var(--text-primary) !important; }
+
+    /* ---------- Sidebar ----------------------------------------------- */
+    section[data-testid="stSidebar"] {
+        background: linear-gradient(180deg, var(--bg-sidebar) 0%, var(--bg-sidebar-2) 100%);
+        border-right: 1px solid rgba(255,255,255,0.06);
+    }
+    /* Sidebar text color — applied per element instead of `*` so the
+       rule cannot leak into BaseWeb internals (disabled buttons,
+       selectbox popup items, file-uploader labels, slider thumbs,
+       checkbox/radio text). Each tag is listed explicitly. */
+    section[data-testid="stSidebar"] body,
+    section[data-testid="stSidebar"] p,
+    section[data-testid="stSidebar"] span,
+    section[data-testid="stSidebar"] div,
+    section[data-testid="stSidebar"] li,
+    section[data-testid="stSidebar"] ul,
+    section[data-testid="stSidebar"] ol,
+    section[data-testid="stSidebar"] label,
+    section[data-testid="stSidebar"] small,
+    section[data-testid="stSidebar"] strong,
+    section[data-testid="stSidebar"] em,
+    section[data-testid="stSidebar"] code,
+    section[data-testid="stSidebar"] kbd,
+    section[data-testid="stSidebar"] a,
+    section[data-testid="stSidebar"] blockquote,
+    section[data-testid="stSidebar"] details,
+    section[data-testid="stSidebar"] summary,
+    section[data-testid="stSidebar"] input,
+    section[data-testid="stSidebar"] textarea { color: var(--text-inverse) !important; }
+    section[data-testid="stSidebar"] h1,
+    section[data-testid="stSidebar"] h2,
+    section[data-testid="stSidebar"] h3 { color: #c7d2fe !important; letter-spacing: 0.01em; }
+    section[data-testid="stSidebar"] .stMarkdown p { color: #cbd5e1 !important; }
+    section[data-testid="stSidebar"] hr { border-color: rgba(255,255,255,0.08); }
+    /* Disabled controls in the sidebar need explicit text colour —
+       `disabled` attribute is what BaseWeb looks at, not a CSS class. */
+    section[data-testid="stSidebar"] button[disabled],
+    section[data-testid="stSidebar"] input[disabled],
+    section[data-testid="stSidebar"] textarea[disabled] {
+        color: #94a3b8 !important;
+        -webkit-text-fill-color: #94a3b8 !important;
+        opacity: 0.7;
+    }
+    /* BaseWeb selectbox dropdown menu portals to <body>; without these
+       rules its option text stays light-blue (the inherited sidebar
+       colour) but the menu background is dark, so items disappear.
+       The popup uses `data-baseweb="menu"` / `role="option"`. */
+    body [data-baseweb="menu"] { background: #0f172a !important; }
+    body [data-baseweb="menu"] li,
+    body [data-baseweb="menu"] [role="option"] { color: #f1f5f9 !important; }
+    body [data-baseweb="menu"] li[aria-selected="true"],
+    body [data-baseweb="menu"] [role="option"][aria-selected="true"] {
+        background: rgba(56,189,248,0.18) !important;
+        color: #ffffff !important;
+    }
+    /* Sidebar brand block */
+    .sm-brand {
+        display: flex; align-items: center; gap: 0.6rem;
+        padding: 0.25rem 0 0.5rem 0;
+    }
+    .sm-brand .logo {
+        width: 32px; height: 32px;
+        display: inline-flex; align-items: center; justify-content: center;
+        background: linear-gradient(135deg, #1d4ed8 0%, #4338ca 100%);
+        color: #fff; border-radius: 8px;
+        box-shadow: 0 2px 6px rgba(29, 78, 216, 0.35);
+        font-size: 0.95rem;
+    }
+    .sm-brand .name { font-size: 1.1rem; font-weight: 700; color: #f8fafc; letter-spacing: 0.01em; }
+    .sm-brand .tag  { font-size: 0.7rem; color: #94a3b8; letter-spacing: 0.04em; text-transform: uppercase; }
+    /* Sidebar section headings */
+    section[data-testid="stSidebar"] h3 {
+        font-size: 0.72rem !important;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: #93c5fd !important;
+        margin-top: 0.75rem !important;
+        margin-bottom: 0.35rem !important;
+        font-weight: 600 !important;
+    }
+    /* Sidebar inputs — dark surfaces, light text */
+    section[data-testid="stSidebar"] .stTextInput input,
+    section[data-testid="stSidebar"] .stTextArea textarea,
+    section[data-testid="stSidebar"] .stNumberInput input,
+    section[data-testid="stSidebar"] .stChatInput input {
+        background: rgba(255,255,255,0.05) !important;
+        color: #f1f5f9 !important;
+        border: 1px solid rgba(255,255,255,0.1) !important;
+        border-radius: var(--radius-sm) !important;
+    }
+    section[data-testid="stSidebar"] .stSelectbox div[data-baseweb="select"] > div {
+        background: rgba(255,255,255,0.05) !important;
+        color: #f1f5f9 !important;
+        border-color: rgba(255,255,255,0.1) !important;
+    }
+    section[data-testid="stSidebar"] label,
+    section[data-testid="stSidebar"] .stMarkdown small,
+    section[data-testid="stSidebar"] .stCaption { color: #cbd5e1 !important; }
+    /* The base sidebar button palette is overridden globally below
+       (see the dark-slate section). Keep this selector out so the
+       `.stButton > button` rules further down can paint every
+       sidebar button with the new dark surface. */
+    section[data-testid="stSidebar"] .stDownloadButton > button {
+        background: linear-gradient(135deg, #1d4ed8 0%, #1e40af 100%);
+        color: #fff;
+        border: 1px solid rgba(255,255,255,0.15);
+        border-radius: var(--radius-sm);
+    }
+    section[data-testid="stSidebar"] .stDownloadButton > button:hover {
+        background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%);
+    }
+    /* Sidebar example-prompt buttons — left aligned, lighter */
+    section[data-testid="stSidebar"] .stButton > button[kind="secondary"] {
+        background: transparent;
+        border: 1px solid rgba(255,255,255,0.08);
+        text-align: left;
+        justify-content: flex-start;
+        font-size: 0.82rem;
+        color: #cbd5e1;
+    }
+
+    /* ---------- Sidebar premium cards (new layout) ------------------- */
+    /* A soft, rounded card that groups a related set of widgets. Used
+       for the core-picks block, the recon help block, the chat-history
+       list, and the overview block. The card sits on top of the dark
+       sidebar gradient and gives the sidebar a layered, panel-based
+       look — closer to a productised desktop client than a long
+       flat form. */
+    .sm-card {
+        background: linear-gradient(180deg, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.02) 100%);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 12px;
+        padding: 0.85rem 0.9rem 0.95rem 0.9rem;
+        margin-bottom: 0.65rem;
+        box-shadow: 0 1px 0 rgba(0,0,0,0.25), 0 6px 18px rgba(0,0,0,0.18);
+    }
+    .sm-card .sm-card-title {
+        display: flex; align-items: center; gap: 0.45rem;
+        font-size: 0.72rem; font-weight: 700;
+        text-transform: uppercase; letter-spacing: 0.1em;
+        color: #93c5fd !important;
+        margin: 0 0 0.55rem 0;
+    }
+    .sm-card .sm-card-title .dot {
+        width: 6px; height: 6px; border-radius: 50%;
+        background: #38bdf8;
+        box-shadow: 0 0 8px rgba(56,189,248,0.6);
+    }
+    .sm-card .sm-card-sub {
+        font-size: 0.78rem; color: #94a3b8 !important;
+        margin: -0.25rem 0 0.6rem 0; line-height: 1.35;
+    }
+    /* Inline code chip — used to render the `/recon` syntax. */
+    .sm-inline-code {
+        background: rgba(56,189,248,0.12);
+        border: 1px solid rgba(56,189,248,0.28);
+        color: #7dd3fc !important;
+        padding: 0.1rem 0.35rem;
+        border-radius: 6px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 0.82rem;
+    }
+    /* Mini-pill list inside a card — used to enumerate recon
+       arguments and the example-prompt row. */
+    .sm-pill-list {
+        display: flex; flex-wrap: wrap; gap: 0.3rem;
+        margin: 0.2rem 0 0.55rem 0;
+    }
+    .sm-pill-list .sm-pill {
+        font-size: 0.72rem;
+        padding: 0.18rem 0.55rem;
+        border-radius: 999px;
+        background: rgba(255,255,255,0.06);
+        border: 1px solid rgba(255,255,255,0.10);
+        color: #cbd5e1 !important;
+    }
+    /* Compact chat-row styling for the in-card history list. */
+    .sm-chat-row {
+        display: flex; align-items: center; gap: 0.35rem;
+        padding: 0.18rem 0.4rem;
+        border-radius: 7px;
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(255,255,255,0.05);
+        margin-bottom: 0.22rem;
+        min-height: 1.6rem;
+    }
+    .sm-chat-row.is-active {
+        background: rgba(56,189,248,0.14);
+        border-color: rgba(56,189,248,0.45);
+        box-shadow: inset 0 0 0 1px rgba(56,189,248,0.15);
+    }
+    .sm-chat-row .sm-chat-title {
+        flex: 1; min-width: 0;
+        font-size: 0.80rem; color: #e2e8f0 !important;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        line-height: 1.05;
+    }
+    .sm-chat-row .sm-chat-meta {
+        font-size: 0.62rem; color: #94a3b8 !important;
+        text-transform: uppercase; letter-spacing: 0.04em;
+    }
+    /* Override Streamlit's default white button inside chat rows so the
+       rows render as slim, dark, in-card pills instead of pale slabs. */
+    section[data-testid="stSidebar"] .sm-chat-row .stButton > button,
+    section[data-testid="stSidebar"] .sm-chat-row button {
+        background: transparent !important;
+        background-color: transparent !important;
+        border: none !important;
+        box-shadow: none !important;
+        color: #e2e8f0 !important;
+        font-weight: 400 !important;
+        padding: 0.05rem 0.25rem !important;
+        min-height: 1.4rem !important;
+        line-height: 1.05 !important;
+        text-align: left !important;
+        justify-content: flex-start !important;
+    }
+    section[data-testid="stSidebar"] .sm-chat-row button:hover {
+        background: rgba(56,189,248,0.10) !important;
+        color: #f0f9ff !important;
+    }
+    section[data-testid="stSidebar"] .sm-chat-row button:focus {
+        background: rgba(56,189,248,0.18) !important;
+        color: #f0f9ff !important;
+        box-shadow: none !important;
+    }
+    section[data-testid="stSidebar"] .sm-chat-row .sm-chat-trash button {
+        color: #64748b !important;
+        padding: 0.05rem 0.35rem !important;
+    }
+    section[data-testid="stSidebar"] .sm-chat-row .sm-chat-trash button:hover {
+        color: #fca5a5 !important;
+        background: rgba(248,113,113,0.10) !important;
+    }
+    /* Active chat row: sky-tinted title text. */
+    .sm-chat-row.is-active .sm-chat-title { color: #bae6fd !important; }
+    /* Trim Streamlit's vertical padding inside cards so the sidebar
+       stays compact and the cards don't bleed into the next section. */
+    section[data-testid="stSidebar"] .sm-card .block-container { padding: 0; }
+    section[data-testid="stSidebar"] .sm-card .element-container { margin-bottom: 0.35rem; }
+    /* Hide the Streamlit expander label colour clash inside our cards. */
+    section[data-testid="stSidebar"] .sm-card details summary { color: #cbd5e1 !important; }
+    /* Recolor the in-card selectbox (recon scope picker) so it stops
+       looking like a pale slab against the dark card background. */
+    section[data-testid="stSidebar"] .sm-card [data-baseweb="select"] > div {
+        background: rgba(15,23,42,0.6) !important;
+        border-color: rgba(148,163,184,0.25) !important;
+        color: #e2e8f0 !important;
+    }
+    section[data-testid="stSidebar"] .sm-card [data-baseweb="select"] > div:hover {
+        border-color: rgba(56,189,248,0.45) !important;
+    }
+    section[data-testid="stSidebar"] .sm-card [data-baseweb="select"] svg {
+        color: #94a3b8 !important;
+    }
+
+    /* Override every sidebar button (regardless of which card it sits
+       in) with the dark slate surface. Streamlit renders each widget
+       as its own root under the sidebar column — the `.sm-card` div
+       is *not* an ancestor of `.stButton`, so the `.sm-card .stButton`
+       selector matches nothing. We therefore style every sidebar
+       button globally; the chat-row rules above still win inside
+       `.sm-chat-row` because their selector has higher specificity
+       (`.sm-card .sm-chat-row .stButton > button`). The dark surface
+       removes the pale "clears on hover" effect. */
+    section[data-testid="stSidebar"] .stButton > button,
+    section[data-testid="stSidebar"] [data-testid="stDownloadButton"] > button,
+    section[data-testid="stSidebar"] [data-testid="baseButton-secondary"] {
+        background-color: rgba(30,41,59,0.92) !important;
+        background: rgba(30,41,59,0.92) !important;
+        border: 1px solid rgba(148,163,184,0.40) !important;
+        color: #f8fafc !important;
+        font-weight: 600 !important;
+        -webkit-text-fill-color: #f8fafc !important;
+        transition: background-color 0.12s ease,
+                    border-color 0.12s ease, color 0.12s ease !important;
+    }
+    section[data-testid="stSidebar"] .stButton > button:hover,
+    section[data-testid="stSidebar"] [data-testid="stDownloadButton"] > button:hover,
+    section[data-testid="stSidebar"] [data-testid="baseButton-secondary"]:hover {
+        background-color: rgba(56,189,248,0.22) !important;
+        background: rgba(56,189,248,0.22) !important;
+        border-color: rgba(56,189,248,0.65) !important;
+        color: #ffffff !important;
+        -webkit-text-fill-color: #ffffff !important;
+    }
+    section[data-testid="stSidebar"] .stButton > button:focus,
+    section[data-testid="stSidebar"] [data-testid="stDownloadButton"] > button:focus,
+    section[data-testid="stSidebar"] [data-testid="baseButton-secondary"]:focus {
+        background-color: rgba(56,189,248,0.26) !important;
+        background: rgba(56,189,248,0.26) !important;
+        border-color: rgba(56,189,248,0.75) !important;
+        color: #ffffff !important;
+        -webkit-text-fill-color: #ffffff !important;
+        box-shadow: none !important;
+    }
+    section[data-testid="stSidebar"] .stButton > button:active,
+    section[data-testid="stSidebar"] [data-testid="stDownloadButton"] > button:active {
+        background-color: rgba(56,189,248,0.34) !important;
+        background: rgba(56,189,248,0.34) !important;
+        border-color: rgba(56,189,248,0.85) !important;
+        color: #ffffff !important;
+        -webkit-text-fill-color: #ffffff !important;
+    }
+
+    /* ---------- Hero (replaces the old h1+p block) ------------------- */
+    .hero {
+        background: linear-gradient(135deg, #0b1220 0%, #15233f 60%, #1e3a8a 100%);
+        color: #f8fafc;
+        padding: var(--hero-pad);
+        border-radius: var(--radius-lg);
+        margin-bottom: 1.25rem;
+        box-shadow: var(--shadow-md);
+        border: 1px solid rgba(255,255,255,0.05);
+        position: relative;
+        overflow: hidden;
+    }
+    .hero::after {
+        /* Subtle radial accent — no glow, no neon. */
+        content: "";
+        position: absolute; right: -80px; top: -80px;
+        width: 280px; height: 280px;
+        background: radial-gradient(circle, rgba(59,130,246,0.18) 0%, rgba(59,130,246,0) 70%);
+        pointer-events: none;
+    }
+    .hero .eyebrow {
+        font-size: 0.7rem;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        color: #93c5fd;
+        font-weight: 600;
+        margin-bottom: 0.35rem;
+    }
+    .hero h1 {
+        margin: 0;
+        font-size: 1.85rem;
+        font-weight: 700;
+        color: #f8fafc;
+        letter-spacing: -0.01em;
+        display: flex; align-items: center; gap: 0.55rem;
+    }
+    .hero h1 .logo {
+        width: 36px; height: 36px;
+        display: inline-flex; align-items: center; justify-content: center;
+        background: linear-gradient(135deg, #2563eb 0%, #4338ca 100%);
+        color: #fff; border-radius: 9px;
+        box-shadow: 0 4px 12px rgba(37, 99, 235, 0.35);
+        font-size: 1.05rem;
+    }
+    .hero p.subtitle {
+        margin: 0.45rem 0 0 0;
+        color: #cbd5e1;
+        font-size: 0.98rem;
+        line-height: 1.45;
+        max-width: 56ch;
+    }
+    .hero p.tagline {
+        margin: 0.6rem 0 0 0;
+        color: #93c5fd;
+        font-size: 0.85rem;
+        letter-spacing: 0.04em;
+    }
+    .hero .badges {
+        display: flex; flex-wrap: wrap; gap: 0.45rem;
+        margin-top: 1rem;
+    }
+    .hero .badge {
+        display: inline-flex; align-items: center; gap: 0.35rem;
+        background: rgba(255,255,255,0.06);
+        border: 1px solid rgba(255,255,255,0.14);
+        color: #e0e7ff;
+        border-radius: 999px;
+        padding: 4px 12px;
+        font-size: 0.78rem;
+        font-weight: 500;
+    }
+    .hero .badge .dot {
+        width: 6px; height: 6px; border-radius: 50%;
+        background: #60a5fa;
+    }
+
+    /* ---------- Hero (kept dark on purpose — it's the brand surface) */
+    .hero, .hero *, .hero p, .hero h1 { color: #f8fafc !important; }
+    .hero .eyebrow, .hero .tagline  { color: #93c5fd !important; }
+    .hero .badge  { color: #e0e7ff !important; }
+    .hero .subtitle { color: #cbd5e1 !important; }
+
+    /* ---------- Status pill (light surface) ------------------------- */
+    .status, .status * { color: var(--text-secondary) !important; }
+
+    /* ---------- Chat bubbles -----------------------------------------
+       High-specificity color rules so the assistant bubble's text is
+       always dark on white, no matter what Streamlit's theme does. */
+    .row { display: flex; margin: var(--row-gap) 0; }
+    .row.right { justify-content: flex-end; }
+    .row.left  { justify-content: flex-start; }
+
+    .bubble-user {
+        background: linear-gradient(135deg, #1d4ed8 0%, #1e40af 100%) !important;
+        color: #ffffff !important;
+        padding: var(--bubble-pad-y) var(--bubble-pad-x);
+        border-radius: 14px 14px 4px 14px;
+        display: inline-block;
+        max-width: var(--bubble-max);
+        box-shadow: var(--shadow-sm);
+        line-height: 1.5;
+        font-size: 0.95rem;
+        word-wrap: break-word;
+    }
+    .bubble-user * { color: #ffffff !important; }
+
+    .bubble-assistant {
+        background: var(--bg-surface) !important;
+        color: var(--text-primary) !important;
+        padding: var(--bubble-pad-y) var(--bubble-pad-x);
+        border-radius: 14px 14px 14px 4px;
+        display: inline-flex;
+        flex-direction: column;
+        align-items: stretch;
+        max-width: var(--bubble-max);
+        border: 1px solid var(--border-subtle);
+        box-shadow: var(--shadow-sm);
+        line-height: 1.6;
+        font-size: 0.95rem;
+        word-wrap: break-word;
+    }
+    /* The first child is the rendered markdown body; everything after
+       it (the copy button, any future action chips) hugs the bottom of
+       the bubble. */
+    .bubble-assistant > :first-child { min-width: 0; }
+    .bubble-assistant > :not(:first-child) { margin-top: 0.45rem; }
+    /* Force every element inside the assistant bubble to inherit dark
+       text — Streamlit wraps rendered markdown in a <p> which would
+       otherwise pick up the page-level white text. */
+    .bubble-assistant,
+    .bubble-assistant *,
+    .bubble-assistant p,
+    .bubble-assistant li,
+    .bubble-assistant span,
+    .bubble-assistant strong,
+    .bubble-assistant em { color: var(--text-primary) !important; }
+    .bubble-assistant p:first-child { margin-top: 0; }
+    .bubble-assistant p:last-child  { margin-bottom: 0; }
+    .bubble-assistant a { color: var(--accent) !important; text-decoration: underline; }
+    .bubble-assistant pre {
+        background: #0f172a !important;
+        color: #e2e8f0 !important;
+        border-radius: 8px;
+        padding: 0.75rem 0.9rem;
+        font-size: 0.82rem;
+        overflow-x: auto;
+        margin: 0.6rem 0;
+        border: 1px solid #1e293b;
+    }
+    .bubble-assistant pre * { color: #e2e8f0 !important; }
+    .bubble-assistant code {
+        background: #eef2f7 !important;
+        color: #1e293b !important;
+        padding: 1px 6px;
+        border-radius: 4px;
+        font-size: 0.85em;
+    }
+    .bubble-assistant pre code {
+        background: transparent !important; color: #e2e8f0 !important; padding: 0;
+    }
+    .bubble-assistant table {
+        border-collapse: collapse;
+        font-size: 0.85rem;
+        margin: 0.5rem 0;
+    }
+    .bubble-assistant th, .bubble-assistant td {
+        border: 1px solid var(--border-subtle);
+        padding: 4px 8px;
+    }
+    .bubble-assistant th {
+        background: var(--bg-surface-2) !important;
+        text-align: left;
+        font-weight: 600;
+    }
+    .bubble-system {
+        background: #fef3c7 !important;
+        color: #78350f !important;
+        padding: 0.5rem 0.85rem;
+        border-radius: 10px;
+        font-size: 0.85rem;
+        border: 1px solid #fde68a;
+    }
+    .bubble-thinking {
+        background: var(--bg-surface) !important;
+        color: var(--text-secondary) !important;
+        padding: var(--bubble-pad-y) var(--bubble-pad-x);
+        border-radius: 14px 14px 14px 4px;
+        display: inline-flex; align-items: center; gap: 0.5rem;
+        max-width: var(--bubble-max);
+        border: 1px solid var(--border-subtle);
+        box-shadow: var(--shadow-sm);
+        font-size: 0.9rem;
+        font-style: italic;
+    }
+    .bubble-thinking * { color: var(--text-secondary) !important; }
+
+    /* ---------- Copy-to-clipboard button (Tier 1 #4) ------------------
+       Sits inside the assistant bubble, right-aligned at the bottom,
+       ChatGPT-style. Theme-aware (light surface on the navy page),
+       tiny, hover hint. The whole button is a single inline <button>
+       rendered by ``web.chat_helpers._copy_button_html``; we only
+       style it here. */
+    .bubble-copy-btn {
+        align-self: flex-end;
+        margin-top: 0.45rem;
+        background: transparent !important;
+        color: var(--text-secondary) !important;
+        border: 1px solid var(--border-subtle);
+        border-radius: 999px;
+        padding: 2px 9px;
+        font-size: 0.7rem;
+        font-weight: 500;
+        line-height: 1.4;
+        cursor: pointer;
+        transition: background 120ms ease, border-color 120ms ease,
+                    color 120ms ease, transform 80ms ease;
+        user-select: none;
+        display: inline-flex;
+        align-items: center;
+        gap: 0.3rem;
+    }
+    .bubble-copy-btn:hover {
+        background: var(--bg-surface-2) !important;
+        border-color: var(--border-strong);
+        color: var(--text-primary) !important;
+    }
+    .bubble-copy-btn:active { transform: translateY(1px); }
+    .bubble-copy-btn:focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 2px;
+    }
+
+    /* ---------- Role labels (You / SecMentor) ------------------------ */
+    .role-label {
+        font-size: 0.7rem;
+        font-weight: 600;
+        color: var(--text-muted) !important;
+        margin: 0 0 3px 0;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+    }
+    .row.right .role-label { text-align: right; }
+    .row.left  .role-label { text-align: left;  }
+
+    /* ---------- Status pill (bottom) --------------------------------- */
+    .status {
+        display: inline-flex; align-items: center; flex-wrap: wrap; gap: 0.55rem;
+        font-size: 0.78rem;
+        color: var(--text-muted);
+        background: var(--bg-surface) !important;
+        border: 1px solid var(--border-subtle);
+        border-radius: 999px;
+        padding: 6px 14px;
+        margin-top: 0.75rem;
+        box-shadow: var(--shadow-sm);
+    }
+    .status .sep { color: var(--border-strong) !important; }
+    .status .pulse {
+        display: inline-block; width: 8px; height: 8px;
+        background: #10b981; border-radius: 50%;
+        margin-right: 2px;
+        animation: pulse 1.8s ease-in-out infinite;
+    }
+    .status.thinking .pulse { background: #f59e0b; }
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50%      { opacity: 0.45; }
+    }
+
+    /* ---------- Empty state ------------------------------------------ */
+    .empty-state {
+        background: var(--bg-surface) !important;
+        color: var(--text-primary) !important;
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-md);
+        padding: 2rem 1.75rem;
+        margin: 1rem 0 1.25rem 0;
+        text-align: center;
+        box-shadow: var(--shadow-sm);
+    }
+    .empty-state * { color: var(--text-primary) !important; }
+    .empty-state p  { color: var(--text-secondary) !important; }
+    .empty-state .icon {
+        width: 48px; height: 48px; margin: 0 auto 0.6rem auto;
+        display: inline-flex; align-items: center; justify-content: center;
+        background: var(--accent-soft) !important; color: var(--accent-strong) !important;
+        border-radius: 12px; font-size: 1.3rem;
+    }
+    .empty-state h3 {
+        margin: 0 0 0.35rem 0;
+        font-size: 1.05rem;
+        font-weight: 600;
+    }
+    .empty-state .suggestions {
+        display: flex; flex-wrap: wrap; gap: 0.4rem; justify-content: center;
+        margin-top: 1rem;
+    }
+    .empty-state .suggestions .chip {
+        background: var(--bg-surface-2) !important;
+        border: 1px solid var(--border-subtle);
+        color: var(--text-secondary) !important;
+        font-size: 0.78rem;
+        padding: 4px 10px;
+        border-radius: 999px;
+    }
+
+    /* ---------- Chat input (floating card) --------------------------- */
+    /* The chat input is bottom-positioned by Streamlit. Wrap it in a
+       card-like surface so it visually anchors the layout. */
+    [data-testid="stChatInput"] {
+        background: var(--bg-surface) !important;
+        border: 1px solid var(--border-strong) !important;
+        border-radius: 14px !important;
+        box-shadow: 0 6px 24px rgba(15, 23, 42, 0.10) !important;
+        padding: 4px 6px !important;
+    }
+    [data-testid="stChatInput"] textarea,
+    [data-testid="stChatInput"] input {
+        color: var(--text-primary) !important;
+        background: transparent !important;
+        font-size: 0.96rem !important;
+        caret-color: var(--accent) !important;
+    }
+    [data-testid="stChatInput"] textarea::placeholder {
+        color: var(--text-muted) !important;
+        opacity: 1 !important;
+    }
+    [data-testid="stChatInput"] button,
+    [data-testid="stChatInput"] [data-testid="baseButton-secondary"] {
+        background: var(--accent) !important;
+        color: #ffffff !important;
+        border-radius: 10px !important;
+    }
+
+    /* ---------- Tighter captions (handled in the widget-fixes block) - */
+
+    /* ---------- Streamlit default widget fixes ----------------------- */
+    .stAlert p { color: inherit !important; }
+    .stAlert[data-baseweb="notification"] * { color: inherit !important; }
+
+    /* ---------- Widget visibility fixes (component-specific) ----------
+       The earlier broad `*` cascades painted the *inside* of every
+       Streamlit widget with the page/sidebar text colour. That hides
+       the *Open* / *Try /recon now* button labels, the *Advanced model
+       & limits* expander summary, the selectbox value, and similar
+       controls because their BaseWeb internals carry their own
+       backgrounds. Below we restyle every affected widget explicitly,
+       once for the light main column and once for the dark sidebar. */
+
+    /* ---------- Buttons (light main column) -------------------------- */
+    .main .stButton > button,
+    .main [data-testid="stDownloadButton"] > button {
+        background: var(--bg-surface) !important;
+        color: var(--text-primary) !important;
+        border: 1px solid var(--border-strong) !important;
+        border-radius: var(--radius-sm) !important;
+        box-shadow: var(--shadow-sm);
+        font-weight: 500 !important;
+        -webkit-text-fill-color: var(--text-primary) !important;
+        transition: background-color 120ms ease, border-color 120ms ease,
+                    color 120ms ease, box-shadow 120ms ease !important;
+    }
+    /* Streamlit wraps the visible button text in nested <p>/<span>
+       elements. Without an explicit colour, those children inherit
+       whatever the parent theme assigns, so the label looks blank. */
+    .main .stButton > button p,
+    .main .stButton > button span,
+    .main .stButton > button div,
+    .main .stButton > button strong,
+    .main [data-testid="stDownloadButton"] > button p,
+    .main [data-testid="stDownloadButton"] > button span,
+    .main [data-testid="stDownloadButton"] > button div { color: inherit !important; }
+    .main .stButton > button:hover,
+    .main [data-testid="stDownloadButton"] > button:hover {
+        background: var(--bg-surface-2) !important;
+        border-color: var(--accent) !important;
+        color: var(--accent) !important;
+        -webkit-text-fill-color: var(--accent) !important;
+    }
+    .main .stButton > button:focus,
+    .main [data-testid="stDownloadButton"] > button:focus {
+        border-color: var(--accent) !important;
+        box-shadow: 0 0 0 3px rgba(29,78,216,0.18) !important;
+        outline: none !important;
+    }
+    .main .stButton > button:active,
+    .main [data-testid="stDownloadButton"] > button:active {
+        background: var(--accent-soft) !important;
+        color: var(--accent-strong) !important;
+        -webkit-text-fill-color: var(--accent-strong) !important;
+    }
+    /* Primary buttons (Streamlit sets `kind="primary"`). */
+    .main .stButton > button[kind="primary"],
+    .main [data-testid="baseButton-primary"] {
+        background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%) !important;
+        color: #ffffff !important;
+        border: 1px solid var(--accent-strong) !important;
+        -webkit-text-fill-color: #ffffff !important;
+    }
+    .main .stButton > button[kind="primary"]:hover,
+    .main [data-testid="baseButton-primary"]:hover {
+        background: linear-gradient(135deg, #2563eb 0%, var(--accent) 100%) !important;
+        color: #ffffff !important;
+        -webkit-text-fill-color: #ffffff !important;
+    }
+    /* Disabled buttons in the main column. */
+    .main .stButton > button:disabled,
+    .main .stButton > button[disabled],
+    .main [data-testid="stDownloadButton"] > button:disabled,
+    .main [data-testid="stDownloadButton"] > button[disabled],
+    .main button[disabled] {
+        background: var(--bg-surface-2) !important;
+        color: var(--text-muted) !important;
+        border-color: var(--border-subtle) !important;
+        -webkit-text-fill-color: var(--text-muted) !important;
+        opacity: 0.7 !important;
+        cursor: not-allowed !important;
+        box-shadow: none !important;
+    }
+
+    /* ---------- Expanders ------------------------------------------- */
+    /* Streamlit renders `st.expander` as <details><summary>. */
+    .main details summary,
+    .main details summary p,
+    .main details summary span,
+    .main details summary div {
+        color: var(--text-primary) !important;
+        -webkit-text-fill-color: var(--text-primary) !important;
+        font-weight: 600 !important;
+    }
+    .main details summary:hover {
+        color: var(--accent) !important;
+        -webkit-text-fill-color: var(--accent) !important;
+    }
+    .main details summary svg { color: var(--text-muted) !important; }
+    .main details[open] > summary { color: var(--accent) !important; }
+    .main details {
+        background: var(--bg-surface) !important;
+        border: 1px solid var(--border-subtle) !important;
+        border-radius: var(--radius-sm);
+        padding: 0.35rem 0.6rem;
+    }
+    .main details > div,
+    .main details > div * {
+        color: var(--text-secondary) !important;
+        -webkit-text-fill-color: var(--text-secondary) !important;
+    }
+
+    /* ---------- BaseWeb selectbox (light) --------------------------- */
+    .main [data-baseweb="select"] > div,
+    .main [data-baseweb="select"] input,
+    .main [data-baseweb="select"] [data-testid="stVirtualDropdown"] {
+        background: var(--bg-surface) !important;
+        color: var(--text-primary) !important;
+        border: 1px solid var(--border-strong) !important;
+        border-radius: var(--radius-sm) !important;
+        -webkit-text-fill-color: var(--text-primary) !important;
+    }
+    .main [data-baseweb="select"] > div:hover { border-color: var(--accent) !important; }
+    .main [data-baseweb="select"] svg { color: var(--text-muted) !important; }
+    .main [data-baseweb="select"] [aria-disabled="true"],
+    .main [data-baseweb="select"] [data-disabled="true"] {
+        background: var(--bg-surface-2) !important;
+        color: var(--text-muted) !important;
+        -webkit-text-fill-color: var(--text-muted) !important;
+    }
+
+    /* ---------- Text inputs / textareas (light) --------------------- */
+    .main .stTextInput input,
+    .main .stTextArea textarea,
+    .main .stNumberInput input,
+    .main .stChatInput input {
+        background: var(--bg-surface) !important;
+        color: var(--text-primary) !important;
+        -webkit-text-fill-color: var(--text-primary) !important;
+        border: 1px solid var(--border-strong) !important;
+        border-radius: var(--radius-sm) !important;
+        caret-color: var(--accent) !important;
+    }
+    .main .stTextInput input::placeholder,
+    .main .stTextArea textarea::placeholder {
+        color: var(--text-muted) !important;
+        opacity: 1 !important;
+    }
+    .main .stTextInput input:focus,
+    .main .stTextArea textarea:focus,
+    .main .stNumberInput input:focus {
+        border-color: var(--accent) !important;
+        box-shadow: 0 0 0 3px rgba(29,78,216,0.18) !important;
+        outline: none !important;
+    }
+    .main .stTextInput input:disabled,
+    .main .stTextArea textarea:disabled,
+    .main .stNumberInput input:disabled {
+        background: var(--bg-surface-2) !important;
+        color: var(--text-muted) !important;
+        -webkit-text-fill-color: var(--text-muted) !important;
+        border-color: var(--border-subtle) !important;
+        cursor: not-allowed !important;
+    }
+
+    /* ---------- Sliders (light) ------------------------------------- */
+    .main [data-testid="stSlider"] [role="slider"] {
+        background: var(--accent) !important;
+        border-color: var(--accent-strong) !important;
+    }
+    .main [data-testid="stSlider"] [data-baseweb="slider"] > div > div {
+        background: var(--accent) !important;
+    }
+    .main [data-testid="stSlider"] [data-baseweb="slider"] > div > div > div {
+        background: var(--border-strong) !important;
+    }
+    .main [data-testid="stSlider"] [data-testid="stTickBar"] { color: var(--text-muted) !important; }
+    .main [data-testid="stSlider"] label,
+    .main [data-testid="stSlider"] [data-testid="stWidgetLabel"] p {
+        color: var(--text-secondary) !important;
+    }
+
+    /* ---------- Checkboxes / radios (light) ------------------------- */
+    .main [data-testid="stCheckbox"] label,
+    .main [data-testid="stCheckbox"] label p,
+    .main [data-testid="stCheckbox"] label span,
+    .main [data-testid="stRadio"] label,
+    .main [data-testid="stRadio"] label p,
+    .main [data-testid="stRadio"] label span {
+        color: var(--text-primary) !important;
+        -webkit-text-fill-color: var(--text-primary) !important;
+    }
+    .main [data-testid="stCheckbox"] [data-baseweb="checkbox"] span,
+    .main [data-testid="stRadio"] [data-baseweb="radio"] span {
+        background: var(--bg-surface) !important;
+        border-color: var(--border-strong) !important;
+    }
+    .main [data-testid="stCheckbox"] [data-baseweb="checkbox"] span svg,
+    .main [data-testid="stRadio"] [data-baseweb="radio"] span svg { color: var(--accent) !important; }
+
+    /* ---------- File uploader (light) ------------------------------- */
+    .main [data-testid="stFileUploader"] section,
+    .main [data-testid="stFileUploader"] button {
+        background: var(--bg-surface) !important;
+        color: var(--text-primary) !important;
+        -webkit-text-fill-color: var(--text-primary) !important;
+        border: 1px dashed var(--border-strong) !important;
+        border-radius: var(--radius-sm) !important;
+    }
+    .main [data-testid="stFileUploader"] small,
+    .main [data-testid="stFileUploader"] span { color: var(--text-muted) !important; }
+
+    /* ---------- Captions (light) ------------------------------------ */
+    .main .stCaption, .main [data-testid="stCaptionContainer"],
+    .main .stCaption p, .main [data-testid="stCaptionContainer"] p {
+        color: var(--text-secondary) !important;
+    }
+    .main .stCaption small { color: var(--text-muted) !important; }
+
+    /* ---------- Main-column button shadow polish -------------------- */
+    .main .stButton > button:hover { box-shadow: var(--shadow-sm); }
+</style>

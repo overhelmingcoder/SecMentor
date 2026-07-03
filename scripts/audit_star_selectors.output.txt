@@ -1,0 +1,11 @@
+--- selectors whose token list contains a bare `*` ---
+  [safe]                 .stApp *
+  [color !important]     .hero *
+  [color !important]     .status *
+  [color !important]     .bubble-user *
+  [color !important]     .bubble-assistant *
+  [color !important]     .bubble-assistant pre *
+  [color !important]     .bubble-thinking *
+  [color !important]     .empty-state *
+  [color !important]     .stAlert[data-baseweb="notification"] *
+  [color !important]     .main details > div *
