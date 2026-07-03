@@ -3,8 +3,8 @@
 > **AI-Powered Cybersecurity Learning & Analysis Platform**
 > Learn · Analyze · Defend · Research
 
-A Streamlit chatbot that answers cybersecurity questions using free LLMs routed through [OpenRouter](https://openrouter.ai). Built as a personal learning project across 7 phases plus a Session-4 post-hoc pass, a Session-7 multimodal pass, a Session-8 UI fix pass, a Session-9 RAG + chat-history pass, and a Phase-15 OSINT pass:
-plain request/response → memory → prompt engineering → web UI → refactor → multi-model selector, two-pass pattern, friendly-error classifier → file & image upload (multimodal) → copy-to-clipboard bubble buttons (no inline JS, idempotent delegated listener) → **persistent chat history sidebar + per-chat RAG over uploaded files + curated global security corpus (OWASP / MITRE / CWE / GTFOBins / Sigma) streamed into the prompt before the user turn → scoped OSINT reconnaissance (`/recon` slash command — DNS / URL / IP / WHOIS / crt.sh) gated by a "lab-only" scope token so it can never reach the public internet on a production target**.
+A Streamlit chatbot that answers cybersecurity questions using free LLMs routed through [OpenRouter](https://openrouter.ai). Built as a personal learning project across 7 phases plus a Session-4 post-hoc pass, a Session-7 multimodal pass, a Session-8 UI fix pass, a Session-9 RAG + chat-history pass, a Phase-15 OSINT pass, and a Phase-16 advanced-model pass:
+plain request/response → memory → prompt engineering → web UI → refactor → multi-model selector, two-pass pattern, friendly-error classifier → file & image upload (multimodal) → copy-to-clipboard bubble buttons (no inline JS, idempotent delegated listener) → **persistent chat history sidebar + per-chat RAG over uploaded files + curated global security corpus (OWASP / MITRE / CWE / GTFOBins / Sigma) streamed into the prompt before the user turn → scoped OSINT reconnaissance (`/recon` slash command — DNS / URL / IP / WHOIS / crt.sh) gated by a "lab-only" scope token so it can never reach the public internet on a production target → a working Advanced model option in the sidebar that lets you paste any `:free` model id from the OpenRouter catalog (e.g. `qwen/qwen3-coder:free`) when the curated default is rate-limited out, with a custom-validating input, a router-level ephemeral-slot path for per-key rotation, and a clear-override button**.
 
 The web UI ships in **CTF / Lab mentor** mode by default (a lab-scoped teaching persona that can produce runnable exploit snippets *for your own lab*), with a one-click switch to the conservative **Defensive (4-pillar)** prompt. The CLI keeps the defensive default so headless / scripted use stays in the tighter scope. Both modes share the same hard refusals — see the [Safety](#safety) section below.
 
@@ -45,8 +45,13 @@ OPENROUTER_APP_NAME=SecMentor
 > (rough ballpark: 20 req/min, 50–200/day depending on the upstream
 > provider). The default model `google/gemma-4-31b-it:free` is the
 > most reliable on the day of writing. If you see a friendly
-> `⏳ … is rate-limited upstream.` banner in the UI, either wait ~30s
-> or pick a different model from the sidebar.
+> `⏳ … is rate-limited upstream.` banner in the UI, either wait ~30s,
+> pick a different model from the curated sidebar dropdown, or open
+> **Advanced model & limits** in the sidebar and paste any other
+> `:free` id from <https://openrouter.ai/models?q=free&output_modalities=text>
+> (e.g. `qwen/qwen3-coder:free`). The Advanced option is the
+> end-user recovery path for quota exhaustion — see the dedicated
+> section below.
 
 ### 3. Create a virtual environment (recommended)
 
@@ -96,7 +101,7 @@ Expected: `Ran N tests in …` → `OK`. The breakdown by file:
 | `tests/test_rag_global.py` | 7 classes | Global corpus store: add, search, source-filter, dedup by sha256, degraded mode |
 | `tests/test_rag_corpus.py` | — | OWASP / MITRE / CWE / GTFOBins / Sigma parsers + dispatch + registry + validation |
 | `tests/test_recon.py` | 17 classes | Phase 15 OSINT: `/recon` grammar, refang, normalize, scope-token safety, 5 transports, orchestrator, two renderers, audit log |
-| `tests/test_streaming.py` | — | `stream_chat` SSE consumer + round-robin router wrapper |
+| `tests/test_streaming.py` | 30 tests | `stream_chat` SSE consumer + round-robin router wrapper + Phase-16 ephemeral-slot path (`test_model_pin_with_no_matching_slot_uses_ephemeral_path`, `test_model_pin_ephemeral_rotates_across_keys`, `test_model_pin_ephemeral_disabled_anchor_marks_ephemeral_blocked`) |
 
 Run any one file with `python -m unittest tests.test_recon -v`.
 
@@ -133,8 +138,8 @@ improvements.md   # Change-log + tuning guide for offensive / defensive behavior
 Key files:
 
 - `app/openrouter.py` — HTTP client to OpenRouter's `/chat/completions` endpoint. Raises `OpenRouterError` (and four subclasses) on any HTTP non-200; 30-second timeout.
-- `app/config.py` — `iter_api_keys()` (5-slot rotation pool), `iter_models()` (multi-model list), `HTTP_TIMEOUT_SECONDS=30`. Reads from `.env` via `python-dotenv`.
-- `app/router.py` — `ModelRouter` class: round-robin slot rotation, 401-disables-slot, 429-backoff, 5xx-retry, key redaction (`****abcd`).
+- `app/config.py` — `iter_api_keys()` (5-slot rotation pool), `iter_models()` (multi-model list), `HTTP_TIMEOUT_SECONDS=30`, and `validate_free_model_id()` + `InvalidFreeModelIdError` for the Advanced-model sidebar option. Reads from `.env` via `python-dotenv`.
+- `app/router.py` — `ModelRouter` class: round-robin slot rotation, 401-disables-slot, 429-backoff, 5xx-retry, key redaction (`****abcd`), and the **ephemeral-slot path** used when a turn pins a model id that is not in the built pool (`_iter_healthy_slots_starting_at` falls through to `_ephemeral_slots_for`, which synthesizes one ephemeral `KeySlot` per configured api key, all sharing the custom `model_id` and reading disabled/cooldown state live from the per-key anchor built slot).
 - `app/prompts.py` — The two system prompts: `CYBERSECURITY_SYSTEM_PROMPT` (defensive, four pillars) and `OFFENSIVE_MENTOR_SYSTEM_PROMPT` ("SecMentor", lab-scope). The web UI can swap between them from the sidebar.
 - `app/file_processor.py` — Multimodal file pipeline: `process_upload(uploaded_file)` returns `ProcessedFile(text, image_b64, mime)`. Handles PDF (text extract via pymupdf, lazy-imported), PNG/JPG/GIF/WebP images (base64, 4 MB cap), raises 8 typed `FileProcessingError` kinds. No Streamlit dependency.
 - `cli/chatbot.py` — REPL-style terminal chat. Always uses the defensive prompt.
@@ -162,18 +167,25 @@ python run.py --no-preflight  # skip the pre-flight check
 python run.py --detach        # run in the background (CI / scripts)
 ```
 
+### Slash commands inside the chat
+
+The chat input box also accepts two non-message directives:
+
+- **`/recon <domain-or-ip>`** — runs the OSINT orchestrator (`app/recon/orchestrator.py`: DNS, URL info, IP info, WHOIS, crt.sh) against the target and streams a structured report into the chat. By default the orchestrator only runs in `lab` scope (see `app/recon/safety.py`); switch it to `live` with `SCAN_SCOPE=live` in `.env` if you really want to use it against a production target.
+- **`/clear`** — clears the visible chat history for the current session (the persistent row in `~/.cache/ai-security-chatbot/` is soft-deleted, not destroyed).
+
 ---
 
 ## How the web app works (60-second tour)
 
-1. The sidebar lets you pick a model from 5 curated `:free` options (Gemma 4 31B, Llama 3.3 70B, Mistral Small 24B, Qwen 2.5 72B, Nemotron 30B) or paste a custom model ID.
+1. The sidebar lets you pick a model from the **curated free list** (Gemma 4 31B, Llama 3.3 70B, Mistral Small 24B, Qwen 2.5 72B, Nemotron 30B) — or open **Advanced model & limits** and paste any other `vendor/model:free` id from the OpenRouter catalog when the curated default hits its quota. The Advanced option validates the id, locks the curated dropdown with a 🔒 caption, and routes the request through the router's ephemeral-slot path so it still rotates across all configured keys.
 2. Type a question into `st.chat_input` and press Enter.
 3. **Or drag a file** into the chat input area (`st.chat_input` accepts a file attachment). Supported: PDF, PNG, JPG, GIF, WebP. Limits: 4 MB images, ~200 K characters of extracted PDF text. See **File & image upload** below.
 4. The view uses a **two-pass pattern**: pass 1 stores the question (and any file) in `session_state["pending_request"]` and calls `st.rerun()`; pass 2 calls the OpenRouter engine, appends the assistant reply, and reruns again so the history loop at the top of the script paints the new bubble.
 5. A `Thinking…` placeholder appears in the spinner window; the assistant bubble replaces it when the model returns.
 6. Errors are classified at the helper layer (`_is_rate_limit_error`) and rendered at the view layer (`_render_friendly_error`). The raw exception is kept in a collapsed `st.expander` for debugging.
 7. The same question twice in one session hits an in-memory cache (no second upstream call).
-8. `/clear` (or the sidebar Reset) wipes the transcript without a server restart.
+8. Every chat you start is **persisted to SQLite** (see the *Persistent chat history sidebar* section below). `/clear` wipes the current transcript without deleting the chat from the sidebar; `+ New chat` starts a fresh one; the trash icon soft-deletes.
 
 ### Web UI features
 
@@ -276,6 +288,11 @@ Every conversation you start lives in a sidebar list on the left, ordered by **m
 - A **title** (the first user prompt, trimmed to ~40 chars) with a **pencil icon** beside it for inline rename.
 - A **relative timestamp**: `just now` (under 30 s), `5m ago`, `2h ago`, `3d ago`, or `Mar 14`. The format is computed at render time from the chat's `updated_at` column, so it stays correct as time passes without any background job.
 - A **trash icon** for soft delete. Click it once: the row is struck through in the UI and greyed out, but the data is still on disk. Click the trash again (now showing ✕) to confirm. After one rerun with no confirmation, the row is hard-deleted along with its messages, artifacts, chunks, and source citations.
+
+**Slash commands that flow through the sidebar list:**
+
+- **`/clear`** typed into the chat input clears the *visible* transcript of the currently open chat only — the row stays in the sidebar and remains re-openable.
+- **`/recon <domain-or-ip>`** runs the OSINT orchestrator (see the *Scoped OSINT reconnaissance* section below) and writes its structured report as an assistant turn in the *same* chat. The recon result is therefore persisted and survives a refresh, the same way a normal reply would.
 
 **Why this is not just `st.session_state["chats"]`.** Streamlit's session state is per-tab, per-process. A refresh wipes it; a server restart wipes it; opening a second tab in the same browser gives you a *different* copy of the same chats. None of those are acceptable for a learner who wants to come back tomorrow and find their SQL-injection walkthrough still in slot #2. The fix is to make the chat a row in SQLite, render the sidebar by querying `chats` ordered by `updated_at DESC`, and call `touch_chat(chat_id)` from `_ask` the moment a turn is appended. `session_state` still holds the *currently open* chat id; everything else lives on disk.
 
@@ -397,6 +414,34 @@ Without one of those tokens, `assert_target_allowed(target)` raises `TargetBlock
 **Testing.** 17 test classes in `tests/test_recon.py` cover every layer: `ParseReconCommandTests`, `RefangTests`, `NormalizeTargetTests`, `SafetyTests`, `DNSResolveTests`, `UrlInfoProbeTests`, `IpInfoLookupTests`, `WhoisLookupTests`, `CrtShLookupTests`, `CrtShDisabledTests`, `CrtShConfigParserTests`, `CrtShOrchestratorDisabledTests`, `CrtShReportSoftEmptyTests`, `OrchestratorTests`, `RenderMarkdownTests`, `RenderJsonTests`, `ReconStorageTests`. Network access is stubbed at the stdlib boundary (`socket`, `urllib.request`) so the suite is hermetic and runs in <1s.
 
 See `docs/phase_15_recon.md` for the design doc (status, scope, orchestrator contract, sub-component breakdown, test plan, known limitations, rollout), row 18 of `docs/technical_write_up.md` for the build log, and `improvements.md` §B.10 for the cross-cutting summary.
+
+---
+
+### Advanced model option (free-tier recovery) — Phase 16
+
+The curated model list in the sidebar is a *closed* allow-list: Gemma 4 31B, Llama 3.3 70B, Mistral Small 24B, Qwen 2.5 72B, Nemotron 30B. Those are the five models the project is tested against on a regular basis. OpenRouter's `:free` catalogue is much wider than that — and any one of the curated five can hit its daily quota and start returning 429s while another, less-trafficked `:free` model still has capacity. The **Advanced model & limits** expander in the sidebar is the recovery hatch for that situation.
+
+**How to use it.** Open the expander, paste a model id of the shape `vendor/model-name:free` (for example `qwen/qwen3-coder:free`, `meta-llama/llama-3.3-70b-instruct:free`, `google/gemini-2.0-flash-exp:free`), and the next turn goes out on that model instead of the curated default. The currently-active id is rendered as a caption in the expander and as a `🔒 override active` suffix in the expander title so you can see at a glance what you're about to send to.
+
+**Why the curated dropdown locks, instead of disappearing.** Hiding the curated list on override would make it ambiguous which model is *really* active when the user scrolls back later. Instead, the curated radio is **disabled** with a `🔒` caption next to the dropdown ("curated list locked while override is active") so the user can still see the curated choice, but can't accidentally switch away from the override mid-turn and get a confusing mix.
+
+**Validation rules — what the input accepts and rejects.** The pasted id must match the regex `^[A-Za-z0-9._-]+/[A-Za-z0-9._:-]+:free$` (vendor-slash, then model name including `:free` suffix). `app/config.py::validate_free_model_id()` is the single source of truth: it raises `InvalidFreeModelIdError` on anything missing the `vendor/` prefix, missing the `:free` suffix, or with whitespace, and returns the normalized id on success. The UI catches that exception and renders an inline `st.error` ("Model id must look like `vendor/model-name:free` — e.g. `qwen/qwen3-coder:free`") with a 🔄 Clear button that wipes both the input and the override state.
+
+**Why this needs the ephemeral-slot path in the router, not just a new pinned slot.** The built slot pool is computed once at router construction time from the five configured `(api_key, built_model_id)` pairs. A pasted override like `qwen/qwen3-coder:free` is *not* in that pool — none of the slots match it. The naive implementation would raise "no healthy slot for that model" on the very first turn. The router instead falls through to `_iter_healthy_slots_starting_at(model, start) → _ephemeral_slots_for(model_id, start)`, which **synthesizes one ephemeral `KeySlot` per configured api key, all sharing the override `model_id`**, and reads disabled/cooldown state *live* from each key's anchor built slot. Net effect: the override still rotates across all five keys, still respects the 401-disables-slot and 429-backoff state, and still appears in the audit log with the same `****abcd` key redaction. A key that has been disabled because its built slot returned a 401 will *also* be blocked from the override path; that is intentional, not a bug.
+
+**What this does NOT do.** It does not bypass the curated list's safety contracts — both prompts still apply, the same hard refusals still fire. It does not enable paid models: only `:free` ids validate. It does not let you target a model that doesn't exist on OpenRouter: an upstream 404 still surfaces as a friendly error bubble. It does not persist across restarts — clearing the override (🔄 Clear button, or starting a new chat) reverts to the curated default.
+
+**Where the code lives:**
+
+- `app/config.py` — `validate_free_model_id(raw: str) -> str`, `InvalidFreeModelIdError`, the regex pattern, and the `^[A-Za-z0-9._-]+/[A-Za-z0-9._:-]+:free$` source of truth.
+- `app/router.py` — `_iter_healthy_slots_starting_at`, `_ephemeral_slots_for`, `has_built_slot_for` (read-only helper that lets the UI branch between the built-pool and ephemeral paths without duplicating the slot-existence check).
+- `web/streamlit_app.py` — `st.session_state["custom_model_override"]` + `custom_model_override_error`; the curated radio's `disabled=bool(st.session_state.get("custom_model_override"))`; the expander title `_override_label_suffix()` helper; the chat driver's `requested_model = st.session_state["custom_model_override"] or st.session_state["model"]` so the override wins for that turn only.
+- `web/styles.css` — the `.stTextInput` rule at lines 184–192 paints the Advanced input box with near-white text on dark background, matching the rest of the sidebar.
+- `tests/test_streaming.py` — three tests pin the new contract: `test_model_pin_with_no_matching_slot_uses_ephemeral_path`, `test_model_pin_ephemeral_rotates_across_keys`, and `test_model_pin_ephemeral_disabled_anchor_marks_ephemeral_blocked`.
+
+**When to reach for it.** When the curated model returns a 429 *and* OpenRouter's [free models page](https://openrouter.ai/models?max_price=0) lists another `:free` model with non-zero capacity. When you're debugging an upstream outage against a specific provider and want to A/B against a different `:free` model on the same conversation. When you've added a sixth key and want to confirm the rotation is reaching it without rebuilding the slot pool.
+
+**When NOT to reach for it.** If the issue is that *all* `:free` models on OpenRouter are throttled globally, the override will not help — that's an upstream problem, and the right action is to wait or add a paid key. If the override id is mistyped or no longer in the catalogue, the model will return a 404, which the friendly-error classifier renders as "model not found" — fix the id and retry.
 
 ---
 

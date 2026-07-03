@@ -14,7 +14,7 @@
         --border-strong:  #cbd5e1;
         --text-primary:   #0f172a;
         --text-secondary: #334155;
-        --text-muted:     #64748b;
+        --text-muted:     #031327;
         --text-inverse:   #e2e8f0;
         --accent:         #1d4ed8;
         --accent-soft:    #dbe5ff;
@@ -140,7 +140,7 @@
     section[data-testid="stSidebar"] input[disabled],
     section[data-testid="stSidebar"] textarea[disabled] {
         color: #94a3b8 !important;
-        -webkit-text-fill-color: #94a3b8 !important;
+        -webkit-text-fill-color: #030a1a !important;
         opacity: 0.7;
     }
     /* BaseWeb selectbox dropdown menu portals to <body>; without these
