@@ -211,6 +211,65 @@ def _is_usable_model_id(value: str | None) -> bool:
     return "/" in value and value.endswith(":free")
 
 
+class InvalidFreeModelIdError(ValueError):
+    """Raised by :func:`validate_free_model_id` when the user-supplied
+    id is not a valid ``vendor/model:free`` shape.
+
+    Kept as a distinct class so the view layer can catch it and show
+    a friendly sidebar banner (rather than a raw traceback) when a
+    user types a paid id, a typo, or whitespace into the Advanced
+    model's "Custom OpenRouter model" field.
+    """
+
+
+def validate_free_model_id(raw: str) -> str:
+    """Validate a user-supplied free-tier model id.
+
+    Used by the "Custom OpenRouter model" field in the Advanced
+    expander of ``web/streamlit_app.py``. The rule is the same one
+    :func:`iter_models` applies at startup: the id must contain a
+    ``/`` (vendor/model) and end with ``:free``. Anything else is
+    rejected with :class:`InvalidFreeModelIdError` so the caller can
+    show a clean error instead of silently burning a paid slot.
+
+    Parameters
+    ----------
+    raw
+        The raw text the user typed. Leading and trailing whitespace
+        is stripped; empty strings are rejected (the caller can use
+        the empty string as the "no override" signal without going
+        through this function).
+
+    Returns
+    -------
+    str
+        The cleaned id (whitespace stripped).
+
+    Raises
+    ------
+    InvalidFreeModelIdError
+        If the cleaned id does not contain a ``/`` or does not end
+        with ``:free``.
+    """
+    if raw is None:
+        raise InvalidFreeModelIdError("Model id is empty.")
+    cleaned = raw.strip()
+    if not cleaned:
+        raise InvalidFreeModelIdError("Model id is empty.")
+    if "/" not in cleaned:
+        raise InvalidFreeModelIdError(
+            f"Model id {cleaned!r} is missing the 'vendor/' prefix. "
+            "OpenRouter ids always look like 'vendor/model:free'."
+        )
+    if not cleaned.endswith(":free"):
+        raise InvalidFreeModelIdError(
+            f"Model id {cleaned!r} is not a free-tier id (must end with "
+            "':free'). Paid models are intentionally not supported — "
+            "rotation across free keys is the whole point."
+        )
+    return cleaned
+
+
 # --- Vision-capable model allow-list ------------------------------------------
 # This is the single source of truth for "which free-tier models can
 # see images". The list is intentionally conservative: only models

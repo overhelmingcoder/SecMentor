@@ -614,23 +614,92 @@ class ModelRouterStreamChatTests(unittest.TestCase):
         )
         self.assertGreaterEqual(len(calls), 1)
 
-    def test_model_pin_with_no_matching_slot_raises(self):
-        """If the requested ``model`` does not match any configured slot,
-        ``stream_chat`` must raise :class:`AllSlotsExhaustedError` — the
-        same error the unpinned path raises when every slot fails. We do
-        *not* want a silent fallback to a different model.
-        """
-        from app.router import AllSlotsExhaustedError
+    def test_model_pin_with_no_matching_slot_uses_ephemeral_path(self):
+        """If the requested ``model`` does not match any built pool slot,
+        ``stream_chat`` must synthesize ephemeral slots — one per configured
+        api key, all with the requested model id — and call the underlying
+        ``openrouter.stream_chat`` with that id. This is the recovery path
+        for the "Advanced model" sidebar option when the curated pool
+        doesn't include the user's free-tier pick.
 
+        One key, one built slot ("text:free"), pin to a different model
+        ("vision:free"): the stream function must still be reached exactly
+        once with ``model="vision:free"`` and the configured key.
+        """
         router = self._build(["k1"], ["text:free"])
 
-        called = {"n": 0}
+        captured: list[dict] = []
 
-        def counting(*_a, **_k):
-            called["n"] += 1
+        def fake_stream(_messages, *, model=None, api_key=None, **_kw):
+            captured.append({"model": model, "api_key": api_key})
+            yield "ok"
+
+        with patch("app.openrouter.stream_chat", side_effect=fake_stream):
+            chunks = list(
+                router.stream_chat(
+                    [{"role": "user", "content": "see image"}],
+                    model="vision:free",
+                )
+            )
+
+        self.assertEqual(chunks, ["ok"])
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0]["model"], "vision:free")
+        self.assertEqual(captured[0]["api_key"], "k1")
+
+    def test_model_pin_ephemeral_rotates_across_keys(self):
+        """With multiple keys, a custom-id pin must rotate to the second
+        key after a 401 on the first. The pin restricts the *model*
+        pool (ephemeral here); the key rotation policy is unchanged.
+        """
+        from app.openrouter import OpenRouterAuthError
+
+        router = self._build(["k1", "k2"], ["text:free"])
+
+        attempts: list[str] = []
+
+        def fake_stream(_messages, *, model=None, api_key=None, **_kw):
+            attempts.append(api_key)
+            if api_key == "k1":
+                raise OpenRouterAuthError(
+                    "auth", status=401, model=model, body=""
+                )
+            yield "recovered"
+
+        with patch("app.openrouter.stream_chat", side_effect=fake_stream):
+            chunks = list(
+                router.stream_chat(
+                    [{"role": "user", "content": "see image"}],
+                    model="vision:free",
+                )
+            )
+
+        self.assertEqual(chunks, ["recovered"])
+        self.assertEqual(attempts, ["k1", "k2"])
+
+    def test_model_pin_ephemeral_disabled_anchor_marks_ephemeral_blocked(self):
+        """If a built-pool slot for key K is disabled, the ephemeral twin
+        for key K must also be considered blocked — otherwise a user
+        pasting a custom id would silently bypass the disabled-key guards.
+        """
+        from app.openrouter import OpenRouterAuthError
+
+        router = self._build(["k1", "k2"], ["text:free"])
+        # Disable k1's anchor slot up front.
+        router._slots[0].disabled = True
+
+        attempts: list[str] = []
+
+        def fake_stream(_messages, *, model=None, api_key=None, **_kw):
+            attempts.append(api_key)
+            if api_key == "k2":
+                raise OpenRouterAuthError(
+                    "auth", status=401, model=model, body=""
+                )
             yield "should not be reached"
 
-        with patch("app.openrouter.stream_chat", side_effect=counting):
+        with patch("app.openrouter.stream_chat", side_effect=fake_stream):
+            from app.router import AllSlotsExhaustedError
             with self.assertRaises(AllSlotsExhaustedError):
                 list(
                     router.stream_chat(
@@ -638,7 +707,9 @@ class ModelRouterStreamChatTests(unittest.TestCase):
                         model="vision:free",
                     )
                 )
-        self.assertEqual(called["n"], 0)
+        # Only k2 was attempted; k1 was blocked at the ephemeral layer
+        # because its anchor was disabled.
+        self.assertEqual(attempts, ["k2"])
 
     def test_model_pin_rotates_keys_for_pinned_model(self):
         """When two keys are configured for the same pinned model, the

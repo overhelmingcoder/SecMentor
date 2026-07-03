@@ -44,6 +44,8 @@ from app.config import (
     OPENROUTER_MODEL,
     iter_api_keys,
     iter_models,
+    validate_free_model_id,
+    InvalidFreeModelIdError,
 )
 from app.openrouter import (
     OpenRouterError,
@@ -690,6 +692,14 @@ def _render_sidebar() -> None:
     )
     if FREE_MODEL_CHOICES:
         _labels = [m["label"] for m in FREE_MODEL_CHOICES]
+        # When a custom model override is active the curated dropdown is
+        # *not* the active selection. We still render it (disabled, with a
+        # lock caption) so the user can see what's underneath and re-enable
+        # it from the Advanced section. The previous version of this block
+        # always overwrote ``session_state["model"]`` with the dropdown's
+        # resolved id, which silently clobbered any custom id the user had
+        # typed in the Advanced expander on the next rerun.
+        _override_active = bool(st.session_state.get("custom_model_override"))
         _current = st.session_state["model"]
         _current_label = next(
             (m["label"] for m in FREE_MODEL_CHOICES if m["id"] == _current),
@@ -700,18 +710,29 @@ def _render_sidebar() -> None:
             _labels,
             index=_labels.index(_current_label),
             label_visibility="collapsed",
-            help="Free OpenRouter models. The engine response cache keys "
-                 "on the model id, so switching gives you a clean cache miss.",
+            disabled=_override_active,
+            help=(
+                "Free OpenRouter models. The engine response cache keys "
+                "on the model id, so switching gives you a clean cache miss."
+                if not _override_active
+                else "Locked — a custom model is set in Advanced. Clear it to re-enable the dropdown."
+            ),
         )
-        st.session_state["model"] = next(
-            m["id"] for m in FREE_MODEL_CHOICES if m["label"] == _chosen_label
-        )
+        if not _override_active:
+            st.session_state["model"] = next(
+                m["id"] for m in FREE_MODEL_CHOICES if m["label"] == _chosen_label
+            )
         # Show the chosen id + a one-line blurb so the user always knows
         # exactly what they're talking to.
         _chosen = next(
             m for m in FREE_MODEL_CHOICES if m["label"] == _chosen_label
         )
         st.caption(f"`{_chosen['id']}` — {_chosen['blurb']}")
+        if _override_active:
+            st.caption(
+                f"🔒 Custom model locked: `{st.session_state['custom_model_override']}` "
+                "(use Advanced → Clear to re-enable the curated list)."
+            )
         # Surface the router pool size so the user can tell at a glance
         # how many (key, model) pairs the engine will try before giving up.
         # We build the router lazily and only for the *display* call here;
@@ -755,16 +776,54 @@ def _render_sidebar() -> None:
     # Advanced expander — custom model id + the three sliders.
     with st.expander("Advanced model & limits", expanded=False):
         if FREE_MODEL_CHOICES:
+            # Initialize the override key once per session. We track the
+            # override separately from ``session_state["model"]`` because
+            # the curated dropdown block above also writes to ``model``
+            # and would otherwise clobber a custom id on every rerun.
+            if "custom_model_override" not in st.session_state:
+                st.session_state["custom_model_override"] = ""
             _custom = st.text_input(
                 "Custom OpenRouter model",
-                value="",
+                value=st.session_state["custom_model_override"],
                 placeholder=OPENROUTER_MODEL,
-                help="Any OpenRouter model id. Leave blank to use the "
-                     "selected free model. Overrides the dropdown until "
-                     "you clear it.",
+                help=(
+                    "Any free OpenRouter model id (must end with ':free'). "
+                    "Leave blank to use the selected curated model. "
+                    "Rotates across your configured api keys via the "
+                    "router's ephemeral-slot path."
+                ),
+                key="_custom_model_id_input",
             ).strip()
-            if _custom:
-                st.session_state["model"] = _custom
+            # The previous version of this block wrote the raw text into
+            # ``session_state["model"]`` on every keystroke. That was racy:
+            # the curated dropdown ran *before* this expander on each
+            # rerun and silently reset ``model`` to the curated default
+            # whenever the custom id didn't match a curated label. We now
+            # write into ``custom_model_override`` instead and let the
+            # chat driver pick it up.
+            if _custom and _custom != st.session_state["custom_model_override"]:
+                try:
+                    cleaned = validate_free_model_id(_custom)
+                except InvalidFreeModelIdError as _e:
+                    st.error(f"❌ {_e}")
+                else:
+                    st.session_state["custom_model_override"] = cleaned
+                    st.toast(
+                        f"Custom model set to `{cleaned}` — dropdown locked "
+                        "until you clear it.",
+                        icon="🔒",
+                    )
+                    st.rerun()
+            # "Use curated model" clear button. Visible only when an
+            # override is active so the curated list isn't cluttered.
+            if st.session_state["custom_model_override"]:
+                if st.button(
+                    "Use curated model (clear override)",
+                    key="_clear_custom_override",
+                    help="Drop the custom model id and re-enable the curated dropdown.",
+                ):
+                    st.session_state["custom_model_override"] = ""
+                    st.rerun()
         st.session_state["temperature"] = st.slider(
             "Temperature",
             min_value=0.0,
@@ -2458,7 +2517,15 @@ if user_chat:
         for m in FREE_MODEL_CHOICES
         if model_supports_vision(m["id"])
     ]
-    requested_model = st.session_state["model"]
+    # ``requested_model`` is the model id the user picked for this turn.
+    # When a custom-id override is active (Advanced expander) that
+    # override wins over the curated dropdown — the dropdown is
+    # rendered disabled while the override is set, so by the time we
+    # reach this line the override is the only signal we have.
+    requested_model = (
+        st.session_state.get("custom_model_override")
+        or st.session_state["model"]
+    )
     effective_model, swapped = select_model_for_request(
         requested_model,
         has_images=has_images,

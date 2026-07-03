@@ -795,7 +795,36 @@ class ModelRouter:
         the call site raises ``AllSlotsExhaustedError`` with the
         last error it saw (or, if every slot was already excluded
         before any call was made, with no cause at all).
+
+        **Custom-id pin path.** When ``model`` is set but does not
+        match any built slot, we synthesize ephemeral slots on the
+        fly — one per configured api key, all with the custom
+        ``model_id`` — so the user's "Advanced model" override still
+        rotates across the 5 keys instead of getting stuck on the
+        first one. The synthesized slots share their disabled /
+        cooldown / last_error state with the built slots that hold
+        the same api key, so a 401 on key 2 disables the ephemeral
+        key-2 slot too. See :meth:`_ephemeral_slots_for`.
         """
+        if model is not None:
+            matched = [s for s in self._slots if s.model_id == model and not s.disabled]
+            if matched:
+                n = len(self._slots)
+                for offset in range(n):
+                    slot = self._slots[(start + offset) % n]
+                    if slot.model_id != model:
+                        continue
+                    if slot.disabled:
+                        continue
+                    if slot.is_in_cooldown():
+                        continue
+                    yield slot
+                return
+            # No built slot has this model id. Fall through to the
+            # ephemeral path below.
+            yield from self._ephemeral_slots_for(model, start)
+            return
+
         n = len(self._slots)
         for offset in range(n):
             slot = self._slots[(start + offset) % n]
@@ -803,9 +832,83 @@ class ModelRouter:
                 continue
             if slot.is_in_cooldown():
                 continue
-            if model is not None and slot.model_id != model:
+            yield slot
+
+    def _ephemeral_slots_for(
+        self, model_id: str, start: int
+    ) -> Iterator[KeySlot]:
+        """Yield ephemeral :class:`KeySlot` instances for a custom
+        (user-supplied) model id, rotating across all configured
+        api keys.
+
+        This is the recovery path used when a user pastes a
+        ``vendor/some-model:free`` id into the Advanced sidebar
+        option because the curated default is rate-limited out.
+        The built pool was constructed from a hand-picked list of
+        10 free models, so the new id almost certainly does not
+        appear there. Instead of failing immediately, we synthesize
+        one ephemeral slot per configured key — all sharing the
+        same custom ``model_id`` — so the request still rotates
+        across keys instead of burning all retries on a single one.
+
+        **State sharing.** The synthesized slot for key K shares
+        its ``disabled`` / ``cooldown_until`` state with the
+        *anchor* built slot (the first built slot that holds key
+        K). We do this by reading the anchor's flags at yield time
+        instead of snapshotting them into the ephemeral slot — a
+        401 on key K in :meth:`chat` mutates ``anchor.disabled``,
+        and we want the ephemeral twin to reflect that
+        immediately on the next iteration. Snapshotting would
+        let a user bypass the disabled-key guard rails by
+        pasting a custom id.
+
+        We do not track per-slot error history for ephemeral
+        slots — they get the "last error across the whole pool"
+        semantics the call sites already handle.
+        """
+        # Build a per-key lookup of the first built slot we know
+        # about. The "first" choice is arbitrary; we only need a
+        # consistent anchor per key so the flags read at yield
+        # time reflect the latest state.
+        anchor_by_key: dict[str, KeySlot] = {}
+        for built in self._slots:
+            if built.api_key not in anchor_by_key:
+                anchor_by_key[built.api_key] = built
+
+        ephemeral: list[tuple[KeySlot, KeySlot]] = []
+        for key, anchor in anchor_by_key.items():
+            # Construct the ephemeral slot with both flags at their
+            # *defaults* (enabled, no cooldown). The yield loop
+            # below reads the anchor's current flags instead of
+            # this slot's, so updates to the anchor take effect
+            # without needing a refresh.
+            ephemeral.append(
+                (
+                    KeySlot(api_key=key, model_id=model_id),
+                    anchor,
+                )
+            )
+
+        n = len(ephemeral)
+        for offset in range(n):
+            slot, anchor = ephemeral[(start + offset) % n]
+            # Reflect anchor state live — do NOT read slot.disabled /
+            # slot.cooldown_until, which are stale by construction.
+            if anchor.disabled:
+                continue
+            if anchor.is_in_cooldown():
                 continue
             yield slot
+
+    def has_built_slot_for(self, model_id: str) -> bool:
+        """Return True iff a built pool slot matches ``model_id``.
+
+        Used by the Streamlit sidebar to decide whether the user's
+        custom id still needs the ephemeral-slot path or whether
+        it can ride on the regular built pool. Read-only — never
+        mutates router state.
+        """
+        return any(s.model_id == model_id for s in self._slots)
 
     def _backoff_for(self, exc: openrouter.OpenRouterRateLimitError) -> float:
         """Pick a sleep duration for a 429.
