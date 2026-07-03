@@ -1311,6 +1311,94 @@ class ChatboxPickerTests(unittest.TestCase):
             state["model"] = new_id
         self.assertEqual(state["model"], "meta-llama/llama-3.3-70b-instruct:free")
 
+    def test_override_locks_the_picker(self):
+        """When the Advanced expander holds a custom ``override_id``,
+        the chatbox picker MUST be a no-op — it must not change
+        ``current_id`` and must report ``changed=False`` so the
+        caller's ``if changed: state['model'] = new_id`` guard
+        short-circuits.
+
+        This is the regression test for the user-reported
+        "Advanced model option silently falls back to the curated
+        default" bug: the chip picker's radio could re-write
+        ``session_state['model']`` on every rerun when the user
+        popped it open, which then made the *next* turn's
+        ``requested_model = custom_model_override or session_state['model']``
+        land on the curated id because the override's session-state
+        read happened *after* the chip's stale write. Locking the
+        chip at the helper level is the only correct fix — guarding
+        at the call site would let any future caller forget.
+        """
+        choices = [
+            {"id": "google/gemma-4-31b-it:free", "label": "Gemma 4 31B (default)"},
+            {"id": "meta-llama/llama-3.3-70b-instruct:free", "label": "Llama 3.3 70B"},
+        ]
+        state = _FakeSessionState()
+        state["model"] = "google/gemma-4-31b-it:free"
+        state["custom_model_override"] = "qwen/qwen3-coder:free"
+        # Even if the user picks a different curated label, the
+        # resolver must return the override id unchanged and
+        # ``changed=False``.
+        new_id, changed = resolve_chatbox_model_id(
+            choices,
+            chosen_label="Llama 3.3 70B",
+            current_id=state["model"],
+            override_id=state["custom_model_override"],
+        )
+        self.assertEqual(new_id, "qwen/qwen3-coder:free")
+        self.assertFalse(changed)
+        # The view's wrapper is the only thing that should mutate
+        # ``state['model']``; with ``changed=False`` the wrapper is a
+        # no-op, so the curated id stays put and the override wins
+        # at the call site of ``_ask``.
+        if changed:
+            state["model"] = new_id
+        self.assertEqual(state["model"], "google/gemma-4-31b-it:free")
+        self.assertEqual(
+            state["custom_model_override"], "qwen/qwen3-coder:free"
+        )
+
+    def test_empty_override_does_not_lock_the_picker(self):
+        """The ``override_id`` parameter is the empty string by
+        default and must be treated as "no override" — a regression
+        guard so a future caller that omits the argument gets the
+        original behaviour, not a lockout. Pinned here so the
+        signature change is *additive* and old call sites are safe.
+        """
+        choices = [
+            {"id": "google/gemma-4-31b-it:free", "label": "Gemma 4 31B (default)"},
+            {"id": "meta-llama/llama-3.3-70b-instruct:free", "label": "Llama 3.3 70B"},
+        ]
+        new_id, changed = resolve_chatbox_model_id(
+            choices,
+            chosen_label="Llama 3.3 70B",
+            current_id="google/gemma-4-31b-it:free",
+            override_id="",
+        )
+        self.assertEqual(new_id, "meta-llama/llama-3.3-70b-instruct:free")
+        self.assertTrue(changed)
+
+    def test_whitespace_only_override_does_not_lock_the_picker(self):
+        """A whitespace-only override is also a no-op. The view
+        normalises this with ``.strip()`` before passing it in, but
+        a future caller that forgets the strip should still get a
+        no-lock behaviour — a whitespace id cannot possibly be a
+        valid free model id and the chip must not lock the user out
+        of the curated list for that reason.
+        """
+        choices = [
+            {"id": "google/gemma-4-31b-it:free", "label": "Gemma 4 31B (default)"},
+            {"id": "meta-llama/llama-3.3-70b-instruct:free", "label": "Llama 3.3 70B"},
+        ]
+        new_id, changed = resolve_chatbox_model_id(
+            choices,
+            chosen_label="Llama 3.3 70B",
+            current_id="google/gemma-4-31b-it:free",
+            override_id="   ",
+        )
+        self.assertEqual(new_id, "meta-llama/llama-3.3-70b-instruct:free")
+        self.assertTrue(changed)
+
 
 class StopFlagTests(unittest.TestCase):
     """Pin the cooperative stop-flag contract.

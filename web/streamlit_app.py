@@ -514,6 +514,39 @@ def _init_state() -> None:
 _init_state()
 
 
+def _active_model_id() -> str:
+    """Return the model id the engine should use for the current turn.
+
+    Single source of truth for "which model id do I send right now".
+    When the Advanced expander has a custom override, that override
+    wins over the curated dropdown — the dropdown is rendered
+    disabled while the override is set, and the chatbox chip picker
+    is forced into a read-only state by
+    :func:`_render_chatbox_model_picker`, so by the time we reach a
+    call site that wants to know "what's active", the override is
+    the only correct answer.
+
+    Centralising this read here means the four call sites that need
+    it (the bare-string compat shim in :func:`_ask` pass 1, the
+    legacy-string reconstruction in pass 2, the final ``model``
+    fallback after popping ``pending_request``, and the
+    ``effective_model`` computation in the chat_input driver) cannot
+    drift apart. If a future call site ever needs to use the
+    override, it must go through this helper rather than reading
+    ``session_state["model"]`` directly.
+
+    Returns the curated dropdown id (``session_state["model"]``)
+    when no override is active. Always returns a non-empty string
+    because the curated id is seeded on first run by
+    :func:`_init_state`.
+    """
+    return (
+        st.session_state.get("custom_model_override")
+        or st.session_state.get("model")
+        or ""
+    )
+
+
 # --- Sidebar -----------------------------------------------------------------
 # All sidebar widgets live in ``_render_sidebar`` so main() stays linear and
 # the layout is easy to reason about. The new layout is card-based (CSS in
@@ -971,7 +1004,7 @@ def _render_sidebar() -> None:
         st.session_state["last_elapsed"] = None
         st.rerun()
     _transcript = _serialize_for_download(
-        st.session_state["messages"], model=st.session_state["model"]
+        st.session_state["messages"], model=_active_model_id()
     )
     st.download_button(
         "⬇️  Download transcript",
@@ -1361,6 +1394,22 @@ def _render_chatbox_model_picker() -> None:
     :func:`web.chat_helpers.resolve_chatbox_model_id` so the contract
     is pinned by a unit test without booting Streamlit. The helper
     is a no-op when :data:`FREE_MODEL_CHOICES` is empty.
+
+    **Override interaction.** When the Advanced expander has a custom
+    ``custom_model_override`` set, the chip is **locked**: its face
+    label shows the override id, the popover is replaced by a static
+    caption that points back at the Advanced section, and the
+    underlying ``session_state["model"]`` write is suppressed. This
+    is the bug fix for the user-reported "Advanced model option
+    silently falls back to the curated default" issue: previously the
+    chip picker's radio could re-write ``session_state["model"]`` on
+    every rerun, which meant the *next* turn's
+    ``requested_model = custom_model_override or session_state["model"]``
+    landed on the curated id because the chip took the radio's choice
+    as authoritative. The override signal in
+    ``session_state["custom_model_override"]`` is now the single
+    source of truth for which model id the engine will use, mirrored
+    on the chip face for visibility.
     """
     if not FREE_MODEL_CHOICES:
         return
@@ -1373,6 +1422,34 @@ def _render_chatbox_model_picker() -> None:
         FREE_MODEL_CHOICES[DEFAULT_SELECTED_MODEL_INDEX],
     )
     current_label = current_row["label"]
+
+    # --- Override detection ----------------------------------------------
+    # When the Advanced expander holds a custom id, the chip is forced
+    # into a read-only state. ``session_state["model"]`` is left
+    # untouched so the override-or-curated resolution at the top of
+    # ``_ask`` keeps the override as the active signal. The chip face
+    # is updated to show the override id explicitly so the user is
+    # never left wondering why the curated-default dropdown is locked.
+    override = (st.session_state.get("custom_model_override") or "").strip()
+
+    if override:
+        # Lock the chip: face label = override id, popover disabled by
+        # pointing the user at the Advanced expander instead.
+        st.button(
+            f"🔒 {override}  (override)",
+            key="_chatbox_model_chip_locked",
+            disabled=True,
+            use_container_width=False,
+            help=(
+                "A custom model id is active in Advanced model & limits. "
+                "Clear the override there to re-enable the curated picker."
+            ),
+        )
+        # Suppress the chip's normal ``session_state["model"]`` write.
+        # We do not call ``resolve_chatbox_model_id`` here — there is
+        # no curated label to resolve, and the override is already
+        # authoritative at the call site of ``_ask``.
+        return
 
     # --- Chip column ------------------------------------------------------
     # A single popover button. The face label shows *only* the model
@@ -1405,6 +1482,7 @@ def _render_chatbox_model_picker() -> None:
             "chatbox_model_picker", current_label
         ),
         current_id=current,
+        override_id=override,
     )
     if changed:
         st.session_state["model"] = chosen_id
@@ -1504,7 +1582,7 @@ def _ask(prompt: str | dict[str, object] | None) -> None:
             request = {
                 "text": prompt,
                 "content": prompt,
-                "model": st.session_state["model"],
+                "model": _active_model_id(),
                 "had_files": False,
                 "signature": hash(prompt) & 0xFFFFFFFF,
             }
@@ -1627,12 +1705,18 @@ def _ask(prompt: str | dict[str, object] | None) -> None:
         request = {
             "text": request,
             "content": request,
-            "model": st.session_state["model"],
+            "model": _active_model_id(),
             "had_files": False,
             "signature": hash(request) & 0xFFFFFFFF,
         }
     content = request["content"]
-    model = request.get("model") or st.session_state["model"]
+    # The override-aware read here is what stops the Advanced option
+    # from silently dropping to the curated dropdown: if the user
+    # typed a custom id and then sent a turn, ``pending_request["model"]``
+    # already holds the override (see the chat_input driver at the
+    # bottom of the file), but ``request.get("model") or ...`` is the
+    # safety net for legacy / cross-version paths.
+    model = request.get("model") or _active_model_id()
     # ``text_model`` is the user's original sidebar selection, preserved
     # so the streaming helper can degrade to it if the vision path
     # fails. When the user already picked a vision model there is no

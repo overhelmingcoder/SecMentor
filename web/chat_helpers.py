@@ -827,6 +827,7 @@ def resolve_chatbox_model_id(
     *,
     chosen_label: str,
     current_id: str,
+    override_id: str = "",
 ) -> tuple[str, bool]:
     """Map a chatbox-picker label to its model id and report a change.
 
@@ -844,15 +845,33 @@ def resolve_chatbox_model_id(
         The label the user just picked in the chatbox dropdown.
     current_id : str
         The model id currently bound to ``session_state["model"]``.
+    override_id : str, default ``""``
+        The Advanced-model sidebar override, if active. When set to a
+        non-empty string the picker MUST NOT change ``current_id`` —
+        the chip is a no-op while the override is locked. This is the
+        single guard that prevents the curated dropdown's radio from
+        silently re-writing ``session_state["model"]`` to a curated
+        id when the user is on an override.
 
     Returns
     -------
     tuple[str, bool]
         ``(resolved_id, changed)`` — ``resolved_id`` is the id that
         matches ``chosen_label`` (falling back to ``current_id`` if
-        the label is not in the list), and ``changed`` is ``True`` iff
-        the resolved id differs from ``current_id``.
+        the label is not in the list, and to ``override_id`` if an
+        override is active), and ``changed`` is ``True`` iff the
+        resolved id differs from ``current_id``.
     """
+    # When an override is active the chip is a no-op: the picker
+    # returns the override id unchanged and ``changed=False`` so the
+    # caller does not write ``session_state["model"]`` and clobber the
+    # override signal downstream of this call. A whitespace-only
+    # ``override_id`` is treated as "no override" — the view
+    # normalises with ``.strip()`` but a future caller that forgets
+    # the strip should not accidentally lock the user out of the
+    # curated list.
+    if override_id and override_id.strip():
+        return override_id, False
     chosen_id = next(
         (m["id"] for m in choices if m.get("label") == chosen_label),
         current_id,
