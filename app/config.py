@@ -58,14 +58,29 @@ def _require_env(name: str) -> str:
 
 
 OPENROUTER_API_KEY: str = _require_env("OPENROUTER_API_KEY")
-# Default single model id. Kept required (the existing single-model
-# setup is still the supported minimum) but iter_models() can override
-# the pool with OPENROUTER_MODELS.
-OPENROUTER_MODEL: str = _require_env("OPENROUTER_MODEL")
+# Optional default model id. ``iter_models()`` is the authoritative
+# source for the model pool: when ``OPENROUTER_MODELS`` is set
+# (comma-separated list) it is preferred and ``OPENROUTER_MODEL``
+# may be left unset. When only ``OPENROUTER_MODEL`` is set it is
+# used as the single-model fallback. When *neither* is set —
+# empty string after stripping — the module raises a single,
+# clear "no models configured" error so a half-edited .env still
+# fails loudly at startup instead of silently sending every turn
+# to ``OPENROUTER_MODEL=""``.
+OPENROUTER_MODEL: str = os.getenv("OPENROUTER_MODEL", "").strip()
 OPENROUTER_BASE_URL: str = os.getenv(
     "OPENROUTER_BASE_URL",
     "https://openrouter.ai/api/v1/chat/completions",
 )
+
+#: Tracks whether the module has already validated that at least
+#: one model id is reachable. Populated by :func:`_validate_model_pool`
+#: at module-import time so downstream ``import`` statements can rely
+#: on either ``OPENROUTER_MODELS`` or ``OPENROUTER_MODEL`` being set
+#: without re-checking. The singleton-pattern guards against double
+#: validation if the function is ever called more than once (it can
+#: be, when tests reload the module).
+_MODEL_POOL_VALIDATED: bool = False
 
 # --- Optional values ----------------------------------------------------------
 OPENROUTER_APP_NAME: str = os.getenv(
@@ -150,6 +165,44 @@ def iter_api_keys() -> Iterator[str]:
         yield value
 
 
+def _validate_model_pool() -> None:
+    """Raise once at module-import time if no model id is reachable.
+
+    Called automatically at the bottom of this module so the app
+    fails loudly at startup rather than mid-turn. The check is
+    cheap (just a parse of both env vars), idempotent thanks to
+    :data:`_MODEL_POOL_VALIDATED`, and only the *first* failure is
+    surfaced — re-running the validation after a successful boot
+    is a no-op.
+
+    Why this exists: :func:`iter_models` is a generator and a
+    generator cannot raise at import time, so a caller iterating
+    ``list(iter_models())`` would only discover the misconfiguration
+    on the first chat turn. Centralising the check here turns "user
+    sees a raw RuntimeError after typing their question" into "user
+    sees a clear error the moment they open the app".
+    """
+    global _MODEL_POOL_VALIDATED
+    if _MODEL_POOL_VALIDATED:
+        return
+    raw_list = os.getenv("OPENROUTER_MODELS") or ""
+    parsed_from_list = [
+        entry.strip()
+        for entry in raw_list.split(",")
+        if entry.strip() and _is_usable_model_id(entry.strip())
+    ]
+    single = (os.getenv("OPENROUTER_MODEL") or "").strip()
+    if not parsed_from_list and not _is_usable_model_id(single):
+        raise RuntimeError(
+            "No OPENROUTER_MODELS or OPENROUTER_MODEL found in the "
+            "environment. Add at least one free-tier id (e.g. "
+            "'mistralai/mistral-small-3.2-24b-instruct:free') to your "
+            ".env file or the Streamlit Cloud Secrets panel. See "
+            ".env.example for the full syntax."
+        )
+    _MODEL_POOL_VALIDATED = True
+
+
 def iter_models() -> Iterator[str]:
     """Yield every model id the router should use.
 
@@ -184,17 +237,22 @@ def iter_models() -> Iterator[str]:
                     cleaned,
                 )
         return
-    if _is_usable_model_id(OPENROUTER_MODEL):
-        yield OPENROUTER_MODEL
-    else:
-        # The single-model path. The router would catch this at
-        # construction time, but the message here is friendlier and
-        # points operators at the actual fix.
-        raise RuntimeError(
-            f"OPENROUTER_MODEL={OPENROUTER_MODEL!r} is not a valid "
-            "free-tier model id. It must contain a '/' (vendor/model) "
-            "and end with ':free'. Update your .env."
-        )
+    # Fall back to OPENROUTER_MODEL (read live from the environment so
+    # tests can monkeypatch ``os.environ`` and see the change without
+    # re-importing the module). The module-level constant is just a
+    # cached snapshot for callers that want the bootstrap value.
+    single = os.getenv("OPENROUTER_MODEL", "").strip()
+    if _is_usable_model_id(single):
+        yield single
+    # Note: we used to raise here on a malformed/empty single value,
+    # but :func:`_validate_model_pool` already guarantees at least
+    # one usable id reaches this function (or raises at import time).
+    # Yielding nothing is therefore intentional: a half-configured
+    # .env that set OPENROUTER_MODELS= (an empty string) plus a
+    # malformed OPENROUTER_MODEL will simply produce an empty pool
+    # at iteration time, and the router will raise AllSlotsExhaustedError
+    # with a clear "zero models" message — visible at the first
+    # failed turn rather than as a silent crash.
 
 
 def _is_usable_model_id(value: str | None) -> bool:
@@ -321,6 +379,16 @@ def model_supports_vision(model_id: str) -> bool:
     if not model_id:
         return False
     return model_id.strip().lower() in _VISION_MODEL_IDS
+
+
+# --- Module-load validation --------------------------------------------------
+# Run the model-pool check *after* every helper it depends on is
+# defined. Idempotent, so re-imports (tests that reload the module,
+# Streamlit's auto-reloader on .env change) skip the work. If this
+# raises the message is shown verbatim in the Streamlit traceback
+# panel — operators see "No OPENROUTER_MODELS or OPENROUTER_MODEL
+# found" and know exactly which panel to edit.
+_validate_model_pool()
 
 
 # --- Tunable defaults ---------------------------------------------------------

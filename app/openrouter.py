@@ -57,6 +57,7 @@ from app.config import (
     OPENROUTER_API_KEY,
     OPENROUTER_BASE_URL,
     OPENROUTER_MODEL,
+    iter_models,
 )
 
 # Cap the length of the raw upstream body we keep on the exception. The
@@ -338,13 +339,15 @@ def chat(
     if not messages:
         raise OpenRouterError("Cannot call OpenRouter with an empty message list.")
 
-    chosen_model = model or OPENROUTER_MODEL
+    # ``OPENROUTER_MODEL`` may legitimately be empty when the deploy
+    # configures the pool via ``OPENROUTER_MODELS`` (the supported
+    # primary form as of the rotation-policy fix). Fall back to the
+    # first entry of ``iter_models()`` so the singular default still
+    # routes to a real model for callers (mostly tests + debug)
+    # that don't pass an explicit ``model=``.
+    chosen_model = model or OPENROUTER_MODEL or next(iter_models(), "")
     chosen_key = api_key if api_key is not None else OPENROUTER_API_KEY
     chosen_url = base_url if base_url is not None else OPENROUTER_BASE_URL
-    # Fall back to the config defaults for the two optional numeric
-    # parameters. Importing them lazily here (rather than at module
-    # top) avoids a circular import with ``app.config`` if either of
-    # those constants is ever moved.
     from app.config import DEFAULT_MAX_TOKENS, DEFAULT_TEMPERATURE
 
     chosen_temperature = DEFAULT_TEMPERATURE if temperature is None else temperature
@@ -534,7 +537,12 @@ def stream_chat(
     """
     if not messages:
         raise OpenRouterError("Cannot stream from OpenRouter with an empty message list.")
-    chosen_model = model or OPENROUTER_MODEL
+    # ``OPENROUTER_MODEL`` may legitimately be empty when the deploy
+    # configures the pool via ``OPENROUTER_MODELS``. Fall back to the
+    # first entry of ``iter_models()`` so the singular default still
+    # routes to a real model for callers that don't pass an explicit
+    # ``model=``.
+    chosen_model = model or OPENROUTER_MODEL or next(iter_models(), "")
     chosen_key = api_key if api_key is not None else OPENROUTER_API_KEY
     chosen_url = base_url if base_url is not None else OPENROUTER_BASE_URL
 

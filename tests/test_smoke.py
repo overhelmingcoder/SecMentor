@@ -307,9 +307,18 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(config.OPENROUTER_API_KEY.startswith("sk-or-v1-"))
 
     def test_model_is_loaded(self):
-        self.assertTrue(config.OPENROUTER_MODEL)
-        # A model name always contains a slash (provider/model).
-        self.assertIn("/", config.OPENROUTER_MODEL)
+        # Either a single ``OPENROUTER_MODEL`` *or* a plural
+        # ``OPENROUTER_MODELS`` list must yield at least one usable
+        # free-tier id. This used to assert only the singular
+        # (``config.OPENROUTER_MODEL`` non-empty), which broke the
+        # deploy dashboard after the rotation-policy fix made the
+        # plural list the supported primary form.
+        from app.config import iter_models
+        ids = list(iter_models())
+        self.assertTrue(ids, "no model ids configured (set OPENROUTER_MODEL or OPENROUTER_MODELS)")
+        for mid in ids:
+            self.assertIn("/", mid)
+            self.assertTrue(mid.endswith(":free"), f"{mid!r} must end with ':free'")
 
     def test_base_url_is_loaded(self):
         self.assertTrue(config.OPENROUTER_BASE_URL.startswith("https://"))
