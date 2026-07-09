@@ -647,12 +647,17 @@ class ModelRouterStreamChatTests(unittest.TestCase):
         self.assertEqual(captured[0]["model"], "vision:free")
         self.assertEqual(captured[0]["api_key"], "k1")
 
-    def test_model_pin_ephemeral_rotates_across_keys(self):
-        """With multiple keys, a custom-id pin must rotate to the second
-        key after a 401 on the first. The pin restricts the *model*
-        pool (ephemeral here); the key rotation policy is unchanged.
+    def test_model_pin_ephemeral_stays_on_active_key(self):
+        """With multiple keys, a custom-id pin must NOT fan out across
+        keys in a single call. The one-key-at-a-time rotation policy
+        is the spec: the agent uses one API, only moves to another
+        API after every model on the current key has been tried on
+        a *subsequent* call. Here the active key is k1; a 401 on k1
+        therefore raises ``AllSlotsExhaustedError`` immediately —
+        k2 must not be touched in the same ``stream_chat`` call.
         """
         from app.openrouter import OpenRouterAuthError
+        from app.router import AllSlotsExhaustedError
 
         router = self._build(["k1", "k2"], ["text:free"])
 
@@ -664,38 +669,38 @@ class ModelRouterStreamChatTests(unittest.TestCase):
                 raise OpenRouterAuthError(
                     "auth", status=401, model=model, body=""
                 )
-            yield "recovered"
+            yield "should not be reached in this call"
 
         with patch("app.openrouter.stream_chat", side_effect=fake_stream):
-            chunks = list(
-                router.stream_chat(
-                    [{"role": "user", "content": "see image"}],
-                    model="vision:free",
+            with self.assertRaises(AllSlotsExhaustedError):
+                list(
+                    router.stream_chat(
+                        [{"role": "user", "content": "see image"}],
+                        model="vision:free",
+                    )
                 )
-            )
+        # Only the active key was attempted. k2 stays untouched in
+        # this call; the next stream_chat would start on k2.
+        self.assertEqual(attempts, ["k1"])
 
-        self.assertEqual(chunks, ["recovered"])
-        self.assertEqual(attempts, ["k1", "k2"])
-
-    def test_model_pin_ephemeral_disabled_anchor_marks_ephemeral_blocked(self):
-        """If a built-pool slot for key K is disabled, the ephemeral twin
-        for key K must also be considered blocked — otherwise a user
-        pasting a custom id would silently bypass the disabled-key guards.
+    def test_model_pin_ephemeral_disabled_anchor_raises_immediately(self):
+        """If a built-pool slot for the active key is disabled, the
+        ephemeral path yields nothing and ``stream_chat`` raises
+        ``AllSlotsExhaustedError`` without touching any other key.
+        A user pasting a custom id must not be able to bypass the
+        disabled-key guards; the active key is determined by
+        ``_start_index``, which still points at the disabled
+        anchor in this test setup.
         """
-        from app.openrouter import OpenRouterAuthError
-
         router = self._build(["k1", "k2"], ["text:free"])
-        # Disable k1's anchor slot up front.
+        # Disable k1's anchor slot up front. _start_index defaults
+        # to 0, so the active key for the next call is k1.
         router._slots[0].disabled = True
 
         attempts: list[str] = []
 
         def fake_stream(_messages, *, model=None, api_key=None, **_kw):
             attempts.append(api_key)
-            if api_key == "k2":
-                raise OpenRouterAuthError(
-                    "auth", status=401, model=model, body=""
-                )
             yield "should not be reached"
 
         with patch("app.openrouter.stream_chat", side_effect=fake_stream):
@@ -707,9 +712,11 @@ class ModelRouterStreamChatTests(unittest.TestCase):
                         model="vision:free",
                     )
                 )
-        # Only k2 was attempted; k1 was blocked at the ephemeral layer
-        # because its anchor was disabled.
-        self.assertEqual(attempts, ["k2"])
+        # Neither key was attempted: the active key's anchor is
+        # disabled, so the ephemeral path yields nothing, and the
+        # one-key-at-a-time policy forbids falling through to k2
+        # inside this call.
+        self.assertEqual(attempts, [])
 
     def test_model_pin_rotates_keys_for_pinned_model(self):
         """When two keys are configured for the same pinned model, the
