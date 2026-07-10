@@ -1,7 +1,18 @@
-"""Multi-key, multi-model rotation layer for OpenRouter free-tier calls.
+"""Multi-key, multi-model rotation layer for LLM API calls.
 
-Why this module exists
-----------------------
+This module owns the pool, the per-slot health state, the retry
+policy, and the "did we exceed the cap" detection. It works with
+both OpenRouter (multi-key, free-tier rotation) and Google Gemini
+(single-key, generous free quota).
+
+The backend client is selected at import time based on
+``ACTIVE_PROVIDER`` in ``app.config``: ``app.google_api`` for Gemini,
+``app.google_api`` for Gemini, ``app.openrouter`` for OpenRouter. Both clients expose the same
+``chat`` / ``stream_chat`` interface and raise the same exception
+hierarchy, so the rotation logic is provider-agnostic.
+
+OpenRouter rotation policy
+--------------------------
 
 The OpenRouter *free* tier caps each **model** (per upstream
 provider) at roughly 50 requests per day, not per API key and not
@@ -75,10 +86,11 @@ Design rules
    the only things that go to the logger. The key prefix is masked
    to its last four characters everywhere it surfaces.
 
-This module imports from ``app.openrouter`` only — it does not
-re-implement HTTP. ``app.openrouter`` does not know about rotation;
+This module imports the active client (``app.google_api`` or
+``app.openrouter``) as ``_client`` — it does not
+re-implement HTTP. The client does not know about rotation;
 that keeps the boundary clean and makes the router testable in
-isolation with a stubbed ``openrouter.chat``.
+        isolation with a stubbed ``_client.chat``.
 """
 
 from __future__ import annotations
@@ -88,7 +100,15 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator, Sequence
 
-from app import openrouter
+from app.config import ACTIVE_PROVIDER
+
+# Import the right client at module-load time. Both clients raise the
+# same ``OpenRouterError`` exception hierarchy so the router's error
+# handling is provider-agnostic.
+if ACTIVE_PROVIDER == "gemini":
+    from app import google_api as _client
+else:
+    from app import openrouter as _client
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +119,7 @@ logger = logging.getLogger(__name__)
 class RouterError(RuntimeError):
     """Base class for every failure the router itself can raise.
 
-    Distinct from ``openrouter.OpenRouterError`` so the caller can
+    Distinct from ``_client.OpenRouterError`` so the caller can
     branch on "the upstream is the problem" vs "the pool is
     exhausted". Inherits from ``RuntimeError`` for symmetry with
     ``OpenRouterError``.
@@ -247,7 +267,8 @@ class ModelRouter:
         # time is far better than catching it on the first user
         # message at 02:00.
         for _api_key, model_id in slots:
-            if not model_id.endswith(":free"):
+            is_gemini = model_id.startswith("gemini-")
+            if not is_gemini and not model_id.endswith(":free"):
                 raise NoFreeModelConfiguredError(
                     f"ModelRouter only accepts free-tier model ids "
                     f"(must end with ':free'). Got: {model_id!r}. "
@@ -343,7 +364,7 @@ class ModelRouter:
         The caller's ``messages`` list is passed through unchanged;
         the router never inspects or rewrites the content.
 
-        ``timeout`` is forwarded to :func:`openrouter.chat` per slot.
+        ``timeout`` is forwarded to :func:`_client.chat` per slot.
         The text path uses the module default (60s); the vision path
         in :mod:`web.chat_helpers` overrides this with a 45s ceiling
         — long enough to absorb a typical warm-slot first-token from
@@ -384,7 +405,7 @@ class ModelRouter:
                     ) from last_error
 
                 try:
-                    text = openrouter.chat(
+                    text = _client.chat(
                         messages,
                         model=slot.model_id,
                         temperature=temperature,
@@ -392,7 +413,7 @@ class ModelRouter:
                         timeout=timeout,
                         api_key=slot.api_key,
                     )
-                except openrouter.OpenRouterAuthError as exc:
+                except _client.OpenRouterAuthError as exc:
                     # 401/403: the key is dead. Disable for the
                     # rest of the session and move on immediately.
                     slot.disabled = True
@@ -406,7 +427,7 @@ class ModelRouter:
                         exc.status,
                     )
                     break  # out of the inner retry loop
-                except openrouter.OpenRouterRateLimitError as exc:
+                except _client.OpenRouterRateLimitError as exc:
                     # 429: transient. Sleep, retry the same slot
                     # once, then move on if it 429s again. Also push
                     # the slot's cooldown timestamp forward so the
@@ -432,7 +453,7 @@ class ModelRouter:
                         slot.short_label(),
                     )
                     break  # out of the inner retry loop, move to next slot
-                except openrouter.OpenRouterServerError as exc:
+                except _client.OpenRouterServerError as exc:
                     # 5xx or network error: transient. Retry once on
                     # the same slot (with a small sleep), then
                     # rotate.
@@ -450,7 +471,7 @@ class ModelRouter:
                         exc.status,
                     )
                     break  # rotate
-                except openrouter.OpenRouterClientError as exc:
+                except _client.OpenRouterClientError as exc:
                     # 4xx other than 401/403/429: the request is
                     # malformed or the model is wrong. Rotating
                     # will not help, but we move on rather than
@@ -515,7 +536,7 @@ class ModelRouter:
         would corrupt the reply. ``None`` (the default) preserves the
         original round-robin behaviour across every healthy slot.
 
-        ``timeout`` is forwarded to :func:`openrouter.stream_chat` per
+        ``timeout`` is forwarded to :func:`_client.stream_chat` per
         slot. The text path uses the module default (60s); the
         vision path in :mod:`web.chat_helpers` overrides this with a
         45s ceiling because the only working free vision model is
@@ -589,7 +610,7 @@ class ModelRouter:
             attempts += 1
             tried_slots.append(slot.short_label())
             try:
-                stream = openrouter.stream_chat(
+                stream = _client.stream_chat(
                     messages,
                     model=slot.model_id,
                     temperature=temperature,
@@ -598,20 +619,20 @@ class ModelRouter:
                     api_key=slot.api_key,
                     base_url=None,
                 )
-            except openrouter.OpenRouterError as exc:
+            except _client.OpenRouterError as exc:
                 # The request could not even be opened. Apply the
                 # same per-slot policy as chat() — disable on
                 # auth, sleep on rate-limit, otherwise move on.
                 self._record_slot_failure(
                     slot, exc, cooldown_seconds=rate_limit_cooldown_seconds,
                 )
-                if isinstance(exc, openrouter.OpenRouterAuthError):
+                if isinstance(exc, _client.OpenRouterAuthError):
                     continue
                 delay = self._backoff_for(exc)
                 if delay > 0:
                     self._sleep(delay)
                 if (
-                    isinstance(exc, openrouter.OpenRouterRateLimitError)
+                    isinstance(exc, _client.OpenRouterRateLimitError)
                     and self._retries_remaining(
                         slot, offset, max_attempts=effective_max_attempts
                     ) > 0
@@ -638,7 +659,7 @@ class ModelRouter:
                 # where _extract_assistant_text raises on empty
                 # content.
                 if not yielded_any:
-                    raise openrouter.OpenRouterError(
+                    raise _client.OpenRouterError(
                         "OpenRouter stream returned no deltas before [DONE].",
                         status=None,
                         model=slot.model_id,
@@ -657,7 +678,7 @@ class ModelRouter:
                 # pin.
                 self._record_slot_success(slot)
                 return
-            except openrouter.OpenRouterError as exc:
+            except _client.OpenRouterError as exc:
                 if yielded_any:
                     # Partial reply is in the caller's accumulator.
                     # Surface the error so the view can show the
@@ -667,7 +688,7 @@ class ModelRouter:
                 self._record_slot_failure(
                     slot, exc, cooldown_seconds=rate_limit_cooldown_seconds,
                 )
-                if isinstance(exc, openrouter.OpenRouterAuthError):
+                if isinstance(exc, _client.OpenRouterAuthError):
                     continue
                 delay = self._backoff_for(exc)
                 if delay > 0:
@@ -732,10 +753,10 @@ class ModelRouter:
         other key for 60s) instead of the constructor default.
         """
         slot.last_error = exc
-        if isinstance(exc, openrouter.OpenRouterAuthError):
+        if isinstance(exc, _client.OpenRouterAuthError):
             slot.disabled = True
             return
-        if isinstance(exc, openrouter.OpenRouterRateLimitError):
+        if isinstance(exc, _client.OpenRouterRateLimitError):
             self._set_rate_limit_cooldown(
                 slot, exc, cooldown_seconds=cooldown_seconds
             )
@@ -743,7 +764,7 @@ class ModelRouter:
     def _set_rate_limit_cooldown(
         self,
         slot: KeySlot,
-        exc: openrouter.OpenRouterRateLimitError,
+        exc: _client.OpenRouterRateLimitError,
         *,
         cooldown_seconds: float | None = None,
     ) -> None:
@@ -955,7 +976,7 @@ class ModelRouter:
         """
         return any(s.model_id == model_id for s in self._slots)
 
-    def _backoff_for(self, exc: openrouter.OpenRouterRateLimitError) -> float:
+    def _backoff_for(self, exc: _client.OpenRouterRateLimitError) -> float:
         """Pick a sleep duration for a 429.
 
         If the exception carries an upstream ``Retry-After`` value

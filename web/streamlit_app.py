@@ -39,19 +39,28 @@ if str(_PROJECT_ROOT) not in sys.path:
 import streamlit as st
 
 from app.config import (
+    ACTIVE_PROVIDER,
     DEFAULT_MAX_TOKENS,
     DEFAULT_TEMPERATURE,
+    GEMINI_API_KEY,
+    GEMINI_MODEL,
     OPENROUTER_MODEL,
     iter_api_keys,
     iter_models,
     validate_free_model_id,
+    validate_gemini_model_id,
     InvalidFreeModelIdError,
+    InvalidGeminiModelIdError,
 )
 from app.openrouter import (
     OpenRouterError,
     OpenRouterRateLimitError,
-    chat,
-    stream_chat,
+    chat as openrouter_chat,
+    stream_chat as openrouter_stream_chat,
+)
+from app.google_api import (
+    chat as google_chat,
+    stream_chat as google_stream_chat,
 )
 from app.router import (
     AllSlotsExhaustedError,
@@ -60,6 +69,18 @@ from app.router import (
     RouterError,
     build_from_config,
 )
+
+# --- Provider-agnostic API selection -----------------------------------------
+# Both clients share the same ``chat`` / ``stream_chat`` signature, so
+# we pick the right implementation at module-load time based on the
+# active provider. The rest of the file calls ``_chat(...)`` and
+# ``_stream_chat(...)`` without needing to know which backend is active.
+if ACTIVE_PROVIDER == "gemini":
+    _chat = google_chat
+    _stream_chat = google_stream_chat
+else:
+    _chat = openrouter_chat
+    _stream_chat = openrouter_stream_chat
 
 # Absolute import (not `from .chat_helpers import ...`) because Streamlit runs
 # this file as a top-level module under `streamlit run web/streamlit_app.py`,
@@ -294,7 +315,51 @@ st.markdown(_load_stylesheet(), unsafe_allow_html=True)
 #
 # Roles are loose categories so the UI can group them. They are not
 # enforced by the engine — pick whichever model you want for any prompt.
-FREE_MODEL_CHOICES: list[dict[str, str]] = [
+
+# --- Gemini model list (ACTIVE_PROVIDER == "gemini") -------------------------
+# All Gemini models natively support vision — no separate vision model needed.
+# The free tier (1500 req/day for gemini-2.0-flash as of mid-2026) is generous.
+_GEMINI_MODEL_CHOICES: list[dict[str, str]] = [
+    {
+        "id": "gemini-2.0-flash",
+        "label": "Gemini 2.0 Flash (default)",
+        "role": "Balanced",
+        "blurb": "Fast, cheap, vision-capable. 1500 req/day free.",
+    },
+    {
+        "id": "gemini-2.5-flash",
+        "label": "Gemini 2.5 Flash",
+        "role": "Balanced",
+        "blurb": "Latest flash model. Strong reasoning + vision. 1500 req/day.",
+    },
+    {
+        "id": "gemini-1.5-flash",
+        "label": "Gemini 1.5 Flash",
+        "role": "Quick",
+        "blurb": "Battle-tested flash model. Great latency / cost balance.",
+    },
+    {
+        "id": "gemini-2.5-pro",
+        "label": "Gemini 2.5 Pro",
+        "role": "Reasoning",
+        "blurb": "Most capable Gemini. Higher quality, slower. Limited free quota.",
+    },
+    {
+        "id": "gemini-1.5-pro",
+        "label": "Gemini 1.5 Pro",
+        "role": "Backup",
+        "blurb": "Strong generalist. Larger context window (1M tokens).",
+    },
+    {
+        "id": "gemini-exp-1206",
+        "label": "Gemini Exp 1206",
+        "role": "Experimental",
+        "blurb": "Experimental model. Check ai.google.dev for availability.",
+    },
+]
+
+# --- OpenRouter model list (ACTIVE_PROVIDER == "openrouter") ------------------
+_OPENROUTER_MODEL_CHOICES: list[dict[str, str]] = [
     {
         "id": "google/gemma-4-31b-it:free",
         "label": "Gemma 4 31B (default)",
@@ -328,24 +393,12 @@ FREE_MODEL_CHOICES: list[dict[str, str]] = [
     # --- Vision-capable models -----------------------------------------
     # As of mid-2026, the only free-tier model on OpenRouter that
     # accepts image inputs and returns 200 is nemotron-nano-12b-v2-vl.
-    # Every other vision candidate (llama-3.2-vision, qwen2.5-vl,
-    # gemma-3, mistral-small-3.1, gemini-2.0-flash-exp) returns 404 on
-    # the free tier. The auto-swap in ``select_model_for_request``
-    # uses the *first* id in this list, so as long as there is exactly
-    # one row, image uploads route to it deterministically. If more
-    # free vision models come online, append them below and the
-    # allow-list test in tests/test_files.py will need a matching
-    # update.
     {
         "id": "nvidia/nemotron-nano-12b-v2-vl:free",
         "label": "Nemotron Nano 12B VL (vision)",
         "role": "Vision",
         "blurb": "Free vision model. Reads screenshots, diagrams, photos. 128K context.",
     },
-    # Extra rotation fodder — the router cycles through every (key, model)
-    # pair in the pool, so adding more ids is the cheap way to stretch the
-    # per-account daily cap. Hand-picked to stay :free-only; if a row stops
-    # working, just delete it.
     {
         "id": "mistralai/mistral-small-3.2-24b-instruct:free",
         "label": "Mistral Small 3.2 24B",
@@ -365,6 +418,14 @@ FREE_MODEL_CHOICES: list[dict[str, str]] = [
         "blurb": "Lightweight, low-latency answers. Good for short drills.",
     },
 ]
+
+# Pick the right list based on the active provider. Views / tests can
+# override this by directly assigning a different list to ``FREE_MODEL_CHOICES``.
+FREE_MODEL_CHOICES: list[dict[str, str]] = (
+    _GEMINI_MODEL_CHOICES
+    if ACTIVE_PROVIDER == "gemini"
+    else _OPENROUTER_MODEL_CHOICES
+)
 
 # The model selected in the sidebar on a fresh session. Must be an id
 # present in FREE_MODEL_CHOICES (the session_state init also defensively
@@ -445,7 +506,7 @@ def _init_state() -> None:
         st.session_state["model"] = (
             FREE_MODEL_CHOICES[DEFAULT_SELECTED_MODEL_INDEX]["id"]
             if FREE_MODEL_CHOICES
-            else OPENROUTER_MODEL
+            else (GEMINI_MODEL if ACTIVE_PROVIDER == "gemini" else OPENROUTER_MODEL)
         )
     if "temperature" not in st.session_state:
         st.session_state["temperature"] = DEFAULT_TEMPERATURE
@@ -815,38 +876,50 @@ def _render_sidebar() -> None:
             # and would otherwise clobber a custom id on every rerun.
             if "custom_model_override" not in st.session_state:
                 st.session_state["custom_model_override"] = ""
+            _model_placeholder = (
+                GEMINI_MODEL if ACTIVE_PROVIDER == "gemini" else OPENROUTER_MODEL
+            )
             _custom = st.text_input(
-                "Custom OpenRouter model",
+                "Custom model",
                 value=st.session_state["custom_model_override"],
-                placeholder=OPENROUTER_MODEL,
+                placeholder=_model_placeholder,
                 help=(
-                    "Any free OpenRouter model id (must end with ':free'). "
-                    "Leave blank to use the selected curated model. "
-                    "Rotates across your configured api keys via the "
-                    "router's ephemeral-slot path."
+                    "Any Gemini model id (e.g. 'gemini-2.0-flash')"
+                    if ACTIVE_PROVIDER == "gemini"
+                    else (
+                        "Any free OpenRouter model id (must end with ':free'). "
+                        "Leave blank to use the selected curated model."
+                    )
                 ),
                 key="_custom_model_id_input",
             ).strip()
-            # The previous version of this block wrote the raw text into
-            # ``session_state["model"]`` on every keystroke. That was racy:
-            # the curated dropdown ran *before* this expander on each
-            # rerun and silently reset ``model`` to the curated default
-            # whenever the custom id didn't match a curated label. We now
-            # write into ``custom_model_override`` instead and let the
-            # chat driver pick it up.
             if _custom and _custom != st.session_state["custom_model_override"]:
-                try:
-                    cleaned = validate_free_model_id(_custom)
-                except InvalidFreeModelIdError as _e:
-                    st.error(f"❌ {_e}")
+                if ACTIVE_PROVIDER == "gemini":
+                    try:
+                        cleaned = validate_gemini_model_id(_custom)
+                    except InvalidGeminiModelIdError as _e:
+                        st.error(f"❌ {_e}")
+                    else:
+                        st.session_state["custom_model_override"] = cleaned
+                        st.toast(
+                            f"Custom model set to `{cleaned}` — dropdown locked "
+                            "until you clear it.",
+                            icon="🔒",
+                        )
+                        st.rerun()
                 else:
-                    st.session_state["custom_model_override"] = cleaned
-                    st.toast(
-                        f"Custom model set to `{cleaned}` — dropdown locked "
-                        "until you clear it.",
-                        icon="🔒",
-                    )
-                    st.rerun()
+                    try:
+                        cleaned = validate_free_model_id(_custom)
+                    except InvalidFreeModelIdError as _e:
+                        st.error(f"❌ {_e}")
+                    else:
+                        st.session_state["custom_model_override"] = cleaned
+                        st.toast(
+                            f"Custom model set to `{cleaned}` — dropdown locked "
+                            "until you clear it.",
+                            icon="🔒",
+                        )
+                        st.rerun()
             # "Use curated model" clear button. Visible only when an
             # override is active so the curated list isn't cluttered.
             if st.session_state["custom_model_override"]:

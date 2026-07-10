@@ -136,15 +136,20 @@ def _ensure_env() -> bool:
 
 
 def _check_env_key() -> None:
-    """Refuse to start if OPENROUTER_API_KEY is still the placeholder."""
+    """Refuse to start if no valid API key is found.
+    Accepts either a real OpenRouter key (sk-or-v1-...) or any non-empty Gemini key.
+    """
     if not ENV_FILE.exists():
         return  # _ensure_env will have already created it; the user must still fill it in
     text = ENV_FILE.read_text(encoding="utf-8")
-    has_real_key = "OPENROUTER_API_KEY=sk-or-v1-" in text and "PASTE" not in text
-    if not has_real_key:
+    
+    has_openrouter_key = "OPENROUTER_API_KEY=sk-or-v1-" in text and "PASTE" not in text
+    has_gemini_key = "GEMINI_API_KEY=" in text and "YOUR_GOOGLE" not in text and len(text.split("GEMINI_API_KEY=")[1].splitlines()[0].strip()) > 10
+    
+    if not (has_openrouter_key or has_gemini_key):
         sys.exit(
-            f"[run.py] {ENV_FILE} does not contain a real OpenRouter key.\n"
-            f"  Open it in any editor and replace the placeholder with your real sk-or-v1-... value,\n"
+            f"[run.py] {ENV_FILE} does not contain a real API key.\n"
+            f"  Please provide either a GEMINI_API_KEY or an OPENROUTER_API_KEY (sk-or-v1-...),\n"
             f"  then re-run:  python run.py"
         )
 

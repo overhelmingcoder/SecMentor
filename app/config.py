@@ -5,12 +5,27 @@ and exposes them as module-level constants. Every other module in the project
 imports from here — no other file should call dotenv, os.getenv, or hardcode
 the model name, API key, or endpoint URL.
 
-If ``OPENROUTER_API_KEY`` is missing the module raises a clear error at import
-time. That is intentional: we want the app to fail loudly at startup, not
-silently send unauthenticated requests.
+Provider selection
+-----------------
 
-Multi-key + multi-model support
--------------------------------
+Two providers are supported:
+
+**OpenRouter** (default) — routes to many LLM providers via a single API key.
+  Set ``OPENROUTER_API_KEY`` and ``OPENROUTER_MODEL`` / ``OPENROUTER_MODELS``.
+  Uses the ``:free`` suffix on model ids. Supports up to 5 API keys for
+  rotation.
+
+**Google Gemini** — direct access to Gemini models via Google AI Studio.
+  Set ``GEMINI_API_KEY`` (from ai.google.dev). No ``:free`` suffix needed;
+  the free tier is based on your project's quota (typically 1500 req/day for
+  Gemini 2.0 Flash). All Gemini models natively support vision.
+
+The provider is auto-detected: if ``GEMINI_API_KEY`` is set, Google is used;
+otherwise OpenRouter is used. To force OpenRouter when both keys are present,
+set ``ACTIVE_PROVIDER=openrouter`` in your .env.
+
+Multi-key + multi-model support (OpenRouter)
+-------------------------------------------
 
 The OpenRouter *free* tier caps usage per *account*, not per API key. So to
 keep the demo running we support up to **five** keys (``OPENROUTER_API_KEY``,
@@ -57,6 +72,17 @@ def _require_env(name: str) -> str:
     return value
 
 
+# --- Provider selection -------------------------------------------------------
+# ``ACTIVE_PROVIDER`` can be ``openrouter`` or ``gemini``. When unset (None)
+# the module auto-detects: if ``GEMINI_API_KEY`` is set, Gemini is used;
+# otherwise OpenRouter is used. Setting this to ``openrouter`` forces OpenRouter
+# even when a Gemini key is present.
+_ACTIVE_PROVIDER_RAW: str | None = os.getenv("ACTIVE_PROVIDER")
+if _ACTIVE_PROVIDER_RAW is not None:
+    _ACTIVE_PROVIDER_RAW = _ACTIVE_PROVIDER_RAW.strip().lower()
+
+# --- OpenRouter config -------------------------------------------------------
+# Required when using OpenRouter (when Gemini is active, these are ignored).
 OPENROUTER_API_KEY: str = _require_env("OPENROUTER_API_KEY")
 # Optional default model id. ``iter_models()`` is the authoritative
 # source for the model pool: when ``OPENROUTER_MODELS`` is set
@@ -72,6 +98,89 @@ OPENROUTER_BASE_URL: str = os.getenv(
     "OPENROUTER_BASE_URL",
     "https://openrouter.ai/api/v1/chat/completions",
 )
+
+# --- Google Gemini config -----------------------------------------------------
+# Optional API key for Google Gemini (from ai.google.dev). When this is set
+# AND ``ACTIVE_PROVIDER`` is not ``openrouter``, the app uses Google Gemini
+# instead of OpenRouter. Gemini offers generous free-tier quotas (typically
+# 1500 req/day for Gemini 2.0 Flash) and all Gemini models support vision
+# natively — no separate vision model selection needed.
+#
+# If ``GEMINI_API_KEY`` is missing, ``iter_api_keys()`` and ``iter_models()``
+# yield OpenRouter values. If it IS set, those functions yield Gemini values
+# (only one key needed; Google does not have the per-provider free-tier
+# rotation problem that OpenRouter has).
+_GEMINI_API_KEY_RAW: str | None = os.getenv("GEMINI_API_KEY", "").strip()
+
+# Determine active provider:
+# 1. Explicit override via ACTIVE_PROVIDER env var
+# 2. Auto-detect: Gemini if GEMINI_API_KEY is set, else OpenRouter
+_PROVIDER_EXPLICIT = _ACTIVE_PROVIDER_RAW in {"openrouter", "gemini"}
+_PROVIDER_FORCED = _ACTIVE_PROVIDER_RAW if _PROVIDER_EXPLICIT else None
+
+if _PROVIDER_FORCED:
+    ACTIVE_PROVIDER: str = _PROVIDER_FORCED  # type: ignore[assignment]
+elif _GEMINI_API_KEY_RAW:
+    ACTIVE_PROVIDER = "gemini"
+else:
+    ACTIVE_PROVIDER = "openrouter"
+
+
+def _gemini_key() -> str:
+    """Return the Gemini API key, raising if not configured."""
+    if not _GEMINI_API_KEY_RAW:
+        raise RuntimeError(
+            "GEMINI_API_KEY is not set. "
+            "Set it in your .env file (get it from https://aistudio.google.com/app/apikey) "
+            "or switch back to OpenRouter by setting ACTIVE_PROVIDER=openrouter."
+        )
+    return _GEMINI_API_KEY_RAW
+
+
+# Gemini is always single-key (no multi-key rotation needed), but we keep
+# the same interface so the router can call iter_api_keys() generically.
+# For Gemini, this always yields exactly one key.
+def _iter_gemini_keys() -> Iterator[str]:
+    if _GEMINI_API_KEY_RAW:
+        yield _GEMINI_API_KEY_RAW
+
+
+GEMINI_API_KEY: str | None = _GEMINI_API_KEY_RAW or None
+GEMINI_BASE_URL: str = os.getenv(
+    "GEMINI_BASE_URL",
+    "https://generativelanguage.googleapis.com/v1beta/openai",
+)
+# Gemini model to use when no override is set. Gemini 2.0 Flash is the
+# recommended default: fast, free-tier friendly (1500 req/day), and
+# natively supports vision.
+GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
+
+# Comma-separated list of Gemini models, same pattern as OPENROUTER_MODELS.
+# Leave blank to use just GEMINI_MODEL.
+GEMINI_MODELS_RAW: str = os.getenv("GEMINI_MODELS", "").strip()
+
+# Built-in list of common Gemini models for the UI dropdown.
+# These are all verified free-tier models from ai.google.dev.
+_GEMINI_DEFAULT_MODELS: tuple[str, ...] = (
+    "gemini-2.0-flash",
+    "gemini-2.5-flash",
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
+    "gemini-2.5-pro",
+    "gemini-exp-1206",
+)
+
+
+def _iter_gemini_models() -> Iterator[str]:
+    """Yield configured Gemini model ids (comma-separated or single fallback)."""
+    if GEMINI_MODELS_RAW:
+        for entry in GEMINI_MODELS_RAW.split(","):
+            cleaned = entry.strip()
+            if cleaned:
+                yield cleaned
+    elif GEMINI_MODEL:
+        yield GEMINI_MODEL
+
 
 #: Tracks whether the module has already validated that at least
 #: one model id is reachable. Populated by :func:`_validate_model_pool`
@@ -128,30 +237,29 @@ def _is_usable_openrouter_key(value: str | None) -> bool:
 
 
 def iter_api_keys() -> Iterator[str]:
-    """Yield every non-empty ``OPENROUTER_API_KEY[_N]`` in slot order.
+    """Yield API keys for the currently active provider.
 
-    Slot 1 (``OPENROUTER_API_KEY``) is required and is the only one
-    that triggers a startup error if missing. Slots 2..5 are optional
-    and are silently skipped if not set, set to the empty string, or
-    fail :func:`_is_usable_openrouter_key` (truncated, missing the
-    ``sk-or-v1-`` prefix, or suspiciously short).
+    When ``ACTIVE_PROVIDER == "gemini"``:
+        Yields exactly one key from ``GEMINI_API_KEY`` (if set).
+        Gemini does not require multi-key rotation; the free tier
+        is per-project, not per-key.
 
-    Order is stable: slot 1 first, then 2, 3, 4, 5. The router uses
-    this order to pick the *primary* key (slot 1) for the first call.
+    When ``ACTIVE_PROVIDER == "openrouter"``:
+        Yields up to five ``OPENROUTER_API_KEY[_N]`` values in slot order.
+        Slot 1 (``OPENROUTER_API_KEY``) is required. Slots 2..5 are
+        optional and silently skipped if malformed / truncated / missing.
 
-    To raise the cap further, bump ``_MAX_KEY_SLOTS`` here; the rest of
-    the codebase reads the constant through this iterator.
+    To raise the OpenRouter cap further, bump ``_MAX_KEY_SLOTS`` here.
     """
+    if ACTIVE_PROVIDER == "gemini":
+        yield from _iter_gemini_keys()
+        return
+
+    # OpenRouter path
     yield OPENROUTER_API_KEY
     for n in range(2, _MAX_KEY_SLOTS + 1):
         value = os.getenv(f"OPENROUTER_API_KEY_{n}")
         if not _is_usable_openrouter_key(value):
-            # A non-empty but malformed value is the "editor hard-wrapped
-            # my .env" case. We log a single warning at module-import
-            # time so the operator notices in the console without
-            # flooding every chat turn. The test suite patches
-            # ``logging.getLogger(__name__)`` so this stays silent in
-            # CI.
             if value:
                 logger.warning(
                     "OPENROUTER_API_KEY_%d looks truncated or malformed "
@@ -168,23 +276,30 @@ def iter_api_keys() -> Iterator[str]:
 def _validate_model_pool() -> None:
     """Raise once at module-import time if no model id is reachable.
 
-    Called automatically at the bottom of this module so the app
-    fails loudly at startup rather than mid-turn. The check is
-    cheap (just a parse of both env vars), idempotent thanks to
-    :data:`_MODEL_POOL_VALIDATED`, and only the *first* failure is
-    surfaced — re-running the validation after a successful boot
-    is a no-op.
+    Handles both providers:
+    - Gemini: validates ``GEMINI_API_KEY`` is set (models have defaults)
+    - OpenRouter: validates at least one ``:free`` model id is configured
 
-    Why this exists: :func:`iter_models` is a generator and a
-    generator cannot raise at import time, so a caller iterating
-    ``list(iter_models())`` would only discover the misconfiguration
-    on the first chat turn. Centralising the check here turns "user
-    sees a raw RuntimeError after typing their question" into "user
-    sees a clear error the moment they open the app".
+    Fails loudly at startup so the operator sees a clear error before
+    the first chat turn. Idempotent via :data:`_MODEL_POOL_VALIDATED`.
     """
     global _MODEL_POOL_VALIDATED
     if _MODEL_POOL_VALIDATED:
         return
+
+    if ACTIVE_PROVIDER == "gemini":
+        if not _GEMINI_API_KEY_RAW:
+            raise RuntimeError(
+                "Gemini is the active provider but GEMINI_API_KEY is not set. "
+                "Get your key from https://aistudio.google.com/app/apikey "
+                "and add it to your .env file as GEMINI_API_KEY=..., "
+                "or set ACTIVE_PROVIDER=openrouter to use OpenRouter instead."
+            )
+        # Gemini models have defaults; no further validation needed at startup.
+        _MODEL_POOL_VALIDATED = True
+        return
+
+    # OpenRouter path
     raw_list = os.getenv("OPENROUTER_MODELS") or ""
     parsed_from_list = [
         entry.strip()
@@ -204,26 +319,22 @@ def _validate_model_pool() -> None:
 
 
 def iter_models() -> Iterator[str]:
-    """Yield every model id the router should use.
+    """Yield model ids for the currently active provider.
 
-    Priority:
+    When ``ACTIVE_PROVIDER == "gemini"``:
+        Yields from ``GEMINI_MODELS`` (comma-separated) or falls back
+        to the single ``GEMINI_MODEL``. No ``:free`` suffix needed.
+        Gemini model names look like ``gemini-2.0-flash``.
 
-    1. ``OPENROUTER_MODELS`` env var, a comma-separated list. Whitespace
-       around commas is stripped; empty entries are skipped. This is
-       the override path — set it in .env when you want to pin the
-       demo to a specific list of free models.
-    2. The single ``OPENROUTER_MODEL`` env var (the original behaviour).
-       Always yielded exactly once so a single-model deployment keeps
-       working with no .env change.
-
-    Order is preserved within (1) so a deliberate primary/secondary
-    ordering in the .env survives into the router pool.
-
-    Each yielded id is validated to look like ``vendor/model:free``:
-    the router will refuse it again at construction time, but checking
-    here turns a "value silently truncated to ``gemma-4-31b-it:fre``"
-    into a single clear warning at startup.
+    When ``ACTIVE_PROVIDER == "openrouter"``:
+        Yields from ``OPENROUTER_MODELS`` (comma-separated) or falls
+        back to ``OPENROUTER_MODEL``. Each id must be ``vendor/model:free``.
     """
+    if ACTIVE_PROVIDER == "gemini":
+        yield from _iter_gemini_models()
+        return
+
+    # OpenRouter path
     raw = os.getenv("OPENROUTER_MODELS")
     if raw:
         for entry in raw.split(","):
@@ -237,22 +348,9 @@ def iter_models() -> Iterator[str]:
                     cleaned,
                 )
         return
-    # Fall back to OPENROUTER_MODEL (read live from the environment so
-    # tests can monkeypatch ``os.environ`` and see the change without
-    # re-importing the module). The module-level constant is just a
-    # cached snapshot for callers that want the bootstrap value.
     single = os.getenv("OPENROUTER_MODEL", "").strip()
     if _is_usable_model_id(single):
         yield single
-    # Note: we used to raise here on a malformed/empty single value,
-    # but :func:`_validate_model_pool` already guarantees at least
-    # one usable id reaches this function (or raises at import time).
-    # Yielding nothing is therefore intentional: a half-configured
-    # .env that set OPENROUTER_MODELS= (an empty string) plus a
-    # malformed OPENROUTER_MODEL will simply produce an empty pool
-    # at iteration time, and the router will raise AllSlotsExhaustedError
-    # with a clear "zero models" message — visible at the first
-    # failed turn rather than as a silent crash.
 
 
 def _is_usable_model_id(value: str | None) -> bool:
@@ -271,7 +369,7 @@ def _is_usable_model_id(value: str | None) -> bool:
 
 class InvalidFreeModelIdError(ValueError):
     """Raised by :func:`validate_free_model_id` when the user-supplied
-    id is not a valid ``vendor/model:free`` shape.
+    OpenRouter id is not a valid ``vendor/model:free`` shape.
 
     Kept as a distinct class so the view layer can catch it and show
     a friendly sidebar banner (rather than a raw traceback) when a
@@ -280,23 +378,26 @@ class InvalidFreeModelIdError(ValueError):
     """
 
 
-def validate_free_model_id(raw: str) -> str:
-    """Validate a user-supplied free-tier model id.
+class InvalidGeminiModelIdError(ValueError):
+    """Raised by :func:`validate_gemini_model_id` when the user-supplied
+    Gemini model id is not recognisable.
 
-    Used by the "Custom OpenRouter model" field in the Advanced
-    expander of ``web/streamlit_app.py``. The rule is the same one
-    :func:`iter_models` applies at startup: the id must contain a
-    ``/`` (vendor/model) and end with ``:free``. Anything else is
-    rejected with :class:`InvalidFreeModelIdError` so the caller can
-    show a clean error instead of silently burning a paid slot.
+    Kept as a distinct class so the view layer can catch it and show
+    a clean banner.
+    """
+
+
+def validate_free_model_id(raw: str) -> str:
+    """Validate a user-supplied OpenRouter free-tier model id.
+
+    Only used when ``ACTIVE_PROVIDER == "openrouter"``. The id must
+    contain a ``/`` (vendor/model) and end with ``:free``. Rejects
+    anything else with :class:`InvalidFreeModelIdError`.
 
     Parameters
     ----------
     raw
-        The raw text the user typed. Leading and trailing whitespace
-        is stripped; empty strings are rejected (the caller can use
-        the empty string as the "no override" signal without going
-        through this function).
+        The raw text the user typed.
 
     Returns
     -------
@@ -328,38 +429,61 @@ def validate_free_model_id(raw: str) -> str:
     return cleaned
 
 
+def validate_gemini_model_id(raw: str) -> str:
+    """Validate a user-supplied Gemini model id.
+
+    Only used when ``ACTIVE_PROVIDER == "gemini"``. Accepts any model
+    name that starts with ``gemini-`` (the standard prefix for all
+    Gemini models on Google AI Studio). Rejects anything else with
+    :class:`InvalidGeminiModelIdError`.
+
+    Parameters
+    ----------
+    raw
+        The raw text the user typed.
+
+    Returns
+    -------
+    str
+        The cleaned id (whitespace stripped).
+
+    Raises
+    ------
+    InvalidGeminiModelIdError
+        If the cleaned id does not look like a Gemini model.
+    """
+    if raw is None:
+        raise InvalidGeminiModelIdError("Gemini model id is empty.")
+    cleaned = raw.strip()
+    if not cleaned:
+        raise InvalidGeminiModelIdError("Gemini model id is empty.")
+    if not cleaned.startswith("gemini-"):
+        raise InvalidGeminiModelIdError(
+            f"Gemini model id {cleaned!r} does not start with 'gemini-'. "
+            "All Gemini models follow the 'gemini-X.Y-name' pattern. "
+            "Example: 'gemini-2.0-flash'."
+        )
+    return cleaned
+
+
 # --- Vision-capable model allow-list ------------------------------------------
-# This is the single source of truth for "which free-tier models can
-# see images". The list is intentionally conservative: only models
-# we have confirmed accept the OpenRouter ``image_url`` part shape on
-# the free tier. Adding a model here that does NOT support vision
-# will produce 400 Bad Request errors at request time — fail-safe in
-# production, but annoying. The list is keyed by the exact model id
-# the provider returns, including the ``:free`` suffix.
+# Two cases:
 #
-# The view layer (``web/streamlit_app.py``) reads this via
-# ``model_supports_vision()`` to decide whether to swap the user's
-# selected model for a vision-capable one when an image is attached.
-# Keeping the set in ``app/`` (not in the view) means tests can patch
-# it without dragging in Streamlit.
+# 1. Google Gemini (ACTIVE_PROVIDER == "gemini"): ALL Gemini models natively
+#    support vision — no swap needed, no allow-list. The helper returns True
+#    for any gemini-* model.
 #
-# When the OpenRouter free-tier pool changes, this set is the one
-# place to update.
-# Free-tier vision allow-list (probed live on 2026-06-15).
+# 2. OpenRouter: the list is intentionally conservative — only models we have
+#    confirmed accept the OpenRouter ``image_url`` part shape on the free tier.
+#    Adding a model here that does NOT support vision produces 400 errors.
 #
-# As of mid-2026, the only free-tier model on OpenRouter that actually
-# accepts image inputs and returns 200 is:
+# The view layer reads this via ``model_supports_vision()`` to decide whether
+# to auto-swap the user's selected model when an image is attached.
+# Keeping the set in ``app/`` (not in the view) means tests can patch it.
 #
-#     nvidia/nemotron-nano-12b-v2-vl:free
-#
-# The other vision models historically listed here (gemini-2.0-flash-exp,
-# gemma-3-27b, qwen-2-vl-7b, qwen2.5-vl-32b, mistral-small-3.1-24b,
-# llama-3.2-11b-vision, llama-3.2-90b-vision) all return 404 from
-# OpenRouter on the free tier. Three of them still work as PAID slugs
-# (drop the ``:free`` suffix) but that is out of scope for the
-# free-tier demo. Keep the list tight: every id here has been
-# live-probed and returned 200 with a real 1x1 PNG payload.
-_VISION_MODEL_IDS: frozenset[str] = frozenset({
+# OpenRouter free-tier vision allow-list (probed live on 2026-06-15).
+# As of mid-2026, only nemotron-nano-12b-v2-vl works on OpenRouter's :free tier.
+_OPENROUTER_VISION_MODEL_IDS: frozenset[str] = frozenset({
     "nvidia/nemotron-nano-12b-v2-vl:free",
 })
 
@@ -367,18 +491,18 @@ _VISION_MODEL_IDS: frozenset[str] = frozenset({
 def model_supports_vision(model_id: str) -> bool:
     """Return True if the given model id is known to accept image inputs.
 
-    The comparison is exact and case-insensitive. Whitespace is stripped
-    so a model id with a trailing newline (common when read from a CSV
-    or an env var) does not silently miss the allow-list.
+    For Google Gemini: all models support vision natively — return True
+    for any gemini-* model id.
 
-    Models not in :data:`_VISION_MODEL_IDS` are assumed to be text-only.
-    Adding a new vision-capable model is a one-line edit to that set
-    — there is no per-provider "capability probe" because OpenRouter
-    does not expose a stable capabilities endpoint for free models.
+    For OpenRouter: exact match against the free-tier vision allow-list.
+    Whitespace is stripped so a trailing newline doesn't silently miss.
     """
     if not model_id:
         return False
-    return model_id.strip().lower() in _VISION_MODEL_IDS
+    cleaned = model_id.strip().lower()
+    if ACTIVE_PROVIDER == "gemini":
+        return cleaned.startswith("gemini-")
+    return cleaned in _OPENROUTER_VISION_MODEL_IDS
 
 
 # --- Module-load validation --------------------------------------------------
